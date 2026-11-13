@@ -236,7 +236,7 @@ class EngineSettingTests(unittest.TestCase):
 
     def test_the_reported_scale_defaults_to_the_tuning_scale(self):
         eng = self._make(
-            spatial_adjust_method="spatial_plus", spatial_tune_scale_m=5000
+            spatial_adjust_method="basis", spatial_tune_scale_m=5000
         )
         self.assertEqual(eng.spatial_adjust_scales, (5000.0,))
         self.assertEqual(eng._tune_eps, 10_000.0)
@@ -244,7 +244,7 @@ class EngineSettingTests(unittest.TestCase):
     def test_a_different_primary_scale_warns(self):
         with mock.patch("geofuse.fusion._log") as log:
             self._make(
-                spatial_adjust_method="spatial_plus",
+                spatial_adjust_method="basis",
                 spatial_tune_scale_m=5000,
                 spatial_adjust_scale_m=[20_000, 5000],
             )
@@ -255,10 +255,10 @@ class EngineSettingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._make(spatial_tune_scale_m=5000)
         with self.assertRaises(ValueError):
-            self._make(spatial_adjust_method="spatial_plus", spatial_tune_scale_m=-1)
+            self._make(spatial_adjust_method="basis", spatial_tune_scale_m=-1)
 
     def test_unset_changes_nothing(self):
-        eng = self._make(spatial_adjust_method="spatial_plus")
+        eng = self._make(spatial_adjust_method="basis")
         self.assertIsNone(eng.spatial_tune_scale_m)
         self.assertEqual(eng.spatial_adjust_scales, ())
 

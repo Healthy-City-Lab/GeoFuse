@@ -30,6 +30,7 @@ import pandas as pd
 import test_spatial_reporting as reporting_fixture
 from geofuse import negative_controls as nc
 from geofuse.fusion import MetricFusionEngine, _absorbed_given_cov
+from spatial_names import stand_in
 from geofuse.jobs import outer_splits
 from test_spatial_scale import _scaled
 
@@ -69,7 +70,7 @@ def _engine(n_ent=2400, n_test=1200, seed=3, effect=0.1):
         _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
         _active_greenery_channel="cgi",
-        spatial_adjust_method="spatial_plus",
+        **stand_in("exposure"),
         spatial_adjust_max_df=10,
         spatial_adjust_df=tuple(range(11)),
         spatial_adjust_criterion="aic",

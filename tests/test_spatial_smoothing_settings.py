@@ -26,6 +26,7 @@ from geofuse import exposure_response, objective_scoring, settings
 from geofuse import spatial_basis as sb
 from geofuse.cli import commands as cli
 from geofuse.fusion import MetricFusionEngine
+from spatial_names import spatial_kwargs
 from geofuse.jobs import runners
 
 
@@ -46,7 +47,7 @@ def _engine(**kw):
     return MetricFusionEngine(
         target_file="dummy.geojson",
         cache_dir=tempfile.mkdtemp(),
-        spatial_adjust_method=kw.pop("spatial_adjust_method", "spatial_plus"),
+        **spatial_kwargs(kw.pop("rule", "exposure")),
         **kw,
     )
 
@@ -58,9 +59,9 @@ class LegacyAliasTests(unittest.TestCase):
         self.assertEqual(old.spatial_adjust_df, new.spatial_adjust_df)
         xy, y, rng = _field()
         x = y + rng.normal(size=len(y))
-        for method in ("spatial_plus", "ks_aic"):
-            a = _engine(spatial_adjust_method=method, spatial_adjust_max_df=10)
-            b = _engine(spatial_adjust_method=method, spatial_adjust_df=range(11))
+        for rule in ("exposure", "outcome"):
+            a = _engine(rule=rule, spatial_adjust_max_df=10)
+            b = _engine(rule=rule, spatial_adjust_df=range(11))
             ra = a._spatial_selection(xy, y, None, x)
             rb = b._spatial_selection(xy, y, None, x)
             self.assertEqual(ra["df"], rb["df"])
@@ -260,7 +261,7 @@ class AtCapTests(unittest.TestCase):
         eng = _engine()
         rows = np.ones(len(y), dtype=bool)
         _cols, record = eng._reporting_smooth(xy, rows, y, None, y)
-        self.assertEqual(set(record), {"method", "df", "at_cap", "ic"})
+        self.assertEqual(set(record), {"method", "select", "df", "at_cap", "ic"})
         self.assertEqual(list(record["ic"])[0], "none")
         from geofuse.jobs.outer_splits import spatial_columns
 

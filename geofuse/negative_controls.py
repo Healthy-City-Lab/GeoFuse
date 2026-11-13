@@ -24,8 +24,8 @@ against each control:
 
 The paired statistics take ``extra``: control columns that belong to one
 variable and join the covariates of every slope involving it, such as a
-spatial smooth selected on the exposure (Spatial+) or on each outcome
-(KS-AIC). Their rows are resampled with the observations. With ``extra``
+spatial basis whose size the exposure model or each outcome model
+selected. Their rows are resampled with the observations. With ``extra``
 columns the resamples are refitted by :mod:`geofuse.resampling`, which keeps a
 block-diagonal smooth's clusters apart instead of forming one dense Gram matrix
 per row; without them, by per-cluster Gram blocks of the covariate basis.

@@ -32,6 +32,7 @@ from geofuse import objective_scoring as osc
 from geofuse import resampling as rs
 from geofuse import spatial_basis as sb
 from geofuse.fusion import MetricFusionEngine
+from spatial_names import spatial_kwargs
 from geofuse.jobs import runners
 from geofuse.jobs.stage_ledger import DONE, FAILED
 
@@ -40,7 +41,7 @@ def _engine(method, rule="own"):
     return MetricFusionEngine(
         target_file="dummy.geojson",
         cache_dir=tempfile.mkdtemp(),
-        spatial_adjust_method=method,
+        **spatial_kwargs(method),
         spatial_paired_smooth=rule,
     )
 
@@ -51,9 +52,9 @@ class SummaryRecordTests(unittest.TestCase):
         xy = np.vstack([rng.normal(size=(200, 2)) * 2_000 + c for c in (0, 1e6)])
         y = rng.normal(size=len(xy))
         for method, rule, want in (
-            ("spatial_plus", "own", "own"),
-            ("spatial_plus", "max", "max"),
-            ("ks_aic", "own", "outcome"),
+            ("exposure", "own", "own"),
+            ("exposure", "max", "max"),
+            ("outcome", "own", "outcome"),
         ):
             eng = _engine(method, rule)
             eng._spatial_selection(xy, y, None, y)
@@ -69,7 +70,8 @@ class SummaryRecordTests(unittest.TestCase):
             eng = MetricFusionEngine(
                 target_file="dummy.geojson",
                 cache_dir=tempfile.mkdtemp(),
-                spatial_adjust_method="spatial_plus",
+                spatial_adjust_method="basis",
+                spatial_adjust_select="fixed_scale" if scales else "df_exposure_ic",
                 spatial_adjust_scale_m=scales,
             )
             eng._spatial_selection(xy, y, None, y)

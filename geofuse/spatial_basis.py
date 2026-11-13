@@ -8,13 +8,20 @@ entity coordinates that absorbs that unmeasured spatial structure, so the partia
 association reflects only the finer-scale greenery↔outcome co-variation a smooth
 confounder cannot explain.
 
-Two estimators consume the basis (see :mod:`geofuse.objective_scoring`):
+The basis enters the outcome model unpenalized, by OLS: the adjustment of
+Keller & Szpiro (2020, §2.2), equal at the observed locations to their
+pre-adjustment of the exposure (§2.3). Its size is set one of three ways (see
+:mod:`geofuse.objective_scoring` and ``MetricFusionEngine``):
 
-* **KS-AIC** (Keller & Szpiro, 2020) — add the smooth to the outcome model and
-  pick its degrees of freedom by AIC on the outcome model *without* the exposure.
-* **df-Spatial+** (the unpenalized, AIC-df variant of Dupont–Wood–Augustin used by
-  Rainey et al., 2025) — residualize the exposure on the smooth, df by AIC on the
-  exposure model.
+* ``df_outcome_ic`` — the df by AIC/BIC of the outcome model *without* the
+  exposure (Keller & Szpiro 2020).
+* ``df_exposure_ic`` — the df by AIC/BIC of the exposure model ("df-Spatial+"
+  of Rainey et al. 2025). The exposure residual is taken on an unpenalized
+  basis, so by Frisch–Waugh–Lovell the slope equals the plain basis adjustment
+  (Dupont, Wood & Augustin 2022, §4); only the basis size differs.
+* ``fixed_scale`` — a pattern scale in metres, with no criterion.
+
+Spatial+ itself, with penalized smooths, lives in :mod:`geofuse.spatial_plus`.
 
 Construction
 ------------
@@ -616,8 +623,8 @@ def select_df_aic(
     (:func:`candidate_dfs`) and the no-spatial baseline ``y ~ covariates``,
     returning the lowest-criterion choice as ``(df, columns)``; on a tie the
     smaller design wins. ``df is None`` (``columns is None``) means the
-    criterion preferred no spatial adjustment. For KS-AIC pass the *outcome* as
-    ``y``; for df-Spatial+ pass the *exposure*.
+    criterion preferred no spatial adjustment. For ``df_outcome_ic`` pass the
+    *outcome* as ``y``; for ``df_exposure_ic`` the *exposure*.
 
     With ``return_profile`` a third value holds the criterion of every design
     compared, ``{"none": ic, "<df>": ic, …}`` in the order compared (empty when

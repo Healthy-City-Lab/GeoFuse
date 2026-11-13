@@ -167,8 +167,70 @@ WARM_RHAT_MAX = 1.01
 WARM_ESS_SHARE = 0.8
 
 #: Which smooth each exposure of a paired CGI-vs-exposure test is scored with
-#: under ``spatial_plus`` (see ``MetricFusionEngine._paired_difference_on``).
+#: when the exposure model picks the df (see
+#: ``MetricFusionEngine._paired_difference_on``).
 SPATIAL_PAIRED_SMOOTHS: tuple[str, ...] = ("own", "cgi", "outcome", "max")
+
+#: Spatial-confounding adjustments: none, an unpenalized thin-plate basis in
+#: the outcome model (Keller & Szpiro 2020), or Spatial+ with penalized
+#: smooths per group (Dupont, Wood & Augustin 2022).
+SPATIAL_ADJUST_METHODS: tuple[str, ...] = ("none", "basis", "spatial_plus")
+
+#: How a ``basis`` adjustment sets its size: the df by AIC/BIC of the outcome
+#: model without the exposure (Keller & Szpiro 2020), the df by AIC/BIC of the
+#: exposure model (df-Spatial+, Rainey 2025; unpenalized, so equal to the
+#: basis adjustment, Dupont et al. 2022 §4), a fixed pattern scale, or the
+#: scale by AIC/BIC of the outcome model without the exposure.
+SPATIAL_ADJUST_SELECTS: tuple[str, ...] = (
+    "df_outcome_ic",
+    "df_exposure_ic",
+    "fixed_scale",
+    "scale_ic",
+)
+
+#: Tuning within areas: the basis joins the search's covariates, or every
+#: search input is residualized on its own penalized smooth (Spatial+ step 1).
+SPATIAL_TUNE_METHODS: tuple[str, ...] = ("basis", "spatial_plus_inputs")
+
+#: How the tuning basis scale is set: given, or selected per split.
+SPATIAL_TUNE_SELECTS: tuple[str, ...] = ("fixed_scale", "scale_ic")
+
+#: Negative controls of a scale selection: the target's scale, or their own.
+SPATIAL_SELECT_CONTROLS: tuple[str, ...] = ("target", "own")
+
+#: What each adjustment computes, with its reference, for records and logs.
+SPATIAL_LABELS: dict[str, str] = {
+    "df_outcome_ic": "basis size by AIC/BIC of the outcome model without the "
+    "exposure (Keller & Szpiro 2020)",
+    "df_exposure_ic": "basis size by AIC/BIC of the exposure model "
+    "(df-Spatial+, Rainey 2025; unpenalized, equal to the basis adjustment, "
+    "Dupont et al. 2022 §4)",
+    "fixed_scale": "fixed-scale thin-plate basis adjustment (Keller & Szpiro 2020)",
+    "scale_ic": "basis scale by AIC/BIC of the outcome model without the "
+    "exposure (Keller & Szpiro 2020)",
+    "spatial_plus": "Spatial+ (Dupont et al. 2022), site-specific smooths",
+    "spatial_plus_inputs": "Spatial+ applied to the search inputs (geofuse "
+    "extension of Dupont et al. 2022; outcome smoother's penalties fixed at "
+    "the outcome-only fit)",
+}
+
+
+def _spatial_method_pair(
+    method, select, scales, tune_scale
+) -> tuple[str, "str | None"]:
+    """``(method, select)`` of an engine: ``ks_aic`` is the basis whose df the
+    outcome model picks; a ``basis`` without a select gets ``fixed_scale``
+    with a pattern scale and ``df_outcome_ic`` without; ``none`` and
+    ``spatial_plus`` have no select."""
+    method = str(method or "none").lower()
+    scaled = scales is not None or tune_scale is not None
+    if method == "ks_aic":
+        return "basis", ("fixed_scale" if scaled else "df_outcome_ic")
+    if method == "basis":
+        if select is None:
+            return method, ("fixed_scale" if scaled else "df_outcome_ic")
+        return method, str(select)
+    return method, None
 
 
 def _absorbed_share(x: np.ndarray, smooth: np.ndarray) -> float | None:
@@ -251,7 +313,7 @@ def _chance_share(smooth: np.ndarray) -> float:
 def _spatially_adjusted(engine) -> bool:
     """Whether ``engine``'s run adjusts for a spatial smooth (any method, or a
     scale ladder whose current rung is the unadjusted one)."""
-    return getattr(engine, "spatial_adjust_method", "none") != "none" or bool(
+    return getattr(engine, "_basis", "none") != "none" or bool(
         getattr(engine, "spatial_adjust_scales", None)
     )
 
@@ -373,6 +435,17 @@ class MetricFusionEngine:
         spatial_adjust_scale_m: "float | list[float] | tuple[float, ...] | None" = None,
         spatial_adjust_min_component: int | None = None,
         spatial_tune_scale_m: float | None = None,
+        spatial_adjust_select: str | None = None,
+        spatial_tune_method: str = "basis",
+        spatial_tune_select: str = "fixed_scale",
+        spatial_plus_groups_column: str | None = None,
+        spatial_plus_k: int = 300,
+        spatial_plus_criterion: str = "gcv",
+        spatial_plus_checks: "list[str] | tuple[str, ...] | None" = None,
+        spatial_plus_step1_covariates: bool = False,
+        spatial_select_scales_m: "list[float] | tuple[float, ...] | None" = None,
+        spatial_select_criterion: str = "bic",
+        spatial_select_controls: str = "target",
         residualize_spline_df: int = objective_scoring.SPLINE_DF,
         residualize_spline_min_unique: int = objective_scoring.SPLINE_MIN_UNIQUE,
         exposure_response_spline_df: int = exposure_response.SPLINE_DF,
@@ -461,8 +534,8 @@ class MetricFusionEngine:
                 :data:`spatial_basis.DEFAULT_DF_CANDIDATES`, or every df
                 ``0 … spatial_adjust_max_df`` when that older form is given;
                 giving both is refused.
-            spatial_adjust_criterion: ``"aic"`` or ``"bic"``, for both the
-                KS-AIC (outcome) and Spatial+ (exposure) selections.
+            spatial_adjust_criterion: ``"aic"`` or ``"bic"``, for both df
+                rules of the basis (outcome and exposure model).
             spatial_adjust_neighbours / spatial_adjust_knots_min /
                 spatial_adjust_knots_max: the k-NN graph that splits entities
                 into spatial clusters (when ``spatial_adjust_eps_m`` is unset)
@@ -619,19 +692,81 @@ class MetricFusionEngine:
         self._covariate_missing_report: dict | None = None
 
         # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
-        # residualized objective. ``ks_aic`` / ``spatial_plus`` fold a low-rank
-        # coordinate smooth (built per spatial cluster, df chosen by AIC) into
-        # the residualization so the score reflects greenery↔outcome co-variation
-        # beyond an unmeasured smooth spatial confounder. Entity coordinates ride
-        # on the prepared frame as ``_cx`` / ``_cy``; the per-split candidate
-        # basis is cached on ``_spatial_basis_cache`` keyed by split id.
-        method = str(spatial_adjust_method or "none").lower()
-        if method not in objective_scoring.SPATIAL_METHODS:
+        # residualized objective. ``basis`` folds an unpenalized thin-plate
+        # basis of the coordinates (built per spatial cluster) into the
+        # residualization, so the score reflects greenery↔outcome co-variation
+        # beyond an unmeasured smooth spatial confounder; ``_basis`` says which
+        # model sets its size (``outcome`` / ``exposure``; ``none`` without a
+        # basis). ``spatial_plus`` leaves the search and the standard reports
+        # unadjusted and adds Spatial+ rows (penalized smooths, see
+        # :meth:`compute_spatial_plus`). Entity coordinates ride on the prepared
+        # frame as ``_cx`` / ``_cy``; the per-split candidate basis is cached on
+        # ``_spatial_basis_cache`` keyed by split id.
+        method, select = _spatial_method_pair(
+            spatial_adjust_method,
+            spatial_adjust_select,
+            spatial_adjust_scale_m,
+            spatial_tune_scale_m,
+        )
+        if method not in SPATIAL_ADJUST_METHODS:
             raise ValueError(
-                f"spatial_adjust_method must be one of "
-                f"{sorted(objective_scoring.SPATIAL_METHODS)}; got {method!r}."
+                f"spatial_adjust_method must be one of {SPATIAL_ADJUST_METHODS}; "
+                f"got {method!r}."
             )
+        if method == "basis" and select not in SPATIAL_ADJUST_SELECTS:
+            raise ValueError(
+                f"spatial_adjust_select must be one of {SPATIAL_ADJUST_SELECTS}; "
+                f"got {select!r}."
+            )
+        unavailable = [
+            name
+            for name, used in (
+                ("spatial_adjust_method 'spatial_plus'", method == "spatial_plus"),
+                ("spatial_adjust_select 'scale_ic'", select == "scale_ic"),
+                ("spatial_tune_select 'scale_ic'", spatial_tune_select == "scale_ic"),
+            )
+            if used
+        ]
+        if unavailable:
+            raise ValueError(f"{', '.join(unavailable)}: not available.")
         self.spatial_adjust_method: str = method
+        self.spatial_adjust_select: str | None = select
+        if spatial_tune_method not in SPATIAL_TUNE_METHODS:
+            raise ValueError(
+                f"spatial_tune_method must be one of {SPATIAL_TUNE_METHODS}; "
+                f"got {spatial_tune_method!r}."
+            )
+        if spatial_tune_select not in SPATIAL_TUNE_SELECTS:
+            raise ValueError(
+                f"spatial_tune_select must be one of {SPATIAL_TUNE_SELECTS}; "
+                f"got {spatial_tune_select!r}."
+            )
+        self.spatial_tune_method: str = spatial_tune_method
+        self.spatial_tune_select: str = spatial_tune_select
+        if spatial_tune_method == "spatial_plus_inputs" and method != "spatial_plus":
+            raise ValueError(
+                "spatial_tune_method 'spatial_plus_inputs' needs "
+                "spatial_adjust_method 'spatial_plus'."
+            )
+        if select is not None and select.startswith("df_") and (
+            spatial_adjust_scale_m is not None or spatial_tune_scale_m is not None
+        ):
+            raise ValueError(
+                f"spatial_adjust_select {select!r} sets the basis by a df; a "
+                "pattern scale needs 'fixed_scale' or 'scale_ic'."
+            )
+        # Which model sets the basis size, and so which code path builds the
+        # smooths: the outcome's (each outcome its own) or the exposure's (one
+        # smooth shared by every outcome). A fixed scale has no criterion and
+        # shares one smooth, as does a scale selected on the target.
+        self._basis: str = "none"
+        if method == "basis":
+            self._basis = (
+                "outcome"
+                if select == "df_outcome_ic"
+                or (select == "scale_ic" and spatial_select_controls == "own")
+                else "exposure"
+            )
         if spatial_adjust_df is not None and spatial_adjust_max_df is not None:
             raise ValueError(
                 "Give spatial_adjust_df or the older spatial_adjust_max_df, not both."
@@ -678,10 +813,9 @@ class MetricFusionEngine:
         if self.spatial_tune_scale_m is not None:
             if self.spatial_tune_scale_m <= 0:
                 raise ValueError("spatial_tune_scale_m must be a positive distance.")
-            if method == "none":
+            if method != "basis":
                 raise ValueError(
-                    "spatial_tune_scale_m needs spatial_adjust_method spatial_plus "
-                    "or ks_aic."
+                    "spatial_tune_scale_m needs spatial_adjust_method 'basis'."
                 )
             # A composite tuned within areas is scored within the same areas.
             if spatial_adjust_scale_m is None:
@@ -694,10 +828,9 @@ class MetricFusionEngine:
         )
         if any(v <= 0 for v in self.spatial_adjust_scales):
             raise ValueError("spatial_adjust_scale_m must be positive distances.")
-        if self.spatial_adjust_scales and method == "none":
+        if self.spatial_adjust_scales and method != "basis":
             raise ValueError(
-                "spatial_adjust_scale_m needs spatial_adjust_method spatial_plus "
-                "or ks_aic."
+                "spatial_adjust_scale_m needs spatial_adjust_method 'basis'."
             )
         # The scale the smooths are built at now (the primary one, or another
         # inside :meth:`spatial_scale`); ``None`` in df mode.
@@ -5249,10 +5382,11 @@ class MetricFusionEngine:
 
         Builds the per-cluster candidate basis once per split fingerprint (the
         coordinates and outcome are stable across trials) and memoizes it on
-        ``_spatial_basis_cache``. For ``ks_aic`` the df is selected once on the
-        outcome (cached); for ``spatial_plus`` the df is selected per call on the
-        exposure ``cgi``. ``None`` means no spatial adjustment is applied (off,
-        no coordinates, degenerate geometry, or AIC preferred no smooth).
+        ``_spatial_basis_cache``. When the outcome model picks the df it is
+        selected once on the outcome (cached); when the exposure model does, per
+        call on the exposure ``cgi``. ``None`` means no spatial adjustment is
+        applied (off, no coordinates, degenerate geometry, or AIC preferred no
+        smooth).
         """
         return self._spatial_smooth(coords_xy, target, cov, cgi)[0]
 
@@ -5291,11 +5425,11 @@ class MetricFusionEngine:
         when the criterion kept none), its df, the criterion of every design
         compared (``{"none": …, "<df>": …}``) and whether the largest
         candidate won. The df is selected on the outcome given the covariates
-        (``ks_aic``, or ``on="outcome"``) or on the exposure ``cgi``
-        (``spatial_plus``). The first selection that lands on the largest
+        (``df_outcome_ic``, or ``on="outcome"``) or on the exposure ``cgi``
+        (``df_exposure_ic``). The first selection that lands on the largest
         candidate logs a WARN.
         """
-        if self.spatial_adjust_method == "none" or coords_xy is None:
+        if self._basis == "none" or coords_xy is None:
             return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
         if self._spatial_scale is not None:
@@ -5336,7 +5470,7 @@ class MetricFusionEngine:
             if self._spatial_adjust_summary is None and basis.has_spatial:
                 self._note_basis_summary(
                     {
-                        "method": self.spatial_adjust_method,
+                        **self._method_record(),
                         "ks_df": entry["ks"]["df"],
                         "candidates": list(self.spatial_adjust_df),
                         "criterion": self.spatial_adjust_criterion,
@@ -5349,10 +5483,10 @@ class MetricFusionEngine:
         basis = entry["basis"]
         if not basis.has_spatial:
             return None
-        if self.spatial_adjust_method == "ks_aic" or on == "outcome":
+        if self._basis == "outcome" or on == "outcome":
             return self._count_selection(entry["ks"])
-        # spatial_plus: the exposure is residualized on the smooth, so df is
-        # selected on the exposure (df-Spatial+); the candidate basis is reused
+        # The exposure model picks the df (df-Spatial+); the candidate basis
+        # is reused
         # and the per-call df search runs off the memoized nested-QR precompute
         # (one matvec instead of one least-squares fit per candidate).
         pre = entry.get("plus_pre")
@@ -5419,7 +5553,7 @@ class MetricFusionEngine:
             if self._spatial_adjust_summary is None and basis.has_spatial:
                 self._note_basis_summary(
                     {
-                        "method": self.spatial_adjust_method,
+                        **self._method_record(),
                         "selection": "fixed scale",
                         "eps_m": self._scale_eps,
                         **basis.summary,
@@ -5440,15 +5574,28 @@ class MetricFusionEngine:
         clusters stay those of the primary scale."""
         if not self.spatial_adjust_scales:
             raise ValueError("spatial_scale needs spatial_adjust_scale_m.")
-        saved = self._spatial_scale, self.spatial_adjust_method
+        saved = self._spatial_scale, self._basis
         if scale is None:
-            self.spatial_adjust_method = "none"
+            self._basis = "none"
         else:
             self._spatial_scale = float(scale)
         try:
             yield
         finally:
-            self._spatial_scale, self.spatial_adjust_method = saved
+            self._spatial_scale, self._basis = saved
+
+    def _method_record(self) -> dict:
+        """The adjustment as a record names it: ``method`` and, for a basis,
+        ``select`` (how its size is set)."""
+        if self.spatial_adjust_method == "basis":
+            return {"method": "basis", "select": self.spatial_adjust_select}
+        return {"method": self.spatial_adjust_method}
+
+    @property
+    def _scoring_spatial_method(self) -> str:
+        """``spatial_method`` of the scorers: ``basis`` while a basis is in
+        use (inside :meth:`spatial_scale` too), else ``none``."""
+        return "none" if self._basis == "none" else "basis"
 
     def _selection_record(self, basis, df, columns, ic) -> dict:
         """A df selection as :meth:`_spatial_selection` returns it."""
@@ -5494,12 +5641,12 @@ class MetricFusionEngine:
         selections the largest candidate won (``at_cap``). Re-splitting, as the
         repeated held-out splits do, leaves it unchanged.
         """
-        if self.spatial_adjust_method == "none":
+        if self._basis == "none":
             return None
         first = self._spatial_run_summary or self._spatial_adjust_summary
         if self.spatial_adjust_scales:
             return {
-                **(first or {"method": self.spatial_adjust_method}),
+                **(first or self._method_record()),
                 "selection": "fixed scale",
                 "scales_m": list(self.spatial_adjust_scales),
                 "primary_scale_m": self.spatial_adjust_scales[0],
@@ -5514,7 +5661,7 @@ class MetricFusionEngine:
                 },
             }
         return {
-            **(first or {"method": self.spatial_adjust_method}),
+            **(first or self._method_record()),
             "candidates": list(self.spatial_adjust_df),
             "criterion": self.spatial_adjust_criterion,
             "neighbours": self.spatial_adjust_neighbours,
@@ -5529,7 +5676,7 @@ class MetricFusionEngine:
             "clusters": (first or {}).get("n_components"),
             "paired_rule": (
                 self.spatial_paired_smooth
-                if self.spatial_adjust_method == "spatial_plus"
+                if self._basis == "exposure"
                 else "outcome"
             ),
             "selections": int(self._spatial_selections["n"]),
@@ -6376,7 +6523,7 @@ class MetricFusionEngine:
                 return_all=return_all,
                 nan_on_fail=nan_on_fail,
                 spatial_basis=spatial_basis,
-                spatial_method=self.spatial_adjust_method,
+                spatial_method=self._scoring_spatial_method,
                 target=spec.association_target,
             )
         return objective_scoring.score(
@@ -6386,7 +6533,7 @@ class MetricFusionEngine:
             covariates=covariates,
             return_pvalue=return_pvalue,
             spatial_basis=spatial_basis,
-            spatial_method=self.spatial_adjust_method,
+            spatial_method=self._scoring_spatial_method,
             **self._residualize_options,
             pdcor_cache=self._pdcor_cache,
             spline_cache=self._spline_basis_cache,
@@ -6547,9 +6694,9 @@ class MetricFusionEngine:
             test_pval = None
 
         result = {"test_score": test_score, "metric": metric}
-        if self.spatial_adjust_method != "none":
+        if self._basis != "none":
             result["spatial_adjustment"] = self._spatial_adjust_summary or {
-                "method": self.spatial_adjust_method,
+                **self._method_record(),
                 "applied": False,
             }
         if test_pval is not None:
@@ -6742,7 +6889,7 @@ class MetricFusionEngine:
                 include_time_fixed=self._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
-                spatial_method=self.spatial_adjust_method,
+                spatial_method=self._scoring_spatial_method,
                 n_bootstrap=min(int(n_bootstrap), self._MIXEDLM_TEST_CI_BOOTSTRAP_CAP),
                 ci_level=float(ci_level),
                 seed=int(seed),
@@ -6795,7 +6942,7 @@ class MetricFusionEngine:
                     covariates=cov_part,
                     return_pvalue=False,
                     spatial_basis=sb_part,
-                    spatial_method=self.spatial_adjust_method,
+                    spatial_method=self._scoring_spatial_method,
                     **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
@@ -6844,7 +6991,7 @@ class MetricFusionEngine:
         """
         return (
             metric in ("r2", *resampling.RESIDUAL_METRICS)
-            and self.spatial_adjust_method != "none"
+            and self._basis != "none"
             and self.residualize_method == "linear"
         )
 
@@ -6858,7 +7005,7 @@ class MetricFusionEngine:
                 resampling.r2_bootstrap_scorer(n_cov_cols),
                 resampling.r2_permutation_scorer(n_cov_cols),
             )
-        method = self.spatial_adjust_method
+        method = self._scoring_spatial_method
         return (
             resampling.residual_bootstrap_scorer(metric, n_cov_cols, method),
             resampling.residual_permutation_scorer(metric, n_cov_cols, method),
@@ -7169,7 +7316,7 @@ class MetricFusionEngine:
         is degenerate.
         """
         n_cov_cols = 0 if cov is None else int(np.asarray(cov).shape[1])
-        if self.spatial_adjust_method == "none":
+        if self._basis == "none":
             return cov, n_cov_cols
         sb = self._spatial_basis_columns(
             self._whole_data_coords(df), target, cov, composite
@@ -7226,7 +7373,7 @@ class MetricFusionEngine:
                     c_arr,
                     cov_part,
                     spatial_basis=sb_part,
-                    spatial_method=self.spatial_adjust_method,
+                    spatial_method=self._scoring_spatial_method,
                     **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
@@ -7434,7 +7581,7 @@ class MetricFusionEngine:
                     include_time_fixed=self._effective_time_fixed(spec),
                     random_slope=spec.random_slope_time,
                     spatial_basis=sb,
-                    spatial_method=self.spatial_adjust_method,
+                    spatial_method=self._scoring_spatial_method,
                     n_bootstrap=n_boot,
                     ci_level=ci_level,
                     seed=int(sub_seed),
@@ -7891,7 +8038,7 @@ class MetricFusionEngine:
                     c_arr,
                     cov_part,
                     spatial_basis=sb_part,
-                    spatial_method=self.spatial_adjust_method,
+                    spatial_method=self._scoring_spatial_method,
                     **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
@@ -8033,15 +8180,17 @@ class MetricFusionEngine:
 
         ``(smooth of the CGI, smooth of the other exposure, record)``; the same
         array twice when the two share one, ``(None, None, None)`` unadjusted.
-        Under ``spatial_plus`` :attr:`spatial_paired_smooth` decides: ``own``
+        When the exposure model picks the df, :attr:`spatial_paired_smooth`
+        decides: ``own``
         selects each smooth on its exposure (as when each is scored alone),
         ``cgi`` gives both the CGI's, ``outcome`` both one selected on the
-        outcome given the covariates (the KS-AIC rule), ``max`` both the larger
-        of the two exposures' dfs. Under ``ks_aic`` the smooth is selected on
-        the outcome already, so every rule is ``outcome``. The record is
+        outcome given the covariates (the outcome-model rule), ``max`` both the
+        larger of the two exposures' dfs. When the outcome model picks the df
+        the smooth is selected on the outcome already, so every rule is
+        ``outcome``. The record is
         ``{"method", "rule", "df_cgi", "df_exposure"}``.
         """
-        method = self.spatial_adjust_method
+        method = self._basis
         if method == "none" or coords is None:
             return None, None, None
         if self._spatial_scale is not None:
@@ -8049,13 +8198,13 @@ class MetricFusionEngine:
             s = None if chosen is None else chosen["columns"]
             df = None if chosen is None else chosen["df"]
             return s, s, {
-                "method": method,
+                **self._method_record(),
                 "rule": "shared",
                 "df_cgi": df,
                 "df_exposure": df,
                 "scale_m": self._spatial_scale,
             }
-        rule = self.spatial_paired_smooth if method == "spatial_plus" else "outcome"
+        rule = self.spatial_paired_smooth if method == "exposure" else "outcome"
 
         def cols(chosen):
             if chosen is None or chosen["columns"] is None:
@@ -8080,7 +8229,7 @@ class MetricFusionEngine:
                 df_cgi = df_std = max(dfs) if dfs else None
                 s_cgi = s_std = self._smooth_at(coords, target, cov, df_cgi)
         record = {
-            "method": method,
+            **self._method_record(),
             "rule": rule,
             "df_cgi": df_cgi,
             "df_exposure": df_std,
@@ -8907,8 +9056,8 @@ class MetricFusionEngine:
         ``coords`` are :meth:`_whole_data_coords` of an ``apply_fusion`` frame
         and ``rows`` a mask over it. The smooth is built on those rows as the
         scores build theirs, with its df selected on ``exposure``
-        (``spatial_plus``) or on ``outcome`` given the covariates
-        (``ks_aic``). The record is ``{"method", "df", "at_cap", "ic"}`` (the
+        (``df_exposure_ic``) or on ``outcome`` given the covariates
+        (``df_outcome_ic``). The record is ``{"method", "df", "at_cap", "ic"}`` (the
         last two once a selection ran: whether the largest candidate won, and
         the criterion of every design compared); ``df`` is ``None`` when no
         smooth is used (no coordinates, or the criterion kept none).
@@ -8921,7 +9070,7 @@ class MetricFusionEngine:
                 None if cov is None else cov[rows],
                 exposure[rows],
             )
-        record = {"method": self.spatial_adjust_method, "df": None}
+        record = {**self._method_record(), "df": None}
         if self._spatial_scale is not None:
             record["scale_m"] = self._spatial_scale
         if chosen is None:
@@ -8952,16 +9101,16 @@ class MetricFusionEngine:
         """The smooths of ``exposure``'s slopes on the target and each control.
 
         ``((columns, record), {control: (columns, record)})`` over ``rows``
-        (:meth:`_reporting_smooth`): under ``spatial_plus`` one smooth, selected
-        on the exposure, serves every outcome; under ``ks_aic`` each outcome has
-        its own, selected on it. Without spatial adjustment every pair is
-        ``(None, None)``.
+        (:meth:`_reporting_smooth`): when the exposure model picks the df (or
+        a fixed scale sets it) one smooth serves every outcome; when the outcome
+        model does each outcome has its own, selected on it. Without spatial
+        adjustment every pair is ``(None, None)``.
         """
-        method = self.spatial_adjust_method
+        method = self._basis
         if method == "none":
             return (None, None), dict.fromkeys(controls, (None, None))
         on_target = self._reporting_smooth(coords, rows, target, cov, exposure)
-        if method == "spatial_plus":
+        if method == "exposure":
             return on_target, dict.fromkeys(controls, on_target)
         return on_target, {
             c: self._reporting_smooth(coords, rows, values, cov, exposure)
@@ -9015,8 +9164,9 @@ class MetricFusionEngine:
         areas instead of entities. ``None`` when no controls are configured.
 
         With spatial adjustment on, every slope, contrast and objective score
-        also adjusts for the split's spatial smooth: the composite's under
-        ``spatial_plus``, each outcome's own under ``ks_aic``
+        also adjusts for the split's spatial smooth: the composite's when the
+        exposure model picks the df, each outcome's own when the outcome model
+        does
         (:meth:`_slope_smooths`); each outcome's entry records it under
         ``spatial_adjustment``.
         """
@@ -9049,7 +9199,7 @@ class MetricFusionEngine:
             return None
         clusters = self._reporting_clusters(df, cluster_column)
         coords = self._whole_data_coords(df)
-        method = self.spatial_adjust_method
+        method = self._basis
 
         def objective(y, x, c, smooth):
             if metric is None:
@@ -9063,7 +9213,7 @@ class MetricFusionEngine:
                         x[keep],
                         None if c is None else c[keep],
                         spatial_basis=None if smooth is None else smooth[keep],
-                        spatial_method=method,
+                        spatial_method=self._scoring_spatial_method,
                     )
                 )
             except Exception:
@@ -9085,9 +9235,9 @@ class MetricFusionEngine:
                 coords, mask, composite, target, controls, cov
             )
             extra = None
-            if method == "spatial_plus":
+            if method == "exposure":
                 extra = {"exposure": t_smooth}
-            elif method == "ks_aic":
+            elif method == "outcome":
                 extra = {
                     "target": t_smooth,
                     "controls": {k: s for k, (s, _) in c_smooths.items()},
@@ -9187,10 +9337,10 @@ class MetricFusionEngine:
         controls or exposures; ``{"skipped": "longitudinal"}`` for a panel.
 
         With spatial adjustment on, the held-out spatial smooth joins the
-        covariates (:meth:`_slope_smooths`): under ``spatial_plus`` each
+        covariates (:meth:`_slope_smooths`): under the exposure rule each
         exposure has its own, selected on it, which the paired resamples carry
-        for that exposure's two slopes; under ``ks_aic`` each outcome has its
-        own. Every slope and row records it under ``spatial_adjustment`` (a row:
+        for that exposure's two slopes; under the outcome rule each outcome has
+        its own. Every slope and row records it under ``spatial_adjustment`` (a row:
         ``df_cgi`` / ``df_exposure`` or ``df_target`` / ``df_control``).
         """
         from . import negative_controls as _nc
@@ -9235,7 +9385,7 @@ class MetricFusionEngine:
         c_t = None if cov is None else cov[test]
         cl_t = None if clusters is None else clusters[test]
         coords = self._whole_data_coords(df)
-        method = self.spatial_adjust_method
+        method = self._basis
         (cgi_smooth, cgi_record), cgi_smooths = self._slope_smooths(
             coords, test, x_cgi, target, controls, cov
         )
@@ -9260,20 +9410,21 @@ class MetricFusionEngine:
                     slopes["controls"][c]["spatial_adjustment"] = e_smooths[c][1]
             out["slopes"][name] = slopes
             for j, (c, v) in enumerate(controls.items()):
-                # Spatial+ adjusts each exposure for its own smooth, KS-AIC each
-                # outcome; the record names the df of the two smooths in play.
+                # The exposure rule adjusts each exposure for its own smooth,
+                # the outcome rule each outcome; the record names the df of the
+                # two smooths in play.
                 extra, record = None, None
-                if method == "spatial_plus":
+                if method == "exposure":
                     extra = {"exposure": cgi_smooth, "other": e_smooth}
                     record = {
-                        "method": method,
+                        **self._method_record(),
                         "df_cgi": cgi_record["df"],
                         "df_exposure": e_record["df"],
                     }
-                elif method == "ks_aic":
+                elif method == "outcome":
                     extra = {"target": cgi_smooth, "control": cgi_smooths[c][0]}
                     record = {
-                        "method": method,
+                        **self._method_record(),
                         "df_target": cgi_record["df"],
                         "df_control": cgi_smooths[c][1]["df"],
                     }
@@ -9611,7 +9762,7 @@ class MetricFusionEngine:
                 rec_cgi,
             )
         if specificity:
-            method = self.spatial_adjust_method
+            method = self._basis
             for name, x in xs.items():
                 if name == "cgi":
                     continue
@@ -9619,11 +9770,11 @@ class MetricFusionEngine:
                 out["delta_d"][name] = {}
                 for j, (c, v) in enumerate(controls.items()):
                     pairs = {}
-                    if method == "spatial_plus":
+                    if method == "exposure":
                         for role, sm in (("exposure", s_cgi), ("other", s_e)):
                             for outcome in ("target", "control"):
                                 pairs[(role, outcome)] = sm
-                    elif method == "ks_aic":
+                    elif method == "outcome":
                         for role in ("exposure", "other"):
                             pairs[(role, "target")] = s_cgi
                             pairs[(role, "control")] = s_cgi_c[c][0]

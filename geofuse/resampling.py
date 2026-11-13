@@ -432,8 +432,7 @@ def _on_residuals(metric: str, rt: np.ndarray, rc: np.ndarray) -> float:
 
 def _residual_designs(n: int, parts, spatial_method: str):
     """The outcome's and the exposure's designs: ``[1, covariates, smooth]``
-    for both, under KS-AIC and Spatial+ alike (the methods differ only in
-    which variable selected the smooth)."""
+    for both, whichever model selected the basis size."""
     dense, smooth = parts
     d_t = BlockDesign(n, dense, smooth)
     return d_t, d_t

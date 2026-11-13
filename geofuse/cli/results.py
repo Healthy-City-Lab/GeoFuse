@@ -18,7 +18,7 @@ import shutil
 from pathlib import Path
 
 from geofuse.cli.commands import EXIT_OK, CliError, _state
-from geofuse.jobs.outer_splits import finite_or_none, spatial_label
+from geofuse.jobs.outer_splits import finite_or_none, method_label, spatial_label
 
 _CHANNELS = {"veg": "vegetation", "terrain": "terrain", "ndvi": "NDVI", "gvi": "GVI"}
 
@@ -303,7 +303,7 @@ def _spatial_lines(bundle: dict) -> list[str]:
     reference = (bundle.get("comparator_reference") or {}).get("test") or {}
     record = target.get("spatial_adjustment") or reference.get("spatial_adjustment")
     outer = (bundle.get("outer_splits") or {}).get("splits") or []
-    line = f"  Spatial adjust   {adjustment['method']} smooth in the scores"
+    line = f"  Spatial adjust   {method_label(adjustment)}: in the scores"
     if record is not None or any("spatial_method" in r for r in outer):
         line += ", slopes, negative controls and specificity"
     if record is not None and record.get("scale_m") is not None:

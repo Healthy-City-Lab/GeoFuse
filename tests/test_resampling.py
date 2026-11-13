@@ -60,7 +60,7 @@ def _study(n=900, seed=0, tiny=(5, 6)):
 
 
 def _r2_ref(y, x, cov, S):
-    return osc.score("r2", y, x, cov, spatial_basis=S, spatial_method="spatial_plus")
+    return osc.score("r2", y, x, cov, spatial_basis=S, spatial_method="basis")
 
 
 class BlockEngineTests(unittest.TestCase):
@@ -179,7 +179,7 @@ class ResamplingLoopTests(unittest.TestCase):
 
     def test_residual_metrics(self):
         d, k = self.d, self.k
-        for method in ("spatial_plus", "ks_aic"):
+        for method in ("basis",):
             for metric in ("distance_corr", "nrmse"):
 
                 def score_fn(t, p, c, metric=metric, method=method):

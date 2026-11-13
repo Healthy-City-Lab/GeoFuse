@@ -452,13 +452,6 @@ def _compute_all_metrics(
     }
 
 
-def _residualize_on(y: np.ndarray, X: np.ndarray) -> np.ndarray:
-    """OLS residuals of ``y ~ X`` (intercept added)."""
-    Xc = np.column_stack([np.ones(len(y)), X])
-    beta, *_ = np.linalg.lstsq(Xc, y, rcond=None)
-    return y - Xc @ beta
-
-
 def score_mixedlm(
     metric: str,
     outcome: np.ndarray,
@@ -501,10 +494,9 @@ def score_mixedlm(
         Return a ``dict`` of all four metric values from the same fit (uses
         one extra fit for the LR test). Overrides ``return_pvalue``.
     spatial_basis, spatial_method
-        Optional df-selected coordinate smooth and the adjustment method. With
-        ``ks_aic`` the smooth enters the model as extra fixed effects; with
-        ``spatial_plus`` the greenery is additionally residualized on the smooth
-        before fitting. ``none`` (or no basis) leaves the model unchanged.
+        Optional coordinate basis and the adjustment method. With ``basis``
+        the basis enters the model as extra fixed effects. ``none`` (or no
+        basis) leaves the model unchanged.
     nan_on_fail
         Return ``NaN`` instead of the degenerate ``0.0`` when the model can't be
         fit or the input is degenerate. Off by default (a bad trial fails soft to
@@ -562,11 +554,8 @@ def score_mixedlm(
         cov = combined[:, :n_cov] if n_cov > 0 else None
         sb = combined[:, n_cov:]
 
-    # Fold the smooth in: as fixed effects (both methods) and, for spatial_plus,
-    # by residualizing the greenery exposure on it first.
+    # Fold the basis in as fixed effects.
     if sb is not None and sb.shape[1] > 0 and len(g) > sb.shape[1] + 1:
-        if spatial_method == "spatial_plus" and float(np.var(g)) > 0:
-            g = _residualize_on(g, sb)
         cov = sb if cov is None else np.hstack([cov, sb])
 
     n_groups = len(np.unique(eids)) if len(eids) else 0

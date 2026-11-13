@@ -1305,7 +1305,7 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
                 include_time_fixed=engine._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
-                spatial_method=engine.spatial_adjust_method,
+                spatial_method=engine._scoring_spatial_method,
                 target=spec.association_target,
             )
             return 1 if float(coef) >= 0 else -1
@@ -1315,7 +1315,7 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
                 pred,
                 cov,
                 spatial_basis=res.get("spatial_basis"),
-                spatial_method=getattr(engine, "spatial_adjust_method", "none"),
+                spatial_method=getattr(engine, "_scoring_spatial_method", "none"),
                 **getattr(engine, "_residualize_options", {}),
             )
         )

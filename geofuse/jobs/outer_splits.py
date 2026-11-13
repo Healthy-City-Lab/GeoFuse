@@ -131,19 +131,44 @@ def scale_text(scale: float | None) -> str:
     return "none" if scale is None else f"{float(scale):g}"
 
 
+def method_name(record: dict | None) -> str | None:
+    """The adjustment's short name: ``"basis fixed_scale"``, ``"spatial_plus
+    gcv"``; a record from before the methods were renamed keeps its own."""
+    if not record or not record.get("method"):
+        return None
+    method = str(record["method"])
+    detail = record.get("select") or record.get("criterion")
+    return f"{method} {detail}" if detail else method
+
+
+def method_label(record: dict | None) -> str | None:
+    """What the adjustment computed, with its reference
+    (:data:`geofuse.fusion.SPATIAL_LABELS`); the short name for a record
+    without one."""
+    from geofuse.fusion import SPATIAL_LABELS
+
+    if not record or not record.get("method"):
+        return None
+    if record["method"] == "basis" and record.get("select") in SPATIAL_LABELS:
+        return SPATIAL_LABELS[record["select"]]
+    return SPATIAL_LABELS.get(str(record["method"]), method_name(record))
+
+
 def spatial_label(record: dict | None) -> str | None:
-    """A ``spatial_adjustment`` record as text: ``"spatial_plus df 3"``,
-    ``"ks_aic df target 2, control none"``; ``None`` without a record."""
+    """A ``spatial_adjustment`` record as text: ``"basis df_exposure_ic df
+    3"``, ``"basis df_outcome_ic df target 2, control none"``, ``"basis
+    fixed_scale at 5 km"``; ``None`` without a record."""
     if not record:
         return None
+    name = method_name(record)
     if record.get("scale_m") is not None:
-        return f"{record.get('method')} at {float(record['scale_m']) / 1000:g} km"
+        return f"{name} at {float(record['scale_m']) / 1000:g} km"
     dfs = [
         ("" if key == "df" else f"{key[3:]} ") + ("none" if v is None else str(v))
         for key, v in record.items()
         if key.startswith("df")
     ]
-    return f"{record.get('method')} df {', '.join(dfs)}"
+    return f"{name} df {', '.join(dfs)}"
 
 
 def _row(quantity: str, exposure: str, spatial: dict | None = None, **values) -> dict:

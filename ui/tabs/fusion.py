@@ -434,6 +434,17 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "spatial_adjust_scale_m",
     "spatial_adjust_min_component",
     "spatial_tune_scale_m",
+    "spatial_adjust_select",
+    "spatial_tune_method",
+    "spatial_tune_select",
+    "spatial_plus_groups_column",
+    "spatial_plus_k",
+    "spatial_plus_criterion",
+    "spatial_plus_checks",
+    "spatial_plus_step1_covariates",
+    "spatial_select_scales_m",
+    "spatial_select_criterion",
+    "spatial_select_controls",
     "spatial_split",
     "spatial_block_size_m",
     "spatial_split_mode",
@@ -500,7 +511,8 @@ _SPATIAL_SPLIT_MODE_LABELS: dict[str, str] = {
 # Criteria that pick the spatial df (``settings.SPATIAL_CRITERIA``).
 _SPATIAL_CRITERION_LABELS: dict[str, str] = {"aic": "AIC", "bic": "BIC"}
 
-# Smooth of each exposure in a Spatial+ paired test
+# Smooth of each exposure in a paired test when the exposure model picks the
+# df
 # (``settings.SPATIAL_PAIRED_SMOOTHS``).
 _SPATIAL_PAIRED_SMOOTH_LABELS: dict[str, str] = {
     "own": "Each exposure's own",
@@ -508,6 +520,182 @@ _SPATIAL_PAIRED_SMOOTH_LABELS: dict[str, str] = {
     "outcome": "Selected on the outcome",
     "max": "The larger df of the two",
 }
+
+
+# Spatial-confounding adjustments (``settings.SPATIAL_ADJUST_METHODS``).
+_SPATIAL_ADJUST_LABELS: dict[str, str] = {
+    "none": "Off (control listed covariates only)",
+    "basis": "Thin-plate basis (Keller & Szpiro 2020)",
+    "spatial_plus": "Spatial+ (Dupont et al. 2022)",
+}
+
+# How a basis adjustment sets its size (``settings.SPATIAL_ADJUST_SELECTS``).
+_SPATIAL_SELECT_LABELS: dict[str, str] = {
+    "df_outcome_ic": "df by AIC/BIC of the outcome model (recommended)",
+    "df_exposure_ic": "df by AIC/BIC of the exposure model (df-Spatial+)",
+    "fixed_scale": "Fixed pattern scale",
+    "scale_ic": "Scale by AIC/BIC of the outcome model",
+}
+
+# How the tuning scale is set (``settings.SPATIAL_TUNE_SELECTS``).
+_SPATIAL_TUNE_SELECT_LABELS: dict[str, str] = {
+    "fixed_scale": "The scale given",
+    "scale_ic": "Chosen per split by AIC/BIC",
+}
+
+# Negative controls of a scale selection (``settings.SPATIAL_SELECT_CONTROLS``).
+_SPATIAL_SELECT_CONTROLS_LABELS: dict[str, str] = {
+    "target": "The target's scale",
+    "own": "Each control's own",
+}
+
+# Criteria that pick the Spatial+ penalties (``settings.SPATIAL_PLUS_CRITERIA``).
+_SPATIAL_PLUS_CRITERION_LABELS: dict[str, str] = {"gcv": "GCV", "reml": "REML"}
+
+
+def _render_scale_selection() -> tuple[list[int], str, str]:
+    """The scale-selection inputs: candidate scales, criterion and the
+    controls' rule; returns ``(scales, criterion, controls)``."""
+    _default(
+        "fusion_spatial_select_scales_m",
+        _df_list_text(_fs_default("spatial_select_scales_m")),
+    )
+    _default(
+        "fusion_spatial_select_criterion",
+        _fs_default("spatial_select_criterion"),
+        list(_SPATIAL_CRITERION_LABELS),
+    )
+    _default(
+        "fusion_spatial_select_controls",
+        _fs_default("spatial_select_controls"),
+        list(_SPATIAL_SELECT_CONTROLS_LABELS),
+    )
+    text = st.text_input(
+        "Candidate scales (m)",
+        key="fusion_spatial_select_scales_m",
+        help=(
+            "Pattern scales the selection compares, besides no smooth, on one "
+            "set of clusters: the criterion of the outcome model without the "
+            "exposure picks one per split."
+        ),
+    )
+    try:
+        scales = _FS["spatial_select_scales_m"].check("spatial_select_scales_m", text)
+    except _gf_settings.SettingError as exc:
+        st.error(f"{exc} Using the default scales.")
+        scales = list(_fs_default("spatial_select_scales_m"))
+    cols = st.columns(2)
+    with cols[0]:
+        criterion = st.selectbox(
+            "Scale criterion",
+            options=list(_SPATIAL_CRITERION_LABELS),
+            format_func=lambda k: _SPATIAL_CRITERION_LABELS[k],
+            key="fusion_spatial_select_criterion",
+            help="BIC picks a coarser or equal scale; both are saved.",
+        )
+    with cols[1]:
+        controls = st.selectbox(
+            "Controls' scale",
+            options=list(_SPATIAL_SELECT_CONTROLS_LABELS),
+            format_func=lambda k: _SPATIAL_SELECT_CONTROLS_LABELS[k],
+            key="fusion_spatial_select_controls",
+            help="Negative controls use the target's scale, or select their own.",
+        )
+    return list(scales), str(criterion), str(controls)
+
+
+def _render_spatial_plus() -> tuple[dict, float | None, int | None]:
+    """The Spatial+ options; returns ``(settings, eps_m, min_component)``."""
+    _default("fusion_spatial_plus_groups_column", "")
+    for name in ("spatial_plus_k", "spatial_plus_step1_covariates"):
+        _default(f"fusion_{name}", _fs_default(name))
+    _default(
+        "fusion_spatial_plus_criterion",
+        _fs_default("spatial_plus_criterion"),
+        list(_SPATIAL_PLUS_CRITERION_LABELS),
+    )
+    _default("fusion_spatial_plus_checks", list(_fs_default("spatial_plus_checks")))
+    _default("fusion_spatial_tune_inputs", False)
+    _default("fusion_spatial_adjust_eps_m", _fs_default("spatial_adjust_eps_m") or 0)
+    _default("fusion_spatial_adjust_min_component", 0)
+    with st.expander("Spatial+ — advanced", expanded=False):
+        groups = st.text_input(
+            "Spatial+ groups column",
+            key="fusion_spatial_plus_groups_column",
+            help=(
+                "A target column whose values are the groups (a site); each "
+                "group gets its own intercept, trend and penalized smooth. "
+                "Empty = clusters split at the cluster gap."
+            ),
+        )
+        cols = st.columns(2)
+        with cols[0]:
+            k = st.number_input(
+                "Basis size per group",
+                **_fs_bounds("spatial_plus_k"),
+                step=10,
+                key="fusion_spatial_plus_k",
+                help="Knots per group, at most its rows − 4 (mgcv's k).",
+            )
+            criterion = st.selectbox(
+                "Penalty criterion",
+                options=list(_SPATIAL_PLUS_CRITERION_LABELS),
+                format_func=lambda c: _SPATIAL_PLUS_CRITERION_LABELS[c],
+                key="fusion_spatial_plus_criterion",
+                help="Picks every group's smoothing parameter: GCV, or REML.",
+            )
+        with cols[1]:
+            eps_ui = st.number_input(
+                "Cluster gap eps (m, 0 = 10 km)",
+                min_value=0,
+                step=100,
+                key="fusion_spatial_adjust_eps_m",
+                help="Distance above which entities fall into different groups.",
+            )
+            min_component = st.number_input(
+                "Smallest cluster (0 = auto)",
+                min_value=0,
+                max_value=int(_FS["spatial_adjust_min_component"].hi),
+                step=1,
+                key="fusion_spatial_adjust_min_component",
+                help="A smaller cluster joins its nearest larger one. 0 = 30.",
+            )
+        checks = st.multiselect(
+            "Check criteria",
+            options=list(_SPATIAL_PLUS_CRITERION_LABELS),
+            format_func=lambda c: _SPATIAL_PLUS_CRITERION_LABELS[c],
+            key="fusion_spatial_plus_checks",
+            help="Also run these criteria; their rows are marked as checks.",
+        )
+        step1_cov = st.checkbox(
+            "Exposure step adjusts for the covariates",
+            key="fusion_spatial_plus_step1_covariates",
+            help=(
+                "The published method removes only the exposure's spatial part "
+                "in its first step; this adds the covariates there too."
+            ),
+        )
+        tune_inputs = st.checkbox(
+            "Residualize the search inputs",
+            key="fusion_spatial_tune_inputs",
+            help=(
+                "Tune on local greenery: every layer, radius and statistic is "
+                "residualized on its own penalized smooth before the search "
+                "(a geofuse extension of Spatial+; linear form only)."
+            ),
+        )
+    settings = {
+        "spatial_plus_groups_column": groups.strip() or None,
+        "spatial_plus_k": int(k),
+        "spatial_plus_criterion": str(criterion),
+        "spatial_plus_checks": [
+            c for c in _SPATIAL_PLUS_CRITERION_LABELS if c in checks
+        ],
+        "spatial_plus_step1_covariates": bool(step1_cov),
+        "spatial_tune_method": "spatial_plus_inputs" if tune_inputs else "basis",
+    }
+    eps = float(eps_ui) if eps_ui and eps_ui > 0 else None
+    return settings, eps, int(min_component) or None
 
 
 def _df_list_text(dfs) -> str:
@@ -582,6 +770,14 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "spatial_paired_smooth": "fusion_spatial_paired_smooth",
     "spatial_adjust_min_component": "fusion_spatial_adjust_min_component",
     "spatial_tune_scale_m": "fusion_spatial_tune_scale_m",
+    "spatial_tune_select": "fusion_spatial_tune_select",
+    "spatial_plus_k": "fusion_spatial_plus_k",
+    "spatial_plus_criterion": "fusion_spatial_plus_criterion",
+    "spatial_plus_checks": "fusion_spatial_plus_checks",
+    "spatial_plus_step1_covariates": "fusion_spatial_plus_step1_covariates",
+    "spatial_plus_groups_column": "fusion_spatial_plus_groups_column",
+    "spatial_select_criterion": "fusion_spatial_select_criterion",
+    "spatial_select_controls": "fusion_spatial_select_controls",
     "resume_existing_study": "fusion_resume_study",
     "multi_objective_requested": "fusion_multi_objective_run",
     "gvi_buffer_min_m": "fusion_gvi_buffer_min",
@@ -674,6 +870,25 @@ def _seed_fusion_form(p: dict) -> None:
     scales = p.get("spatial_adjust_scale_m")
     st.session_state["fusion_spatial_adjust_scale_m"] = (
         _df_list_text(scales) if scales else ""
+    )
+    # A study recorded before the select setting existed names its method the
+    # older way; it comes back as what it computed.
+    if p.get("spatial_adjust_method") is not None:
+        method, select = _gf_settings.spatial_method_pair(
+            p["spatial_adjust_method"],
+            p.get("spatial_adjust_select"),
+            scales=scales,
+            tune_scale=p.get("spatial_tune_scale_m"),
+        )
+        st.session_state["fusion_spatial_adjust_method"] = method
+        if select is not None:
+            st.session_state["fusion_spatial_adjust_select"] = select
+    if p.get("spatial_select_scales_m"):
+        st.session_state["fusion_spatial_select_scales_m"] = _df_list_text(
+            p["spatial_select_scales_m"]
+        )
+    st.session_state["fusion_spatial_tune_inputs"] = (
+        p.get("spatial_tune_method") == "spatial_plus_inputs"
     )
 
     types = dict(p.get("covariate_types") or {})
@@ -2557,6 +2772,12 @@ def _render_study_details_panel(
     spatial_adjust_scale_m: list[int] | None = None
     spatial_adjust_min_component: int | None = None
     spatial_tune_scale_m: int | None = None
+    spatial_adjust_select = _fs_default("spatial_adjust_select")
+    spatial_tune_select = _fs_default("spatial_tune_select")
+    spatial_select_scales_m = list(_fs_default("spatial_select_scales_m"))
+    spatial_select_criterion = _fs_default("spatial_select_criterion")
+    spatial_select_controls = _fs_default("spatial_select_controls")
+    spatial_plus_settings: dict = {}
     st.markdown("**Per-pixel CGI scoring**")
     _grid = _FS["cgi_grid_spacing_m"]
     _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
@@ -2640,11 +2861,6 @@ def _render_study_details_panel(
             )
 
         # ── Spatial-confounding adjustment ──────────────────
-        _spatial_adjust_labels = {
-            "none": "Off (control listed covariates only)",
-            "ks_aic": "KS-AIC (recommended)",
-            "spatial_plus": "Spatial+ (df-Spatial+)",
-        }
         _spatial_adjust_keys = list(_FS["spatial_adjust_method"].choices)
         _default(
             "fusion_spatial_adjust_method",
@@ -2654,20 +2870,42 @@ def _render_study_details_panel(
         spatial_adjust_method = st.selectbox(
             "Spatial-confounding adjustment",
             options=_spatial_adjust_keys,
-            format_func=lambda k: _spatial_adjust_labels[k],
+            format_func=lambda k: _SPATIAL_ADJUST_LABELS[k],
             key="fusion_spatial_adjust_method",
             help=(
                 "Remove unmeasured smooth spatial confounding from the reported "
-                "results by adding a coordinate smooth (per spatial cluster, df "
-                "chosen by AIC) to the held-out scores, paired tests, slopes, "
-                "negative controls and specificity contrast. KS-AIC (Keller & "
-                "Szpiro) is recommended; Spatial+ residualizes the greenery "
-                "exposure on the smooth instead. The CGI's tuning is unchanged; "
-                "the reported association becomes fine-scale (within-cluster) "
-                "contrast."
+                "results. Thin-plate basis: an unpenalized basis of the "
+                "coordinates (per spatial cluster) joins the held-out scores, "
+                "paired tests, slopes, negative controls and specificity "
+                "contrast (Keller & Szpiro 2020). Spatial+: penalized smooths "
+                "per site, the exposure's spatial part removed first (Dupont, "
+                "Wood & Augustin 2022), reported beside the unadjusted results. "
+                "The CGI's tuning is unchanged unless tuning within areas is set."
             ),
         )
-        if spatial_adjust_method != "none":
+        if spatial_adjust_method == "basis":
+            _select_keys = list(_FS["spatial_adjust_select"].choices)
+            _default(
+                "fusion_spatial_adjust_select",
+                _fs_default("spatial_adjust_select"),
+                _select_keys,
+            )
+            spatial_adjust_select = st.selectbox(
+                "Basis size",
+                options=_select_keys,
+                format_func=lambda k: _SPATIAL_SELECT_LABELS[k],
+                key="fusion_spatial_adjust_select",
+                help=(
+                    "How the basis size is set: the df by AIC/BIC of the "
+                    "outcome model without the exposure (Keller & Szpiro 2020); "
+                    "the df by AIC/BIC of the exposure model (df-Spatial+; "
+                    "unpenalized, so the same adjustment with another size); a "
+                    "fixed pattern scale (set it under the advanced options); "
+                    "or the scale chosen by AIC/BIC of the outcome model among "
+                    "candidate scales."
+                ),
+            )
+        if spatial_adjust_method == "basis":
             _default(
                 "fusion_spatial_adjust_df", _df_list_text(spatial_adjust_df)
             )
@@ -2822,7 +3060,7 @@ def _render_study_details_panel(
                             key="fusion_spatial_adjust_knots_max",
                         )
                     )
-                if spatial_adjust_method == "spatial_plus":
+                if spatial_adjust_select == "df_exposure_ic":
                     spatial_paired_smooth = st.selectbox(
                         "Paired-test smooth",
                         options=list(_SPATIAL_PAIRED_SMOOTH_LABELS),
@@ -2835,6 +3073,34 @@ def _render_study_details_panel(
                             "printed scores."
                         ),
                     )
+                _default(
+                    "fusion_spatial_tune_select",
+                    _fs_default("spatial_tune_select"),
+                    list(_SPATIAL_TUNE_SELECT_LABELS),
+                )
+                spatial_tune_select = st.selectbox(
+                    "Tuning scale",
+                    options=list(_SPATIAL_TUNE_SELECT_LABELS),
+                    format_func=lambda k: _SPATIAL_TUNE_SELECT_LABELS[k],
+                    key="fusion_spatial_tune_select",
+                    help=(
+                        "The scale tuned within: the one given above, or "
+                        "chosen on each split's train+val rows by AIC/BIC of "
+                        "the outcome model among the candidate scales."
+                    ),
+                )
+                if "scale_ic" in (spatial_adjust_select, spatial_tune_select):
+                    (
+                        spatial_select_scales_m,
+                        spatial_select_criterion,
+                        spatial_select_controls,
+                    ) = _render_scale_selection()
+        if spatial_adjust_method == "spatial_plus":
+            (
+                spatial_plus_settings,
+                spatial_adjust_eps_m,
+                spatial_adjust_min_component,
+            ) = _render_spatial_plus()
 
     # ────────────────────────────────────────────────────────────
     # Exposure buffer
@@ -2946,6 +3212,28 @@ def _render_study_details_panel(
         "spatial_adjust_scale_m": spatial_adjust_scale_m,
         "spatial_adjust_min_component": spatial_adjust_min_component,
         "spatial_tune_scale_m": spatial_tune_scale_m,
+        "spatial_adjust_select": str(spatial_adjust_select),
+        "spatial_tune_method": spatial_plus_settings.get(
+            "spatial_tune_method", _fs_default("spatial_tune_method")
+        ),
+        "spatial_tune_select": (
+            str(spatial_tune_select)
+            if spatial_adjust_method == "basis"
+            else _fs_default("spatial_tune_select")
+        ),
+        **{
+            key: spatial_plus_settings.get(key, _fs_default(key))
+            for key in (
+                "spatial_plus_groups_column",
+                "spatial_plus_k",
+                "spatial_plus_criterion",
+                "spatial_plus_checks",
+                "spatial_plus_step1_covariates",
+            )
+        },
+        "spatial_select_scales_m": list(spatial_select_scales_m),
+        "spatial_select_criterion": str(spatial_select_criterion),
+        "spatial_select_controls": str(spatial_select_controls),
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
         "spatial_split_mode": str(spatial_split_mode),
@@ -3371,8 +3659,9 @@ def _render_specificity_contrast(results_view: dict) -> None:
     if any(r.get("spatial_adjustment") for r in rows):
         st.caption(
             "Spatially adjusted: every slope also controls for a coordinate "
-            "smooth, each exposure's own under Spatial+ and each outcome's own "
-            "under KS-AIC; the column gives the df of the two smooths in play."
+            "basis, each exposure's own when the exposure model picks the df "
+            "and each outcome's own when the outcome model does; the column "
+            "gives the df of the two smooths in play."
         )
 
 
@@ -5551,9 +5840,9 @@ def _render_negative_controls(report: dict | None) -> None:
         "composite is more or less specific than a single channel."
         + (
             " Spatially adjusted: β, the difference and the objective also "
-            "control for a coordinate smooth, the composite's under Spatial+ "
-            "and each outcome's own under KS-AIC (its df in the Spatial smooth "
-            "column)."
+            "control for a coordinate basis, the composite's when the exposure "
+            "model picks the df and each outcome's own when the outcome model "
+            "does (its df in the Spatial smooth column)."
             if adjusted
             else ""
         )
@@ -7127,6 +7416,13 @@ def render(output_dir: str) -> None:
                 "spatial_adjust_method": (
                     spatial_adjust_method_param if is_vector_target else "none"
                 ),
+                "spatial_adjust_select": (
+                    study_state.get(
+                        "spatial_adjust_select", _fs_default("spatial_adjust_select")
+                    )
+                    if is_vector_target and spatial_adjust_method_param == "basis"
+                    else None
+                ),
                 "spatial_adjust_df": list(spatial_adjust_df_param),
                 "spatial_adjust_eps_m": (
                     spatial_adjust_eps_m_param if is_vector_target else None
@@ -7142,6 +7438,16 @@ def render(output_dir: str) -> None:
                         "spatial_adjust_scale_m",
                         "spatial_adjust_min_component",
                         "spatial_tune_scale_m",
+                        "spatial_tune_method",
+                        "spatial_tune_select",
+                        "spatial_plus_groups_column",
+                        "spatial_plus_k",
+                        "spatial_plus_criterion",
+                        "spatial_plus_checks",
+                        "spatial_plus_step1_covariates",
+                        "spatial_select_scales_m",
+                        "spatial_select_criterion",
+                        "spatial_select_controls",
                     )
                 },
                 # Spatial block validation applies to vector targets only;

@@ -7,12 +7,13 @@ for the same kind of coordinate smooth the scores do. Pinned here:
   slopes, an outcome's only the slopes on it, and unit weights reproduce
   :func:`negative_controls.partial_slope` on each slope's own design;
 - a smooth confounder driving exposure, target and control (no effect): under
-  ``spatial_plus`` the held-out slope and the control slope shrink towards 0,
+  a basis the held-out slope and the control slope shrink towards 0,
   and the slope equals an OLS on the covariates plus the same smooth columns;
 - a true within-area effect survives the adjustment;
 - with unit weights the specificity contrast's four slopes are the adjusted
-  partial slopes (each exposure's own smooth under ``spatial_plus``, each
-  outcome's under ``ks_aic``), and every slope and row records its smooth;
+  partial slopes (each exposure's own smooth when the exposure model picks the
+  df, each outcome's when the outcome model does), and every slope and row
+  records its smooth;
 - ``none`` adds no record anywhere;
 - the records become text columns on the slope rows; in a spatially adjusted
   run with two held-out splits every split's slope rows carry them, the
@@ -42,6 +43,7 @@ import pandas as pd
 from geofuse import negative_controls as nc
 from geofuse.jobs import outer_splits
 from geofuse.statistical_testing import corrected_resampled_t
+from spatial_names import SELECT, stand_in
 
 # ────────────────────────────────────────────────────────────────────
 # The statistics' extra columns
@@ -154,6 +156,7 @@ class TestExtraColumns(unittest.TestCase):
 # ────────────────────────────────────────────────────────────────────
 
 _METHODS = (
+    "_method_record",
     "_reporting_covariate_matrix",
     "_reporting_raw_column",
     "_reporting_clusters",
@@ -190,7 +193,7 @@ def _field(n_ent, rng, effect=0.0):
     return xy, exposure, target, control, bench
 
 
-def _engine(method="spatial_plus", n_ent=600, n_test=300, seed=11, effect=0.0):
+def _engine(method="exposure", n_ent=600, n_test=300, seed=11, effect=0.0):
     """The engine's reporting methods over entities whose frames the test sets:
     the CGI, a comparator ``bench`` (frame in another order) and one control."""
     from geofuse.fusion import MetricFusionEngine as E
@@ -232,7 +235,7 @@ def _engine(method="spatial_plus", n_ent=600, n_test=300, seed=11, effect=0.0):
         _covariate_dummy_map={},
         test_data=full[full["polygon_id"] < n_test],
         _active_greenery_channel="cgi",
-        spatial_adjust_method=method,
+        **stand_in(method),
         spatial_adjust_max_df=10,
         spatial_adjust_df=tuple(range(11)),
         spatial_adjust_criterion="aic",
@@ -283,7 +286,7 @@ def _control_beta(eng) -> float:
 class TestSmoothConfounder(unittest.TestCase):
     def test_the_slopes_shrink_towards_zero(self):
         plain = _engine("none")
-        adjusted = _engine("spatial_plus")
+        adjusted = _engine("exposure")
         for name, slope in (("held-out", _held_out_beta), ("control", _control_beta)):
             with self.subTest(name):
                 before, after = slope(plain), slope(adjusted)
@@ -291,7 +294,7 @@ class TestSmoothConfounder(unittest.TestCase):
                 self.assertLess(abs(after), 0.25 * before)
 
     def test_the_slope_is_an_ols_on_the_covariates_and_the_same_smooth(self):
-        for method in ("spatial_plus", "ks_aic"):
+        for method in ("exposure", "outcome"):
             with self.subTest(method):
                 eng = _engine(method)
                 got = eng.compute_partial_slopes({})["test"]
@@ -303,19 +306,20 @@ class TestSmoothConfounder(unittest.TestCase):
                 want = _ols_beta(d["x"][t], d["y"][t], controls)
                 self.assertAlmostEqual(got["beta"], want, delta=1e-8)
                 self.assertEqual(got["spatial_adjustment"], record)
-                self.assertEqual(record["method"], method)
+                self.assertEqual(record["method"], "basis")
+                self.assertEqual(record["select"], SELECT[method])
                 self.assertIsInstance(record["df"], int)
 
     def test_a_true_within_area_effect_survives(self):
-        got = _engine("spatial_plus", effect=0.3).compute_partial_slopes({})["test"]
+        got = _engine("exposure", effect=0.3).compute_partial_slopes({})["test"]
         self.assertGreater(got["ci_low"], 0.0)
 
     def test_every_split_and_every_outcome_records_its_smooth(self):
-        eng = _engine("ks_aic")
+        eng = _engine("outcome")
         slopes = eng.compute_partial_slopes({})
         self.assertEqual(set(slopes), {"test", "train_val", "all"})
         for entry in slopes.values():
-            self.assertEqual(entry["spatial_adjustment"]["method"], "ks_aic")
+            self.assertEqual(entry["spatial_adjustment"]["select"], "df_outcome_ic")
         report = eng.compute_negative_controls({}, metric="r2", n_boot=50)
         for res in report["splits"].values():
             self.assertIn("spatial_adjustment", res["target"])
@@ -337,8 +341,8 @@ class TestSmoothConfounder(unittest.TestCase):
 class TestSpecificityAdjusted(unittest.TestCase):
     exposures = {"bench": ("comparator:bench", {})}
 
-    def test_spatial_plus_gives_each_exposure_its_own_smooth(self):
-        eng = _engine("spatial_plus")
+    def test_the_exposure_rule_gives_each_exposure_its_own_smooth(self):
+        eng = _engine("exposure")
         out = eng.compute_specificity_contrast({}, self.exposures, n_boot=0)
         (row,) = out["rows"]
         cgi = eng.compute_partial_slopes({})["test"]
@@ -355,14 +359,14 @@ class TestSpecificityAdjusted(unittest.TestCase):
             row["beta_control_cgi"], controls["controls"]["grip"]["beta"], places=10
         )
         record = row["spatial_adjustment"]
-        self.assertEqual(record["method"], "spatial_plus")
+        self.assertEqual(record["select"], "df_exposure_ic")
         self.assertEqual(record["df_cgi"], cgi["spatial_adjustment"]["df"])
         self.assertEqual(
             record["df_exposure"], own["target"]["spatial_adjustment"]["df"]
         )
 
-    def test_ks_aic_gives_each_outcome_its_own_smooth(self):
-        eng = _engine("ks_aic")
+    def test_the_outcome_rule_gives_each_outcome_its_own_smooth(self):
+        eng = _engine("outcome")
         out = eng.compute_specificity_contrast({}, self.exposures, n_boot=0)
         (row,) = out["rows"]
         d, t = eng.data, eng.test
@@ -379,11 +383,16 @@ class TestSpecificityAdjusted(unittest.TestCase):
             self.assertAlmostEqual(row[key], want, delta=1e-8, msg=key)
         self.assertEqual(
             row["spatial_adjustment"],
-            {"method": "ks_aic", "df_target": r_t["df"], "df_control": r_c["df"]},
+            {
+                "method": "basis",
+                "select": "df_outcome_ic",
+                "df_target": r_t["df"],
+                "df_control": r_c["df"],
+            },
         )
 
     def test_the_cgi_against_itself_differs_by_zero(self):
-        out = _engine("spatial_plus").compute_specificity_contrast(
+        out = _engine("exposure").compute_specificity_contrast(
             {}, {"same": ("cgi", {})}, n_boot=100
         )
         (row,) = out["rows"]
@@ -397,28 +406,41 @@ class TestSpecificityAdjusted(unittest.TestCase):
 
 class TestRecords(unittest.TestCase):
     def test_columns_and_labels(self):
-        one = {"method": "spatial_plus", "df": 3}
-        pair = {"method": "ks_aic", "df_target": 2, "df_control": None}
+        one = {"method": "basis", "select": "df_exposure_ic", "df": 3}
+        pair = {
+            "method": "basis",
+            "select": "df_outcome_ic",
+            "df_target": 2,
+            "df_control": None,
+        }
         self.assertEqual(
             outer_splits.spatial_columns(one),
-            {"spatial_method": "spatial_plus", "spatial_df": "3"},
+            {
+                "spatial_method": "basis",
+                "spatial_select": "df_exposure_ic",
+                "spatial_df": "3",
+            },
         )
         self.assertEqual(
             outer_splits.spatial_columns(pair),
             {
-                "spatial_method": "ks_aic",
+                "spatial_method": "basis",
+                "spatial_select": "df_outcome_ic",
                 "spatial_df_target": "2",
                 "spatial_df_control": "none",
             },
         )
         self.assertEqual(outer_splits.spatial_columns(None), {})
-        self.assertEqual(outer_splits.spatial_label(one), "spatial_plus df 3")
         self.assertEqual(
-            outer_splits.spatial_label(pair), "ks_aic df target 2, control none"
+            outer_splits.spatial_label(one), "basis df_exposure_ic df 3"
+        )
+        self.assertEqual(
+            outer_splits.spatial_label(pair),
+            "basis df_outcome_ic df target 2, control none",
         )
 
     def test_slope_rows_carry_the_record_and_the_summary_the_method(self):
-        record = {"method": "spatial_plus", "df": 4}
+        record = {"method": "basis", "select": "df_exposure_ic", "df": 4}
         slope = {"beta": 0.1, "ci_low": 0.0, "ci_high": 0.2, "t": 2.0, "df": 300}
         rows = []
         for k in range(3):
@@ -436,7 +458,7 @@ class TestRecords(unittest.TestCase):
         score = [r for r in rows if r["quantity"] == "held_out_score"]
         self.assertNotIn("spatial_method", score[0])
         summary = {e["quantity"]: e for e in outer_splits.summarise(rows)}
-        self.assertEqual(summary["held_out_beta"]["spatial_method"], "spatial_plus")
+        self.assertEqual(summary["held_out_beta"]["spatial_method"], "basis")
         self.assertNotIn("spatial_method", summary["held_out_score"])
 
 
@@ -495,7 +517,7 @@ class TestAdjustedRun(unittest.TestCase):
                     self.assertIn(quantity, quantities)
                     for r in split:
                         if r["quantity"] == quantity:
-                            self.assertEqual(r["spatial_method"], "spatial_plus")
+                            self.assertEqual(r["spatial_method"], "basis")
         diffs = [r for r in rows if r["quantity"] == "specificity_difference"]
         self.assertTrue(all("spatial_df_cgi" in r for r in diffs))
 
@@ -503,7 +525,7 @@ class TestAdjustedRun(unittest.TestCase):
         outer = self.bundle["outer_splits"]
         rows = [r for r in outer["splits"] if r["quantity"] == "held_out_beta"]
         (entry,) = [e for e in outer["summary"] if e["quantity"] == "held_out_beta"]
-        self.assertEqual(entry["spatial_method"], "spatial_plus")
+        self.assertEqual(entry["spatial_method"], "basis")
         want = corrected_resampled_t(
             [r["estimate"] for r in rows],
             float(np.mean([r["test_share"] for r in rows])),
@@ -528,7 +550,7 @@ class TestAdjustedRun(unittest.TestCase):
                 table = self._table(name)
                 self.assertIn(column, table[0])
                 methods = {r["spatial_method"] for r in table if r["spatial_method"]}
-                self.assertEqual(methods, {"spatial_plus"})
+                self.assertEqual(methods, {"basis"})
 
 
     def test_the_covariates_only_reports_say_so(self):
@@ -599,15 +621,15 @@ class TestDirection(unittest.TestCase):
             "spatial_basis": u.reshape(-1, 1),
         }
         signs = {}
-        for method in ("none", "spatial_plus", "ks_aic"):
+        for method in ("none", "basis"):
             eng = types.SimpleNamespace(
                 evaluate_on_test=lambda **kw: dict(held_out),
                 is_longitudinal=False,
-                spatial_adjust_method=method,
+                _scoring_spatial_method=method,
                 residualize_method="linear",
             )
             signs[method] = fusion_outputs._direction_sign(eng, {}, "r2")
-        self.assertEqual(signs, {"none": 1, "spatial_plus": -1, "ks_aic": -1})
+        self.assertEqual(signs, {"none": 1, "basis": -1})
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -619,9 +641,14 @@ class TestCommandLine(unittest.TestCase):
     def test_the_summary_names_the_adjustment(self):
         from geofuse.cli import results
 
-        record = {"method": "spatial_plus", "df": 3}
+        record = {"method": "basis", "select": "df_exposure_ic", "df": 3}
         bundle = {
-            "test_results": {"spatial_adjustment": {"method": "spatial_plus"}},
+            "test_results": {
+                "spatial_adjustment": {
+                    "method": "basis",
+                    "select": "df_exposure_ic",
+                }
+            },
             "negative_controls": {
                 "splits": {"test": {"target": {"spatial_adjustment": record}}}
             },
@@ -639,7 +666,8 @@ class TestCommandLine(unittest.TestCase):
                         "p_value": 0.01,
                         "n": 300,
                         "spatial_adjustment": {
-                            "method": "spatial_plus",
+                            "method": "basis",
+                            "select": "df_exposure_ic",
                             "df_cgi": 3,
                             "df_exposure": 2,
                         },
@@ -649,14 +677,16 @@ class TestCommandLine(unittest.TestCase):
         }
         text = "\n".join(results.summary("y", bundle, Path(".")))
         self.assertIn(
-            "Spatial adjust   spatial_plus smooth in the scores, slopes, negative "
+            "Spatial adjust   basis size by AIC/BIC of the exposure model "
+            "(df-Spatial+, Rainey 2025; unpenalized, equal to the basis "
+            "adjustment, Dupont et al. 2022 §4): in the scores, slopes, negative "
             "controls and specificity (held-out β: df 3)",
             text,
         )
-        self.assertIn("spatial_plus df cgi 3, exposure 2", text)
+        self.assertIn("basis df_exposure_ic df cgi 3, exposure 2", text)
         old = {"test_results": {"spatial_adjustment": {"method": "ks_aic"}}}
         lines = results.summary("y", old, Path("."))
-        self.assertIn("  Spatial adjust   ks_aic smooth in the scores", lines)
+        self.assertIn("  Spatial adjust   ks_aic: in the scores", lines)
 
 
 if __name__ == "__main__":

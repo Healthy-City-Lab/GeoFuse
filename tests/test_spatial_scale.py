@@ -10,7 +10,8 @@ Pinned here:
   ratio near 9; a planted field four scales long is absorbed, one half a
   scale long mostly not;
 - one shared smooth: the slope is an OLS on the covariates and that smooth,
-  ``spatial_plus`` and ``ks_aic`` and every paired rule give the same numbers,
+  both df rules (outcome and exposure model) and every paired rule give the
+  same numbers,
   and a paired difference is the difference of the two printed scores;
 - the ladder: another scale's rows equal a run at that scale with the primary
   scale's clusters, the ``none`` rows an unadjusted run, and the summary
@@ -166,7 +167,7 @@ class ClusterTests(unittest.TestCase):
 # ────────────────────────────────────────────────────────────────────
 
 
-def _reporting(method="spatial_plus", scales=(3_000.0,), eps=None, **kw):
+def _reporting(method="exposure", scales=(3_000.0,), eps=None, **kw):
     eng = reporting_fixture._engine(method, **kw)
     return _scaled(eng, scales, eps=eps)
 
@@ -189,8 +190,8 @@ class SharedSmoothTests(unittest.TestCase):
             record["absorbed"], _absorbed_share(d["x"][t], smooth), places=6
         )
 
-    def test_spatial_plus_and_ks_aic_give_the_same_numbers(self):
-        plus, ks = _reporting("spatial_plus"), _reporting("ks_aic")
+    def test_both_df_rules_give_the_same_numbers(self):
+        plus, ks = _reporting("exposure"), _reporting("outcome")
         exposures = {"bench": ("comparator:bench", {})}
         pairs = [
             (e.compute_partial_slopes({})["test"]["beta"] for e in (plus, ks)),
@@ -213,11 +214,11 @@ class SharedSmoothTests(unittest.TestCase):
     def test_every_paired_rule_gives_the_difference_of_the_printed_scores(self):
         outs = []
         for method, rule in (
-            ("spatial_plus", "own"),
-            ("spatial_plus", "cgi"),
-            ("spatial_plus", "max"),
-            ("spatial_plus", "outcome"),
-            ("ks_aic", "own"),
+            ("exposure", "own"),
+            ("exposure", "cgi"),
+            ("exposure", "max"),
+            ("exposure", "outcome"),
+            ("outcome", "own"),
         ):
             eng = _scaled(paired_fixture._engine(method, rule), (3_000.0,))
             out = paired_fixture._paired(eng)
@@ -269,7 +270,7 @@ class LadderTests(unittest.TestCase):
                     )
         # The primary scale is back in place afterwards.
         self.assertEqual(eng._spatial_scale, 3_000.0)
-        self.assertEqual(eng.spatial_adjust_method, "spatial_plus")
+        self.assertEqual(eng._basis, "exposure")
 
     def test_the_summary_groups_per_scale_and_holm_takes_the_primary(self):
         rows = []

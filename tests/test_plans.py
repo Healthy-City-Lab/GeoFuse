@@ -758,7 +758,8 @@ class TabParityTests(_Case):
             "fusion_residualize_spline_df": 5,
             "fusion_residualize_spline_min_unique": 9,
             "fusion_exposure_response_spline_df": 6,
-            "fusion_spatial_adjust_method": "spatial_plus",
+            "fusion_spatial_adjust_method": "basis",
+            "fusion_spatial_adjust_select": "df_exposure_ic",
             "fusion_spatial_adjust_df": "0, 2, 5, 9",
             "fusion_spatial_adjust_criterion": "bic",
             "fusion_spatial_adjust_neighbours": 7,
@@ -782,7 +783,8 @@ class TabParityTests(_Case):
             residualize_spline_df = 5
             residualize_spline_min_unique = 9
             exposure_response_spline_df = 6
-            spatial_adjust_method = "spatial_plus"
+            spatial_adjust_method = "basis"
+            spatial_adjust_select = "df_exposure_ic"
             spatial_adjust_df = [9, 0, 5, 2]
             spatial_adjust_criterion = "bic"
             spatial_adjust_neighbours = 7

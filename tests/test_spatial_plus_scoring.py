@@ -1,9 +1,10 @@
-"""Scores under ``spatial_plus`` residualise both sides on covariates + smooth.
+"""Scores under a ``basis`` adjustment residualise both sides on covariates +
+basis.
 
 Pinned here:
 
-- on a fixed smooth, ``spearman``, ``distance_corr``, ``nrmse`` and the
-  direction under ``spatial_plus`` equal ``ks_aic``;
+- the older spellings ``ks_aic`` / ``spatial_plus`` are refused by the scorer
+  (the engine maps them before scoring);
 - the partial correlation behind ``spearman`` is the Frisch–Waugh one (the
   exposure residualised on covariates and smooth), so an exposure that tracks
   the covariates is not attenuated;
@@ -43,7 +44,7 @@ def _resid(v, X):
     return v - Xc @ np.linalg.lstsq(Xc, v, rcond=None)[0]
 
 
-class TestSpatialPlusMatchesKsAic(unittest.TestCase):
+class TestBasisScores(unittest.TestCase):
     def setUp(self):
         self.y, self.x, self.cov, self.s = _data()
 
@@ -57,17 +58,13 @@ class TestSpatialPlusMatchesKsAic(unittest.TestCase):
             spatial_method=method,
         )
 
-    def test_the_residualising_metrics(self):
-        for metric in ("spearman", "distance_corr", "nrmse", "r2"):
-            self.assertAlmostEqual(
-                self._score(metric, "spatial_plus"),
-                self._score(metric, "ks_aic"),
-                places=12,
-                msg=metric,
-            )
+    def test_the_older_spellings_are_refused(self):
+        for method in ("spatial_plus", "ks_aic"):
+            with self.assertRaises(ValueError):
+                self._score("r2", method)
 
     def test_the_direction(self):
-        for method in ("spatial_plus", "ks_aic"):
+        for method in ("basis",):
             self.assertEqual(
                 osc.relationship_sign(
                     self.y,
@@ -85,7 +82,7 @@ class TestSpatialPlusMatchesKsAic(unittest.TestCase):
         ry = _resid(rankdata(self.y), design)
         rx = _resid(rankdata(self.x), design)
         ref = abs(np.corrcoef(ry, rx)[0, 1])
-        self.assertAlmostEqual(self._score("spearman", "spatial_plus"), ref, 12)
+        self.assertAlmostEqual(self._score("spearman", "basis"), ref, 12)
         smooth_only = abs(np.corrcoef(ry, _resid(rankdata(self.x), self.s))[0, 1])
         self.assertLess(smooth_only, ref)
 
@@ -97,7 +94,7 @@ class TestSpatialPlusMatchesKsAic(unittest.TestCase):
             return 1 - np.var(_resid(self.y, X)) / np.var(self.y)
 
         self.assertAlmostEqual(
-            self._score("r2", "spatial_plus"), r2(full) - r2(design), places=12
+            self._score("r2", "basis"), r2(full) - r2(design), places=12
         )
 
 
@@ -105,7 +102,7 @@ class TestIndependentExposure(unittest.TestCase):
     def test_the_score_moves_only_by_noise(self):
         y, x, cov, s = _data(seed=3, n=4000, tie=0.0)
         new = osc.score(
-            "spearman", y, x, cov, spatial_basis=s, spatial_method="spatial_plus"
+            "spearman", y, x, cov, spatial_basis=s, spatial_method="basis"
         )
         ranks = np.column_stack([rankdata(c) for c in cov.T])
         ry = _resid(rankdata(y), np.column_stack([ranks, s]))

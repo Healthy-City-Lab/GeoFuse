@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from geofuse import objective_scoring
+from spatial_names import stand_in
 from geofuse.fusion import MetricFusionEngine as E
 
 _METHODS = (
@@ -33,6 +34,7 @@ _METHODS = (
     "_whole_data_coords",
     "_whole_data_longitudinal_keys",
     "_paired_smooths",
+    "_method_record",
     "_smooth_at",
     "_spatial_selection",
     "_note_basis_summary",
@@ -47,7 +49,7 @@ _METHODS = (
 )
 
 
-def _engine(method="spatial_plus", rule="own", n=500, seed=5):
+def _engine(method="exposure", rule="own", n=500, seed=5):
     """The paired-difference methods over a CGI whose spatial part is smooth
     and a standalone exposure whose spatial part is rough, so Spatial+ picks
     different dfs for the two."""
@@ -84,7 +86,7 @@ def _engine(method="spatial_plus", rule="own", n=500, seed=5):
         covariate_columns=["age"],
         test_data=full[full["polygon_id"] < n // 2],
         _active_greenery_channel="cgi",
-        spatial_adjust_method=method,
+        **stand_in(method),
         spatial_paired_smooth=rule,
         spatial_adjust_df=tuple(range(11)),
         spatial_adjust_max_df=10,
@@ -135,7 +137,7 @@ def _held_out_score(eng, exposure):
         exposure[test],
         cov,
         spatial_basis=sb,
-        spatial_method=eng.spatial_adjust_method,
+        spatial_method=eng._scoring_spatial_method,
     )
 
 
@@ -167,9 +169,9 @@ class PairedSmoothTests(unittest.TestCase):
         rec = fast["spatial_adjustment"]
         self.assertEqual(rec["df_cgi"], rec["df_exposure"])
 
-    def test_outcome_equals_a_ks_aic_run(self):
+    def test_outcome_equals_an_outcome_rule_run(self):
         plus = _paired(_engine(rule="outcome"))
-        ks = _paired(_engine(method="ks_aic"))
+        ks = _paired(_engine(method="outcome"))
         for key in ("observed_diff", "cgi_score", "standalone_score", "lower", "upper"):
             self.assertAlmostEqual(plus[key], ks[key], places=12, msg=key)
         self.assertEqual(plus["spatial_adjustment"]["rule"], "outcome")
@@ -180,9 +182,9 @@ class PairedSmoothTests(unittest.TestCase):
         larger = max(d for d in (own["df_cgi"], own["df_exposure"]) if d is not None)
         self.assertEqual((rec["df_cgi"], rec["df_exposure"]), (larger, larger))
 
-    def test_every_rule_is_outcome_under_ks_aic(self):
+    def test_every_rule_is_outcome_under_the_outcome_rule(self):
         rules = ("own", "cgi", "max")
-        rows = [_paired(_engine(method="ks_aic", rule=r)) for r in rules]
+        rows = [_paired(_engine(method="outcome", rule=r)) for r in rules]
         for row in rows[1:]:
             for key in ("observed_diff", "lower", "upper", "p_value"):
                 self.assertEqual(row[key], rows[0][key], key)

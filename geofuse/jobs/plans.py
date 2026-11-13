@@ -495,7 +495,11 @@ def _expand_fusion(step: _rf.Step, by_step: dict[str, list[JobSpec]]) -> list[Jo
                 ]
                 + [
                     step.settings[k]
-                    for k in ("outer_null_group", "weight_column")
+                    for k in (
+                        "outer_null_group",
+                        "weight_column",
+                        "spatial_plus_groups_column",
+                    )
                     if step.settings.get(k)
                 ]
             )
@@ -903,11 +907,29 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
 
     s, o = spec.settings, spec.options
     vector, polygon = o["vector"], o["polygon"]
-    adjust = s["spatial_adjust_method"] if vector else "none"
-    adjusted = adjust != "none"
+    # A spec recorded before the select setting existed has no
+    # ``spatial_adjust_select``: its method is mapped to what it computed.
+    adjust, select = _settings.spatial_method_pair(
+        s["spatial_adjust_method"] if vector else "none",
+        s.get("spatial_adjust_select"),
+        scales=s.get("spatial_adjust_scale_m"),
+        tune_scale=s.get("spatial_tune_scale_m"),
+    )
+    # The basis settings act only under the basis adjustment.
+    adjusted = adjust == "basis"
+    spatial_plus = adjust == "spatial_plus"
+    defaults = _settings.defaults("fusion")
+
+    def opt(key: str):
+        return s.get(key, defaults[key])
+
     # The spatial null's gap clusters read the smooth's gap settings, so they
     # reach the engine whenever the null calibration runs.
-    gaps = adjusted or (int(s["outer_null_runs"]) > 0 and int(s["outer_splits"]) > 1)
+    gaps = (
+        adjusted
+        or spatial_plus
+        or (int(s["outer_null_runs"]) > 0 and int(s["outer_splits"]) > 1)
+    )
     blocks = vector and s["spatial_split"]
     form = "linear" if s["index_form"] == "sweep" else s["index_form"]
     covariates = list(o["covariates"])
@@ -990,6 +1012,21 @@ def fusion_run_config(spec: JobSpec) -> dict[str, Any]:
         "whole_grid_scaling": bool(s["whole_grid_scaling"]) if vector else True,
         "area_balanced_split": bool(s["area_balanced_split"]) if polygon else False,
         "spatial_adjust_method": adjust,
+        "spatial_adjust_select": select,
+        "spatial_tune_method": opt("spatial_tune_method"),
+        "spatial_tune_select": (
+            opt("spatial_tune_select") if adjusted else "fixed_scale"
+        ),
+        "spatial_plus_groups_column": (
+            opt("spatial_plus_groups_column") or None if spatial_plus else None
+        ),
+        "spatial_plus_k": int(opt("spatial_plus_k")),
+        "spatial_plus_criterion": opt("spatial_plus_criterion"),
+        "spatial_plus_checks": list(opt("spatial_plus_checks")),
+        "spatial_plus_step1_covariates": bool(opt("spatial_plus_step1_covariates")),
+        "spatial_select_scales_m": list(opt("spatial_select_scales_m")),
+        "spatial_select_criterion": opt("spatial_select_criterion"),
+        "spatial_select_controls": opt("spatial_select_controls"),
         "spatial_adjust_df": (
             _settings.spatial_df_candidates(s)
             if adjusted

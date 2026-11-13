@@ -136,7 +136,7 @@ class TestScoreSpatialAdjustment(unittest.TestCase):
         _df, cols = sb.select_df_aic(target, basis, None)
         naive = osc.score("distance_corr", target, cgi)
         adj = osc.score(
-            "distance_corr", target, cgi, spatial_basis=cols, spatial_method="ks_aic"
+            "distance_corr", target, cgi, spatial_basis=cols, spatial_method="basis"
         )
         self.assertGreater(naive, 0.6)
         self.assertLess(adj, 0.2)
@@ -151,7 +151,7 @@ class TestScoreSpatialAdjustment(unittest.TestCase):
         basis = sb.build_block_basis(xy, max_df=12)
         _df, cols = sb.select_df_aic(target, basis, None)
         adj = osc.score(
-            "distance_corr", target, cgi, spatial_basis=cols, spatial_method="ks_aic"
+            "distance_corr", target, cgi, spatial_basis=cols, spatial_method="basis"
         )
         self.assertGreater(adj, 0.3)  # genuine effect kept
 
@@ -165,7 +165,7 @@ class TestScoreSpatialAdjustment(unittest.TestCase):
         _df, cols = sb.select_df_aic(target, basis, None)
         mi0 = osc.score("mutual_info", target, cgi)
         mi1 = osc.score(
-            "mutual_info", target, cgi, spatial_basis=cols, spatial_method="ks_aic"
+            "mutual_info", target, cgi, spatial_basis=cols, spatial_method="basis"
         )
         self.assertAlmostEqual(mi0, mi1, places=10)
 
@@ -216,7 +216,7 @@ class TestMixedlmSpatialAdjustment(unittest.TestCase):
         _df, cols = sb.select_df_aic(y, basis, None)
         none = mx.score_mixedlm("mixedlm_tstat", y, g, eid, t)
         ks = mx.score_mixedlm(
-            "mixedlm_tstat", y, g, eid, t, spatial_basis=cols, spatial_method="ks_aic"
+            "mixedlm_tstat", y, g, eid, t, spatial_basis=cols, spatial_method="basis"
         )
         self.assertGreater(none, 5.0)
         self.assertLess(ks, none / 2.0)

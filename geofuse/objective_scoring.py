@@ -149,11 +149,12 @@ RESIDUALIZE_IGNORED: frozenset[str] = frozenset(
     {"partial_distance_corr", "mutual_info", "quartile_contrast"}
 )
 
-# Spatial-confounding adjustment methods. ``none`` reproduces the plain
-# covariate-residualized score. ``ks_aic`` (Keller & Szpiro) and ``spatial_plus``
-# (df-Spatial+) fold a coordinate smooth into the residualization — see
-# :func:`score` and :mod:`geofuse.spatial_basis`.
-SPATIAL_METHODS: frozenset[str] = frozenset({"none", "ks_aic", "spatial_plus"})
+# Spatial-confounding adjustment of a score. ``none`` reproduces the plain
+# covariate-residualized score; ``basis`` folds an unpenalized coordinate basis
+# into the residualization on both sides — see :func:`score` and
+# :mod:`geofuse.spatial_basis`. How the basis size was chosen does not change
+# how a score uses it.
+SPATIAL_METHODS: frozenset[str] = frozenset({"none", "basis"})
 
 # Worst score returned when the inputs are degenerate (all-NaN, constant, < 3
 # rows).
@@ -294,10 +295,10 @@ def _spatial_designs(
     """Control designs to residualize the (target, cgi) sides on, per method.
 
     * ``none`` / no basis → both sides get the covariates.
-    * ``ks_aic`` / ``spatial_plus`` → both sides get ``[covariates,
-      spatial_basis]``: the partial association of cgi in ``target ~ cgi +
-      covariates + smooth`` (Frisch–Waugh needs the full design on both sides).
-      The two methods differ only in which variable selected the smooth's df.
+    * ``basis`` → both sides get ``[covariates, spatial_basis]``: the partial
+      association of cgi in ``target ~ cgi + covariates + smooth``
+      (Frisch–Waugh needs the full design on both sides), whichever model
+      selected the basis size.
     """
     if spatial_basis is None or method == "none":
         return cov, cov
@@ -584,9 +585,8 @@ def score(
 
     ``spatial_basis`` is an optional already-df-selected coordinate smooth (the
     output of :func:`geofuse.spatial_basis.select_df_aic`). With ``spatial_method``
-    ``ks_aic`` or ``spatial_plus`` it joins the covariates on both sides (the
-    methods differ in which variable selected its df, not in how the score uses
-    it). ``spatial_method="none"`` (or a
+    ``basis`` it joins the covariates on both sides, whichever model selected
+    its size. ``spatial_method="none"`` (or a
     missing basis) reproduces the plain covariate-residualized score. The smooth
     is ignored by ``mutual_info`` (like covariates).
 

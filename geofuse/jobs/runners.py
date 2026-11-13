@@ -35,6 +35,7 @@ from geofuse import bayesian_index as _bayesian_index
 from geofuse import cgi_formulas as _cgi_formulas
 from geofuse import metric_intake, parallel
 from geofuse import pdcor as _pdcor_mod
+from geofuse import settings as _settings
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -1626,6 +1627,22 @@ def _non_default_options(values: dict) -> dict:
     return {k: v for k, v in values.items() if v != defaults[k]}
 
 
+def _fingerprint_spelling(method: str, select: str | None, tune_method: str) -> str:
+    """The adjustment as the search fingerprint spells it.
+
+    A basis adjustment keeps the names it had before the methods were named
+    by what they compute (``ks_aic`` when the outcome model picks the df,
+    ``spatial_plus`` otherwise), so earlier runs keep their hash. Spatial+
+    reaches only the reports, so it leaves the search's hash alone unless it
+    also residualizes the search inputs.
+    """
+    if method == "basis":
+        return "ks_aic" if select == "df_outcome_ic" else "spatial_plus"
+    if method == "spatial_plus" and tune_method == "spatial_plus_inputs":
+        return "spatial_plus_inputs"
+    return "none"
+
+
 def _fusion_config_fingerprint(
     *,
     buffer_meters: float,
@@ -1967,6 +1984,17 @@ def run_fusion(
     spatial_adjust_scale_m: "list[float] | float | None" = None,
     spatial_adjust_min_component: int | None = None,
     spatial_tune_scale_m: float | None = None,
+    spatial_adjust_select: str | None = None,
+    spatial_tune_method: str = "basis",
+    spatial_tune_select: str = "fixed_scale",
+    spatial_plus_groups_column: str | None = None,
+    spatial_plus_k: int = 300,
+    spatial_plus_criterion: str = "gcv",
+    spatial_plus_checks: list[str] | None = None,
+    spatial_plus_step1_covariates: bool = False,
+    spatial_select_scales_m: list[int] | None = None,
+    spatial_select_criterion: str = "bic",
+    spatial_select_controls: str = "target",
     residualize_method: str = "linear",
     residualize_spline_df: int = 4,
     residualize_spline_min_unique: int = 7,
@@ -2119,6 +2147,14 @@ def run_fusion(
         index_forms: tuple[str, ...] = (
             _bayesian_index.FORMS if index_form == "sweep" else (index_form,)
         )
+        # A job recorded before the select setting existed passes no
+        # ``spatial_adjust_select``: its method is mapped to what it computed.
+        spatial_adjust_method, spatial_adjust_select = _settings.spatial_method_pair(
+            spatial_adjust_method,
+            spatial_adjust_select,
+            scales=spatial_adjust_scale_m,
+            tune_scale=spatial_tune_scale_m,
+        )
         if weight_search and (not weight_column or "synergy" in index_forms):
             raise ValueError(
                 "weight_search needs a weight_column and fits the linear form "
@@ -2200,7 +2236,7 @@ def run_fusion(
         scale_ladder: list[float | None] = (
             [*spatial_scales[1:], None] if len(spatial_scales) > 1 else []
         )
-        if spatial_adjust_method in (None, "none"):
+        if spatial_adjust_method != "basis":
             scale_ladder = []
         ledger = _build_fusion_ledger(
             all_labels,
@@ -2237,15 +2273,60 @@ def run_fusion(
             "spatial_adjust_knots_min": int(spatial_adjust_knots_min),
             "spatial_adjust_knots_max": int(spatial_adjust_knots_max),
         }
+        selection_settings = {
+            "spatial_select_scales_m": list(
+                spatial_select_scales_m or _settings.SPATIAL_SELECT_SCALES_M
+            ),
+            "spatial_select_criterion": str(spatial_select_criterion),
+            "spatial_select_controls": str(spatial_select_controls),
+        }
+        plus_settings = {
+            "spatial_plus_groups_column": spatial_plus_groups_column or None,
+            "spatial_plus_k": int(spatial_plus_k),
+            "spatial_plus_criterion": str(spatial_plus_criterion),
+            "spatial_plus_checks": list(spatial_plus_checks or []),
+            "spatial_plus_step1_covariates": bool(spatial_plus_step1_covariates),
+        }
+        # The search-side options that act: they change the search, so they
+        # join the fingerprint (only when set, so other runs keep their hash).
+        tune_options: dict[str, Any] = {}
+        if str(spatial_tune_method) != "basis":
+            tune_options["spatial_tune_method"] = str(spatial_tune_method)
+            tune_options.update(plus_settings)
+        if spatial_adjust_method == "basis" and str(spatial_tune_select) == "scale_ic":
+            tune_options["spatial_tune_select"] = "scale_ic"
+            tune_options.update(selection_settings)
+        if spatial_adjust_method == "basis" and spatial_adjust_select == "scale_ic":
+            tune_options["spatial_adjust_select"] = "scale_ic"
+            tune_options.update(selection_settings)
         spatial_record: dict[str, Any] = {}
-        if spatial_adjust_method and spatial_adjust_method != "none":
+        if spatial_adjust_method == "basis":
             spatial_record = {
-                "spatial_adjust_method": str(spatial_adjust_method),
+                "spatial_adjust_method": "basis",
+                "spatial_adjust_select": str(spatial_adjust_select),
                 "spatial_adjust_df": list(spatial_dfs),
                 "spatial_adjust_eps_m": spatial_adjust_eps_m,
                 **spatial_settings,
                 "spatial_paired_smooth": str(spatial_paired_smooth),
                 **scale_settings,
+                **(
+                    selection_settings
+                    if "scale_ic" in (spatial_adjust_select, spatial_tune_select)
+                    else {}
+                ),
+                **(
+                    {"spatial_tune_select": str(spatial_tune_select)}
+                    if spatial_tune_select != "fixed_scale"
+                    else {}
+                ),
+            }
+        elif spatial_adjust_method == "spatial_plus":
+            spatial_record = {
+                "spatial_adjust_method": "spatial_plus",
+                "spatial_adjust_eps_m": spatial_adjust_eps_m,
+                "spatial_adjust_min_component": spatial_adjust_min_component,
+                **plus_settings,
+                "spatial_tune_method": str(spatial_tune_method),
             }
         spline_settings = {
             "residualize_spline_df": int(residualize_spline_df),
@@ -2318,7 +2399,7 @@ def run_fusion(
                             }
                         }
                         if not outer_null_group
-                        and spatial_adjust_method in (None, "none")
+                        and spatial_adjust_method != "basis"
                         and (spatial_adjust_eps_m or spatial_adjust_min_component)
                         else {}
                     ),
@@ -2594,6 +2675,17 @@ def run_fusion(
                 spatial_adjust_scale_m=spatial_scales or None,
                 spatial_adjust_min_component=spatial_adjust_min_component,
                 spatial_tune_scale_m=spatial_tune_scale_m or None,
+                spatial_adjust_select=spatial_adjust_select,
+                spatial_tune_method=str(spatial_tune_method),
+                spatial_tune_select=str(spatial_tune_select),
+                spatial_plus_groups_column=spatial_plus_groups_column or None,
+                spatial_plus_k=int(spatial_plus_k),
+                spatial_plus_criterion=str(spatial_plus_criterion),
+                spatial_plus_checks=list(spatial_plus_checks or []),
+                spatial_plus_step1_covariates=bool(spatial_plus_step1_covariates),
+                spatial_select_scales_m=spatial_select_scales_m,
+                spatial_select_criterion=str(spatial_select_criterion),
+                spatial_select_controls=str(spatial_select_controls),
                 residualize_method=residualize_method,
                 residualize_spline_df=int(residualize_spline_df),
                 residualize_spline_min_unique=int(residualize_spline_min_unique),
@@ -2957,12 +3049,18 @@ def run_fusion(
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
-                spatial_adjust_method=spatial_adjust_method,
+                spatial_adjust_method=_fingerprint_spelling(
+                    spatial_adjust_method, spatial_adjust_select, spatial_tune_method
+                ),
                 spatial_adjust_df=spatial_dfs,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
                 spatial_options={
                     **_non_default_options(spatial_settings),
                     **scale_settings,
+                    **{
+                        k: (",".join(map(str, v)) if isinstance(v, list) else v)
+                        for k, v in tune_options.items()
+                    },
                 },
                 residualize_options=(
                     _non_default_options(spline_settings)

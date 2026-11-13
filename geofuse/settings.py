@@ -70,7 +70,7 @@ class Setting:
                 )
             return value
         if self.kind == "multichoice":
-            if not isinstance(value, list) or not value:
+            if not isinstance(value, list) or (not value and self.default != []):
                 raise SettingError(f"'{key}' must be a non-empty list.")
             bad = [v for v in value if v not in self.choices]
             if bad:
@@ -229,8 +229,34 @@ BINARY_ONLY_METRICS = frozenset(
 ASSOCIATION_TARGETS = ("level", "decline_overall", "decline_average", "decline_change")
 #: How each trial's mixed-model variance components are estimated.
 SEARCH_SCORING_METHODS = ("mom_em3", "mom_em1", "mom", "exact")
-#: Spatial-confounding adjustments of the fusion objective.
-SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
+#: ``geofuse.fusion.SPATIAL_ADJUST_METHODS``: no adjustment, an unpenalized
+#: thin-plate basis in the outcome model, or Spatial+ (penalized smooths).
+SPATIAL_ADJUST_METHODS = ("none", "basis", "spatial_plus")
+#: ``geofuse.fusion.SPATIAL_ADJUST_SELECTS``: how a ``basis`` adjustment sets
+#: its size; the first is the default.
+SPATIAL_ADJUST_SELECTS = ("df_outcome_ic", "df_exposure_ic", "fixed_scale", "scale_ic")
+#: ``geofuse.fusion.SPATIAL_TUNE_METHODS``.
+SPATIAL_TUNE_METHODS = ("basis", "spatial_plus_inputs")
+#: ``geofuse.fusion.SPATIAL_TUNE_SELECTS``.
+SPATIAL_TUNE_SELECTS = ("fixed_scale", "scale_ic")
+#: ``geofuse.spatial_plus.CRITERIA``.
+SPATIAL_PLUS_CRITERIA = ("gcv", "reml")
+#: ``geofuse.spatial_scale_selection.DEFAULT_SCALES_M``.
+SPATIAL_SELECT_SCALES_M = (50000, 30000, 20000, 15000, 10000, 7000, 5000, 4000, 3000)
+#: ``geofuse.fusion.SPATIAL_SELECT_CONTROLS``.
+SPATIAL_SELECT_CONTROLS = ("target", "own")
+#: Spellings of ``spatial_adjust_method`` from before the methods were named
+#: by what they compute; see :func:`spatial_method_pair`.
+LEGACY_SPATIAL_METHODS = ("ks_aic",)
+#: Settings that act only under the ``basis`` adjustment. A run file that sets
+#: one of them together with ``spatial_plus`` is refused, as ``spatial_plus``
+#: used to name a basis adjustment.
+BASIS_ONLY_SETTINGS = (
+    "spatial_adjust_df",
+    "spatial_adjust_max_df",
+    "spatial_adjust_scale_m",
+    "spatial_paired_smooth",
+)
 #: ``geofuse.spatial_basis.DEFAULT_DF_CANDIDATES``.
 SPATIAL_DF_CANDIDATES = (0, 1, 2, 3, 4, 6, 8, 11, 15, 20)
 #: ``geofuse.spatial_basis.CRITERIA``.
@@ -557,7 +583,68 @@ FUSION: dict[str, Setting] = {
         "stripe", SPATIAL_SPLIT_MODES, "Test blocks: evenly striped, or at random."
     ),
     "spatial_adjust_method": _choice(
-        "none", SPATIAL_ADJUST_METHODS, "Spatial-confounding adjustment."
+        "none",
+        SPATIAL_ADJUST_METHODS,
+        "Spatial-confounding adjustment of the reported effects: an unpenalized "
+        "thin-plate basis in the outcome model, or Spatial+ (penalized smooths).",
+    ),
+    "spatial_adjust_select": _choice(
+        SPATIAL_ADJUST_SELECTS[0],
+        SPATIAL_ADJUST_SELECTS,
+        "How the basis size is set: df by AIC/BIC of the outcome model without "
+        "the exposure, df by AIC/BIC of the exposure model, a fixed pattern "
+        "scale, or the scale by AIC/BIC of the outcome model.",
+    ),
+    "spatial_tune_method": _choice(
+        SPATIAL_TUNE_METHODS[0],
+        SPATIAL_TUNE_METHODS,
+        "Tuning within areas: the basis at spatial_tune_scale_m joins the "
+        "search's covariates, or every search input is residualized on its own "
+        "penalized smooth (Spatial+ step 1).",
+    ),
+    "spatial_tune_select": _choice(
+        SPATIAL_TUNE_SELECTS[0],
+        SPATIAL_TUNE_SELECTS,
+        "Tuning scale: spatial_tune_scale_m, or chosen per split by AIC/BIC of "
+        "the outcome model.",
+    ),
+    "spatial_plus_groups_column": Setting(
+        "text",
+        None,
+        help="Target column whose values are the Spatial+ groups (a site); unset "
+        "= gap clusters.",
+    ),
+    "spatial_plus_k": _int(
+        300, 10, 2000, "Spatial+ basis size per group (knots); at most n − 4."
+    ),
+    "spatial_plus_criterion": _choice(
+        "gcv", SPATIAL_PLUS_CRITERIA, "Criterion that picks the Spatial+ penalties."
+    ),
+    "spatial_plus_checks": Setting(
+        "multichoice",
+        [],
+        SPATIAL_PLUS_CRITERIA,
+        help="Criteria also run as checks; their rows are marked check.",
+    ),
+    "spatial_plus_step1_covariates": _bool(
+        False, "Spatial+ step 1 adjusts the exposure for the covariates too."
+    ),
+    "spatial_select_scales_m": Setting(
+        "intlist",
+        list(SPATIAL_SELECT_SCALES_M),
+        lo=100,
+        hi=1_000_000,
+        ordered=True,
+        help="Candidate pattern scales (m) of the scale selection, besides no "
+        "smooth.",
+    ),
+    "spatial_select_criterion": _choice(
+        "bic", SPATIAL_CRITERIA, "Criterion of the scale selection."
+    ),
+    "spatial_select_controls": _choice(
+        "target",
+        SPATIAL_SELECT_CONTROLS,
+        "Negative controls use the target's selected scale, or select their own.",
     ),
     "spatial_adjust_df": Setting(
         "intlist",
@@ -587,8 +674,8 @@ FUSION: dict[str, Setting] = {
     "spatial_paired_smooth": _choice(
         "own",
         SPATIAL_PAIRED_SMOOTHS,
-        "Spatial+ paired tests: each exposure's own smooth, the CGI's, the "
-        "outcome's, or the larger df.",
+        "Paired tests when the exposure model picks the df: each exposure's "
+        "own basis, the CGI's, the outcome's, or the larger df.",
     ),
     "spatial_adjust_scale_m": Setting(
         "intlist",
@@ -611,7 +698,7 @@ FUSION: dict[str, Setting] = {
         None,
         100,
         1_000_000,
-        "Tune within areas of this size (m): the smooth at this scale joins "
+        "Tune within areas of this size (m): the basis at this scale joins "
         "the search's covariates. Unset = tune on all variation.",
     ),
     # ── Longitudinal (mixed-effects) ────────────────────────────
@@ -700,7 +787,19 @@ def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
     """
     schema = SCHEMAS[engine]
     out: dict[str, Any] = {}
-    for key, value in expand_shorthands(engine, values).items():
+    values = expand_shorthands(engine, values)
+    if engine == "fusion" and values.get("spatial_adjust_method") in (
+        LEGACY_SPATIAL_METHODS
+    ):
+        values["spatial_adjust_method"], values["spatial_adjust_select"] = (
+            spatial_method_pair(
+                values["spatial_adjust_method"],
+                None,
+                scales=values.get("spatial_adjust_scale_m"),
+                tune_scale=values.get("spatial_tune_scale_m"),
+            )
+        )
+    for key, value in values.items():
         if key not in schema:
             raise SettingError(f"Unknown {engine.upper()} setting '{key}'.")
         out[key] = schema[key].check(key, value)
@@ -751,9 +850,84 @@ def _check_outer_null(out: Mapping[str, Any]) -> None:
         raise SettingError("'outer_null_stop_high' must not exceed '_after'.")
 
 
+def spatial_method_pair(
+    method: str | None,
+    select: str | None,
+    *,
+    scales: Any = None,
+    tune_scale: Any = None,
+) -> tuple[str, str | None]:
+    """``(spatial_adjust_method, spatial_adjust_select)`` with the older
+    spellings mapped to what they computed.
+
+    ``ks_aic`` was the basis whose df the outcome model picks
+    (``df_outcome_ic``). A ``spatial_plus`` recorded before the select
+    setting existed (``select`` is ``None``) was the basis whose df the
+    exposure model picks (``df_exposure_ic``; unpenalized, so equal to the
+    basis adjustment). Either one given a pattern scale (``scales`` or
+    ``tune_scale``) was the fixed-scale basis. A ``basis`` without a select
+    gets ``fixed_scale`` with a scale and ``df_outcome_ic`` without; the
+    select of ``none`` and ``spatial_plus`` is ``None``.
+    """
+    method = str(method or "none").lower()
+    scaled = bool(scales) or bool(tune_scale)
+    if method == "ks_aic" or (method == "spatial_plus" and select is None):
+        if scaled:
+            return "basis", "fixed_scale"
+        return "basis", ("df_outcome_ic" if method == "ks_aic" else "df_exposure_ic")
+    if method == "basis":
+        if select is None:
+            select = "fixed_scale" if scaled else SPATIAL_ADJUST_SELECTS[0]
+        return method, str(select)
+    return method, None
+
+
 def _check_spatial(out: Mapping[str, Any]) -> None:
-    """Refuse a df list given twice, knots that run backwards, and a df the
-    knots cannot hold."""
+    """Refuse a df list given twice, knots that run backwards, a df the knots
+    cannot hold, a basis size rule that does not match the scale settings, and
+    tuning settings the method cannot serve."""
+    # A partial table (a preset, a test) is checked only on what it sets.
+    method = out.get("spatial_adjust_method")
+    select = out.get("spatial_adjust_select", SPATIAL_ADJUST_SELECTS[0])
+    if method == "basis":
+        scaled = bool(out.get("spatial_adjust_scale_m")) or bool(
+            out.get("spatial_tune_scale_m")
+        )
+        if select.startswith("df_") and out.get("spatial_adjust_scale_m"):
+            raise SettingError(
+                f"'spatial_adjust_scale_m' defines the basis by a scale; set "
+                f"'spatial_adjust_select' to 'fixed_scale', not {select!r}."
+            )
+        if select.startswith("df_") and out.get("spatial_tune_scale_m"):
+            raise SettingError(
+                "A run tuned within areas reports at a scale; set "
+                "'spatial_adjust_select' to 'fixed_scale' or 'scale_ic'."
+            )
+        if select == "fixed_scale" and not scaled:
+            raise SettingError(
+                "'spatial_adjust_select' 'fixed_scale' needs "
+                "'spatial_adjust_scale_m'."
+            )
+    tune_method = out.get("spatial_tune_method", SPATIAL_TUNE_METHODS[0])
+    tune_by_basis = tune_method == "basis" and (
+        bool(out.get("spatial_tune_scale_m"))
+        or out.get("spatial_tune_select") == "scale_ic"
+    )
+    if tune_by_basis and method not in (None, "basis"):
+        raise SettingError(
+            "Tuning within areas by a basis needs 'spatial_adjust_method' 'basis'."
+        )
+    if tune_method == "spatial_plus_inputs":
+        if method not in (None, "spatial_plus"):
+            raise SettingError(
+                "'spatial_tune_method' 'spatial_plus_inputs' needs "
+                "'spatial_adjust_method' 'spatial_plus'."
+            )
+        if out.get("index_form", "linear") not in ("linear",):
+            raise SettingError(
+                "'spatial_plus_inputs' tunes the linear form only (synergy terms "
+                "need positive inputs); set 'index_form' to 'linear'."
+            )
     dfs = spatial_df_candidates(out)
     lo, hi = "spatial_adjust_knots_min", "spatial_adjust_knots_max"
     if lo in out and hi in out and out[lo] > out[hi]:
