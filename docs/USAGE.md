@@ -145,13 +145,15 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 
 | Setting (form label) | Default | What it does |
 | --- | --- | --- |
+| `spatial_adjust_method` (**Spatial-confounding adjustment**) | `none` | `basis`: an unpenalized thin-plate basis in the outcome model (Keller & Szpiro 2020); `spatial_plus`: Spatial+ with penalized smooths per site (Dupont et al. 2022), see below. Runs and run files from before the rename say `ks_aic` (read as `basis` + `df_outcome_ic`) |
+| `spatial_adjust_select` (**Basis size**) | `df_outcome_ic` | How a `basis` sets its size: `df_outcome_ic` (df by AIC/BIC of the outcome model without the exposure), `df_exposure_ic` (df by AIC/BIC of the exposure model, "df-Spatial+"; unpenalized, so the same adjustment with another size), `fixed_scale` (the pattern scales below), `scale_ic` (a scale chosen by AIC/BIC, see below) |
 | `spatial_adjust_df` (**Spatial df candidates**) | `[0, 1, 2, 3, 4, 6, 8, 11, 15, 20]` | Sizes compared, besides no smooth; a list in a run file, `0, 2, 5` in the form, `--spatial-adjust-df 0 2 5` on the command line |
 | `spatial_adjust_max_df` | unset | Older form of the list: every size from 0 to N. Give one or the other |
 | `spatial_adjust_criterion` (**Spatial df criterion**) | `aic` | `bic` penalises size more, so it picks a smaller or equal smooth |
 | `spatial_adjust_eps_m` (**Cluster gap eps**) | 0 (automatic) | Entities farther apart than this fall into different clusters |
 | `spatial_adjust_neighbours` (**Cluster neighbours**) | 10 | With eps automatic, entities linked through this many nearest neighbours form one cluster |
 | `spatial_adjust_knots_min` / `_max` (**Fewest / Most knots per cluster**) | 35 / 150 | Knots of each cluster's smooth; a cluster holds at most `knots_max` radial functions |
-| `spatial_paired_smooth` (**Paired-test smooth**) | `own` | Spatial+ only: the smooth each exposure of a paired CGI-vs-exposure test is scored with, see below |
+| `spatial_paired_smooth` (**Paired-test smooth**) | `own` | `df_exposure_ic` only: the smooth each exposure of a paired CGI-vs-exposure test is scored with, see below |
 | `spatial_adjust_scale_m` (**Spatial pattern scales (m)**) | unset | Define the smooth by a distance instead of a size, see below; a list in a run file, `5000, 20000, 10000` in the form, `--spatial-adjust-scale-m 5000 20000` on the command line |
 | `spatial_adjust_min_component` (**Smallest cluster**) | 0 (30 with scales, none without) | A smaller cluster shares its nearest larger cluster's level instead of having its own |
 | `spatial_tune_scale_m` (**Tune within areas of (m)**) | unset (0) | Tune the composite on variation within areas of about this size, see below |
@@ -159,15 +161,24 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 | `residualize_spline_min_unique` (**Distinct values for a spline**) | 7 | A covariate with fewer distinct values (a code, a dummy) enters linearly |
 | `exposure_response_spline_df` (**Exposure-response spline df**) | 4 | Spline size of the exposure-response curve and its linearity test |
 
-Under Spatial+ the smooth is selected on the exposure, so the CGI and the
+`spatial_plus` used to name the basis whose df the exposure model picks. A
+recorded job or run config from before the rename reruns as that basis
+(`geofuse rerun` reproduces it); a new run file that sets `spatial_plus`
+together with `spatial_adjust_df`, `spatial_adjust_max_df`,
+`spatial_adjust_scale_m` or `spatial_paired_smooth` is refused at plan time
+with the spelling to use instead (`basis` with `df_exposure_ic` or
+`fixed_scale`), since those settings do not act on Spatial+.
+
+When the exposure model picks the df (`df_exposure_ic`) the smooth is
+selected on the exposure, so the CGI and the
 exposure it is compared with (a channel or a comparator) can each have their
 own. `spatial_paired_smooth` decides what a paired test uses: `own` (each
 exposure's own smooth, as when it is scored alone, so the paired difference is
 the difference of the two printed held-out scores), `cgi` (the CGI's smooth for
 both, the behaviour before this setting existed), `outcome` (one smooth
-selected on the outcome given the covariates, the KS-AIC rule) or `max` (the
-larger of the two exposures' sizes for both). Under KS-AIC the smooth is
-selected on the outcome already, so every value behaves as `outcome`, and the
+selected on the outcome given the covariates, the `df_outcome_ic` rule) or
+`max` (the larger of the two exposures' sizes for both). When the outcome model
+picks the df the smooth is selected on the outcome already, so every value behaves as `outcome`, and the
 paired rows record it so.
 
 **Pattern scales.** A size per cluster removes patterns of different lengths
@@ -186,8 +197,8 @@ entities' locations. With a scale set:
   by default twice the first scale, and a cluster smaller than
   `spatial_adjust_min_component` (default 30) joins the nearest larger one;
 - the smooth depends on the locations only, so the CGI, every channel,
-  comparator and negative control share it, KS-AIC and Spatial+ give the same
-  numbers, and paired tests use it on both sides;
+  comparator and negative control share it, and paired tests use it on both
+  sides;
 - with several scales, as in `[5000, 20000, 10000, 3000]`, the first is the
   primary one (scores, paired tests, verdicts) and every slope is also reported
   at the others and without a smooth, on every held-out split (one split when

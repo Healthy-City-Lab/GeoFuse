@@ -444,21 +444,24 @@ which are descriptive. Comparators are not scored for panels (several rows per
 entity). The same results are in `results_summary.json` under `comparators`,
 `comparator_reference` (the CGI's row) and `cgi_vs_comparator_paired`.
 
-**Spatially adjusted runs.** With `spatial_adjust_method` set to `ks_aic` or
-`spatial_plus`, the slopes are adjusted for a coordinate smooth as the scores
-are, built on the rows each one reports. That covers `beta` in
+**Spatially adjusted runs.** With `spatial_adjust_method = "basis"`, the
+slopes are adjusted for a coordinate basis as the scores are, built on the rows each one reports. That covers `beta` in
 `negative_controls.csv` and `comparators.csv` (and the objective scores in
 `negative_controls.csv`), the four slopes, D and ΔD in
 `specificity_contrast.csv`, and the slope rows of `outer_splits.csv` on every
-split. Under `spatial_plus` the smooth is selected on the exposure, so each
-exposure's target and control slopes share one; under `ks_aic` it is selected
-on each outcome, so the target and every control have their own. Each
-adjusted row carries `spatial_method` and the smooth's `spatial_df`: the
+split. When the exposure model picks the df (`df_exposure_ic`), or a fixed
+scale sets the basis, each exposure's target and control slopes share one
+smooth; when the outcome model picks it (`df_outcome_ic`) the target and every
+control have their own. Each adjusted row carries `spatial_method` (`basis`),
+`spatial_select` (how its size was set) and the smooth's `spatial_df`: the
 number of radial functions per spatial cluster, `0` for the cluster levels
 and linear trends alone, and `none` when the criterion kept no smooth. In
 `specificity_contrast.csv` two smooths are in play, so a row has either
-`spatial_df_cgi` / `spatial_df_exposure` (Spatial+) or `spatial_df_target` /
-`spatial_df_control` (KS-AIC). `outer_summary.csv` names the
+`spatial_df_cgi` / `spatial_df_exposure` (exposure rule) or
+`spatial_df_target` / `spatial_df_control` (outcome rule). Runs made before
+the methods were renamed say `ks_aic` (now `basis` with `df_outcome_ic`) or
+`spatial_plus` (now `basis` with `df_exposure_ic`, or `fixed_scale` with a
+pattern scale). `outer_summary.csv` names the
 `spatial_method`, and `results_summary.json` keeps a `spatial_adjustment`
 record on each slope. A slope row also carries `spatial_at_cap`, true when the
 largest candidate size won (a larger smooth might fit better), and its record

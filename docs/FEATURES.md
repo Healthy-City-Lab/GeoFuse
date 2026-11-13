@@ -398,14 +398,23 @@ Nothing below is pre-specified.
   projection is rank-safe: a redundant design, such as an empty category or a
   full set of dummies, removes only its real span, and the job log reports how
   many directions were redundant.
-- Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
-  cross-validation, so geographic autocorrelation cannot inflate scores. The
-  adjustment's coordinate smooth enters the scores, the direction, the paired
-  tests, the slopes, the negative controls and the specificity contrast, on
-  every held-out split, but not the tuning. Spatial+ selects the smooth on each
-  exposure, KS-AIC on each outcome; once selected, the smooth joins the
-  covariates on both the outcome and the exposure side under either method,
-  so the two differ only in which variable chose its size. Every adjusted
+- Optional spatial-confounding adjustment and spatial block cross-validation,
+  so geographic autocorrelation cannot inflate scores. The **basis**
+  adjustment (`spatial_adjust_method = "basis"`) adds an unpenalized
+  thin-plate basis of the coordinates to the outcome model, the adjustment of
+  Keller & Szpiro (2020); its coordinate smooth enters the scores, the
+  direction, the paired tests, the slopes, the negative controls and the
+  specificity contrast, on every held-out split, but not the tuning.
+  `spatial_adjust_select` says how its size is set: the df by AIC/BIC of the
+  outcome model without the exposure (`df_outcome_ic`, Keller & Szpiro), the
+  df by AIC/BIC of the exposure model (`df_exposure_ic`, the "df-Spatial+" of
+  Rainey et al. 2025), a fixed pattern scale (`fixed_scale`) or a scale chosen
+  by AIC/BIC of the outcome model (`scale_ic`). Once chosen, the basis joins
+  the covariates on both the outcome and the exposure side under every rule:
+  an unpenalized exposure residual leaves the slope equal to the plain basis
+  adjustment (Frisch–Waugh–Lovell; Dupont, Wood & Augustin 2022, §4), so the
+  rules differ only in the basis size. **Spatial+** with penalized smooths is
+  a method of its own (`spatial_adjust_method = "spatial_plus"`, below). Every adjusted
   slope records the method and the smooth's degrees of freedom. The smooth is
   a thin-plate spline per cluster: an intercept, a linear trend and radial
   functions constrained to carry no trend of their own (Wood 2003), so K
@@ -416,8 +425,8 @@ Nothing below is pre-specified.
   cluster; the run keeps the criterion of every
   candidate and warns when the largest wins, since a larger smooth might then
   fit better. The knots and the neighbour graph that splits entities into
-  clusters are settings too. In a paired CGI-vs-exposure test under Spatial+,
-  each exposure is scored with the smooth selected on itself by default, as
+  clusters are settings too. In a paired CGI-vs-exposure test when the
+  exposure model picks the df, each exposure is scored with the smooth selected on itself by default, as
   when it is scored alone, so the paired difference is the difference of the
   two printed scores; the CGI's smooth for both, one selected on the outcome,
   or the larger of the two are the alternatives. The smooth can instead be
