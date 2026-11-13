@@ -721,7 +721,6 @@ class MetricFusionEngine:
         unavailable = [
             name
             for name, used in (
-                ("spatial_adjust_method 'spatial_plus'", method == "spatial_plus"),
                 ("spatial_adjust_select 'scale_ic'", select == "scale_ic"),
                 ("spatial_tune_select 'scale_ic'", spatial_tune_select == "scale_ic"),
             )
@@ -915,6 +914,36 @@ class MetricFusionEngine:
         if self.weight_search and not self.weight_column:
             raise ValueError("weight_search needs a weight_column.")
         self.null_group_column: str | None = null_group_column or None
+        # Spatial+ (penalized smooths per group) and the scale selection.
+        from . import spatial_plus as _sp
+
+        if spatial_plus_criterion not in _sp.CRITERIA:
+            raise ValueError(
+                f"spatial_plus_criterion must be one of {_sp.CRITERIA}; got "
+                f"{spatial_plus_criterion!r}."
+            )
+        bad = [c for c in (spatial_plus_checks or ()) if c not in _sp.CRITERIA]
+        if bad:
+            raise ValueError(f"spatial_plus_checks may only hold {_sp.CRITERIA}.")
+        self.spatial_plus_groups_column: str | None = (
+            spatial_plus_groups_column or None
+        )
+        self.spatial_plus_k: int = int(spatial_plus_k)
+        self.spatial_plus_criterion: str = spatial_plus_criterion
+        self.spatial_plus_checks: tuple[str, ...] = tuple(
+            c for c in (spatial_plus_checks or ()) if c != spatial_plus_criterion
+        )
+        self.spatial_plus_step1_covariates: bool = bool(spatial_plus_step1_covariates)
+        if spatial_select_controls not in SPATIAL_SELECT_CONTROLS:
+            raise ValueError(
+                f"spatial_select_controls must be one of {SPATIAL_SELECT_CONTROLS}; "
+                f"got {spatial_select_controls!r}."
+            )
+        self.spatial_select_scales_m: tuple[float, ...] = tuple(
+            float(v) for v in (spatial_select_scales_m or ())
+        )
+        self.spatial_select_criterion: str = spatial_select_criterion
+        self.spatial_select_controls: str = spatial_select_controls
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -1215,6 +1244,7 @@ class MetricFusionEngine:
             for c in (
                 getattr(self, "weight_column", None),
                 getattr(self, "null_group_column", None),
+                getattr(self, "spatial_plus_groups_column", None),
             )
             if c
         ]
@@ -8985,13 +9015,17 @@ class MetricFusionEngine:
                     _log("WARN", f"{role} '{col}' is not a target column; skipped.")
                     continue
                 fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
-        # The null-group column keeps its labels (an area name is text).
-        group = getattr(self, "null_group_column", None)
-        if group and group not in fusion_df.columns:
-            if group in entity_gdf.columns:
-                fusion_df[group] = entity_gdf[group].to_numpy()
-            else:
-                _log("WARN", f"Null group '{group}' is not a target column.")
+        # The null-group and Spatial+ group columns keep their labels (an area
+        # name is text).
+        for role, group in (
+            ("Null group", getattr(self, "null_group_column", None)),
+            ("Spatial+ group", getattr(self, "spatial_plus_groups_column", None)),
+        ):
+            if group and group not in fusion_df.columns:
+                if group in entity_gdf.columns:
+                    fusion_df[group] = entity_gdf[group].to_numpy()
+                else:
+                    _log("WARN", f"{role} '{group}' is not a target column.")
 
     def _test_entity_mask(self, df: "pd.DataFrame") -> np.ndarray:
         """Rows of an ``apply_fusion`` frame that belong to the held-out split."""
@@ -9570,6 +9604,138 @@ class MetricFusionEngine:
         finally:
             self._active_greenery_channel = prev
             self._spatial_selections = counters
+        return out
+
+    def compute_spatial_plus(
+        self,
+        cgi_params: dict,
+        exposures: "dict[str, tuple[str, dict]] | None" = None,
+        *,
+        n_boot: int = 1000,
+        seed: int = 42,
+        fixed_iqr: "dict[str, float] | None" = None,
+    ) -> "dict | None":
+        """Spatial+ (Dupont, Wood & Augustin 2022) on the held-out rows.
+
+        For the CGI and every exposure of ``exposures`` (``{name: (active
+        channel, params)}``), on the target and each negative control:
+        :func:`geofuse.spatial_plus.report` over the held-out rows, with one
+        penalized thin-plate smooth per group (gap clusters at
+        ``spatial_adjust_eps_m``, default 10 km, small ones merged; or the
+        values of ``spatial_plus_groups_column``) and the penalties by
+        ``spatial_plus_criterion`` (plus every ``spatial_plus_checks``
+        criterion, its rows marked ``check``). The IQR and p5–p95 scales are
+        the exposures' train+val distributions (``fixed_iqr`` overrides the
+        IQR), as for :meth:`compute_raw_effects`. ``None`` unless the method
+        is ``spatial_plus``; ``{"skipped": reason}`` for a panel or a
+        two-valued outcome (Spatial+ is fitted for Gaussian outcomes).
+        """
+        from . import spatial_plus as _sp
+
+        if self.spatial_adjust_method != "spatial_plus":
+            return None
+        if self.is_panel:
+            return {"skipped": "longitudinal"}
+        if getattr(self, "weight_column", None):
+            _log(
+                "WARN",
+                "Spatial+ estimates are not weighted: the sampling weights do "
+                "not enter them.",
+            )
+        fixed = {str(k): float(v) for k, v in (fixed_iqr or {}).items()}
+        prev = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            target = df["target"].to_numpy(dtype=np.float64)
+            finite_target = target[np.isfinite(target)]
+            if len(np.unique(finite_target)) <= 2:
+                _log(
+                    "WARN",
+                    "Spatial+ fits Gaussian outcomes; the target has two values, "
+                    "so it is skipped.",
+                )
+                return {"skipped": "binary outcome"}
+            xs: dict[str, tuple[str, np.ndarray]] = {
+                "cgi": ("cgi", df["composite"].to_numpy(dtype=np.float64))
+            }
+            applied = self._applied_exposures(df, exposures, "Spatial+")
+            for name, values in applied.items():
+                xs[name] = (_exposure_kind(exposures[name][1]), values)
+            cov = self._reporting_covariate_matrix(df)
+            test = self._test_entity_mask(df)
+            coords = self._whole_data_coords(df)
+            if coords is None:
+                _log("WARN", "Spatial+ needs entity coordinates; skipped.")
+                return {"skipped": "no coordinates"}
+            controls: dict[str, np.ndarray] = {}
+            for name in self.negative_control_columns:
+                values = self._reporting_raw_column(df, name)
+                if values is not None:
+                    controls[name] = values
+            keep = test & np.isfinite(coords).all(axis=1) & np.isfinite(target)
+            if cov is not None:
+                keep &= np.isfinite(cov).all(axis=1)
+            for _, x in xs.values():
+                keep &= np.isfinite(x)
+            for v in controls.values():
+                keep &= np.isfinite(v)
+            if int(keep.sum()) < 20:
+                return {"skipped": "too few held-out rows"}
+            values = None
+            if self.spatial_plus_groups_column:
+                labels = self._reporting_clusters(df, self.spatial_plus_groups_column)
+                if labels is None:
+                    _log(
+                        "WARN",
+                        f"Spatial+ group column '{self.spatial_plus_groups_column}' "
+                        "not found; using gap clusters.",
+                    )
+                else:
+                    values = labels[keep]
+            labels, rule = _sp.group_labels(
+                coords[keep],
+                eps_m=self.spatial_adjust_eps_m,
+                min_component=self.spatial_adjust_min_component,
+                values=values,
+            )
+            if values is not None:
+                rule["column"] = self.spatial_plus_groups_column
+            scales = {}
+            for name, (_kind, x) in xs.items():
+                dist = _distribution(x[~test])
+                span = None
+                if dist["p95"] is not None and dist["p5"] is not None:
+                    span = dist["p95"] - dist["p5"]
+                scales[name] = {"iqr": fixed.get(name, dist["iqr"]), "span": span}
+            out = _sp.report(
+                coords[keep],
+                {name: (kind, x[keep]) for name, (kind, x) in xs.items()},
+                target[keep],
+                {name: v[keep] for name, v in controls.items()},
+                None if cov is None else cov[keep],
+                labels,
+                criterion=self.spatial_plus_criterion,
+                checks=self.spatial_plus_checks,
+                k=self.spatial_plus_k,
+                step1_covariates=self.spatial_plus_step1_covariates,
+                scales=scales,
+                n_boot=int(n_boot),
+                seed=int(seed),
+            )
+        finally:
+            self._active_greenery_channel = prev
+        out.update(
+            method="spatial_plus",
+            label=SPATIAL_LABELS["spatial_plus"],
+            split="test",
+            groups_rule=rule,
+            controls=list(controls),
+            exposures={name: kind for name, (kind, _x) in xs.items()},
+            scales=scales,
+        )
+        for message in dict.fromkeys(out["warnings"]):
+            _log("WARN", f"Spatial+: {message}.")
         return out
 
     def compute_weighted_report(
