@@ -151,6 +151,7 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 | `spatial_select_criterion` (**Scale criterion**) | `bic` | AIC-NE or BIC-NE picks the scale; both are always saved |
 | `spatial_select_controls` (**Controls' scale**) | `target` | Negative controls use the target's selected scale, or (`own`) select their own |
 | `spatial_tune_select` (**Tuning scale**) | `fixed_scale` | `scale_ic` chooses the tuning scale per split by the same rule, on that split's train+val rows |
+| `spatial_tune_method` (**Residualize the search inputs**) | `basis` | `spatial_plus_inputs` (with `spatial_plus`, linear form only): tune on every input's Spatial+ residual, see below |
 | `spatial_plus_groups_column` (**Spatial+ groups column**) | unset | A target column whose values are the Spatial+ groups (a site); unset = clusters split at `spatial_adjust_eps_m` (default 10 km for Spatial+), smaller than `spatial_adjust_min_component` (default 30) merged |
 | `spatial_plus_k` (**Basis size per group**) | 300 | Knots of each group's penalized thin-plate spline, at most its rows − 4 (mgcv's `k`) |
 | `spatial_plus_criterion` (**Penalty criterion**) | `gcv` | Picks every group's smoothing parameter: `gcv` (as published) or `reml` |
@@ -232,6 +233,29 @@ replicate with the penalties fixed. A two-valued target is skipped (Gaussian
 outcomes only), and sampling weights do not enter it (the run warns). A group
 whose smooth uses over 90 % of its functions logs a warning: raise
 `spatial_plus_k`.
+
+**Spatial+ on the search inputs.** With `spatial_adjust_method =
+"spatial_plus"`, `spatial_tune_method = "spatial_plus_inputs"` tunes the
+composite on "local" greenery, a geofuse extension of Spatial+ (not the
+published method). On each split's train+val rows every search column
+(channel × radius × statistic) is residualized on its own penalized smooth per
+group, the outcome smoother is fitted on the outcome, the covariates and the
+groups' smooths without any exposure, and the outcome and every residual are
+multiplied by (I − H)^½, H that smoother's hat matrix. A least-squares slope
+of the transformed outcome on any mix of transformed residuals is then
+Spatial+'s second-step slope of that mix with the outcome smoother's
+penalties held at the outcome-only fit, so the sweep, posterior and null
+calibration all work on Spatial+ residuals (choosing the penalties jointly
+for each of the many candidate composites is not feasible). The covariates
+are absorbed by the transform. The penalties are kept per split, so the
+standalone searches and the null outcomes of the repeated-split calibration
+use the real outcome's smoother. Synergy terms need positive inputs, which
+residuals are not, so the linear form only. The tuned composite is reported
+on the raw inputs by Spatial+ itself, and the search's own posterior β is the
+composite of residualized inputs scored by the transform. The run records,
+per channel, the median edf and absorbed share of its columns, the outcome
+smoother's λ and edf, and its effective bandwidth (`spatial_tuning` in the
+results).
 
 **Pattern scales.** A size per cluster removes patterns of different lengths
 in different places: 20 functions in a cluster 800 km across remove regional

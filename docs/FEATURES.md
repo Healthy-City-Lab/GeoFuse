@@ -429,7 +429,11 @@ Nothing below is pre-specified.
   slopes and, optionally, the tuning. Every basis run saves that AIC-NE /
   BIC-NE profile (`scale_selection.csv`) and the effective bandwidth of every
   smooth it uses (`effective_bandwidth.csv`, by the Keller & Szpiro and the
-  Rainey & Keller rules). Every adjusted
+  Rainey & Keller rules). Under Spatial+ the search itself can run on
+  Spatial+ residuals (`spatial_tune_method = "spatial_plus_inputs"`, a geofuse
+  extension): every input column loses its own penalized spatial fit and the
+  outcome and inputs are transformed by the outcome smoother, so the layers,
+  radii and weights are chosen on local greenery (linear form only). Every adjusted
   slope records the method and the smooth's degrees of freedom. The smooth is
   a thin-plate spline per cluster: an intercept, a linear trend and radial
   functions constrained to carry no trend of their own (Wood 2003), so K
