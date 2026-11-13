@@ -422,7 +422,14 @@ Nothing below is pre-specified.
   specificity contrasts and paired ΔR² are reported beside the unadjusted
   results on every held-out split, with mgcv's Bayesian intervals and
   bootstraps that refit both steps at the chosen penalties
-  (`spatial_plus.csv`). Every adjusted
+  (`spatial_plus.csv`). The basis scale can also be chosen per split by
+  Keller & Szpiro's rule (`spatial_adjust_select = "scale_ic"`): the outcome
+  model without the exposure, on the split's train+val rows, picks the
+  candidate scale with the smallest BIC (or AIC), separately for the reported
+  slopes and, optionally, the tuning. Every basis run saves that AIC-NE /
+  BIC-NE profile (`scale_selection.csv`) and the effective bandwidth of every
+  smooth it uses (`effective_bandwidth.csv`, by the Keller & Szpiro and the
+  Rainey & Keller rules). Every adjusted
   slope records the method and the smooth's degrees of freedom. The smooth is
   a thin-plate spline per cluster: an intercept, a linear trend and radial
   functions constrained to carry no trend of their own (Wood 2003), so K

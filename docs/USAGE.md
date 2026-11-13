@@ -147,6 +147,10 @@ existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
 | --- | --- | --- |
 | `spatial_adjust_method` (**Spatial-confounding adjustment**) | `none` | `basis`: an unpenalized thin-plate basis in the outcome model (Keller & Szpiro 2020); `spatial_plus`: Spatial+ with penalized smooths per site (Dupont et al. 2022), see below. Runs and run files from before the rename say `ks_aic` (read as `basis` + `df_outcome_ic`) |
 | `spatial_adjust_select` (**Basis size**) | `df_outcome_ic` | How a `basis` sets its size: `df_outcome_ic` (df by AIC/BIC of the outcome model without the exposure), `df_exposure_ic` (df by AIC/BIC of the exposure model, "df-Spatial+"; unpenalized, so the same adjustment with another size), `fixed_scale` (the pattern scales below), `scale_ic` (a scale chosen by AIC/BIC, see below) |
+| `spatial_select_scales_m` (**Candidate scales (m)**) | `[50000, 30000, 20000, 15000, 10000, 7000, 5000, 4000, 3000]` | Pattern scales the scale selection compares, besides no smooth |
+| `spatial_select_criterion` (**Scale criterion**) | `bic` | AIC-NE or BIC-NE picks the scale; both are always saved |
+| `spatial_select_controls` (**Controls' scale**) | `target` | Negative controls use the target's selected scale, or (`own`) select their own |
+| `spatial_tune_select` (**Tuning scale**) | `fixed_scale` | `scale_ic` chooses the tuning scale per split by the same rule, on that split's train+val rows |
 | `spatial_plus_groups_column` (**Spatial+ groups column**) | unset | A target column whose values are the Spatial+ groups (a site); unset = clusters split at `spatial_adjust_eps_m` (default 10 km for Spatial+), smaller than `spatial_adjust_min_component` (default 30) merged |
 | `spatial_plus_k` (**Basis size per group**) | 300 | Knots of each group's penalized thin-plate spline, at most its rows − 4 (mgcv's `k`) |
 | `spatial_plus_criterion` (**Penalty criterion**) | `gcv` | Picks every group's smoothing parameter: `gcv` (as published) or `reml` |
@@ -186,7 +190,26 @@ selected on the outcome given the covariates, the `df_outcome_ic` rule) or
 picks the df the smooth is selected on the outcome already, so every value behaves as `outcome`, and the
 paired rows record it so.
 
-**Spatial+.** `spatial_adjust_method = "spatial_plus"` reports Spatial+
+**Scale selection.** `spatial_adjust_select = "scale_ic"` (with `basis`)
+chooses the pattern scale on each held-out split the way Keller & Szpiro
+(2020, §4) choose the amount of adjustment: the outcome model without the
+exposure (covariates, then the basis at each candidate scale) is fitted on the
+split's train+val rows, and the scale with the smallest BIC (BIC-NE, the
+default) or AIC (AIC-NE) wins; no smooth is a candidate too. Every candidate
+is built on one set of clusters (gap `spatial_adjust_eps_m`, default 10 km), so
+only the smooth changes. The test rows never enter the choice; the chosen
+scale's basis is then built on the held-out rows. Negative controls use the
+target's scale unless `spatial_select_controls = "own"`. The slopes are also
+reported at every candidate and unadjusted, so the chosen scale sits on the
+scale curve. Keller & Szpiro found AIC-NE best in most settings and BIC-NE
+better under bias amplification, and more adjustment can amplify bias, so a
+falling estimate alone does not show confounding. With
+`spatial_tune_select = "scale_ic"` the same rule picks the tuning scale per
+split. Every basis run saves the AIC-NE / BIC-NE profile of the target and
+each control on every split, and the effective bandwidth of every candidate
+(see OUTPUTS), whatever its select setting.
+
+**Spatial+.** `spatial_adjust_method = "spatial_plus" reports Spatial+
 (Dupont, Wood & Augustin 2022) beside the unadjusted results, on every
 held-out split. The model is y = β x + covariates + f(t) + ε with f a
 penalized thin-plate spline. Spatial+ first fits the exposure on location,

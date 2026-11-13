@@ -121,6 +121,8 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── exposure_scales.csv             each exposure's distribution per split
     ├── weighted.csv                    weighted held-out results, with weight_column
     ├── spatial_plus.csv                Spatial+ fits per group, with spatial_plus
+    ├── scale_selection.csv             AIC-NE / BIC-NE per scale, every basis run
+    ├── effective_bandwidth.csv         distance each smooth removes, k̂
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
@@ -389,6 +391,30 @@ split `outer_splits.csv` gets Spatial+ rows beside the unadjusted ones, with
 the penalized residual sum of squares at the outcome model's penalties).
 `outer_summary.csv` summarises them per criterion, with their own Holm
 families. The search and the standard rows stay unadjusted.
+
+**`scale_selection.csv`** appears in every `basis` run. One row per split,
+stage (`reporting`; `tuning` too with `spatial_tune_select = "scale_ic"`),
+outcome (the target and each negative control) and candidate (`scale_m`,
+empty for no smooth), from the outcome model without the exposure on the
+split's train+val rows: `n`, `columns` (smooth columns), `aic`, `bic`,
+`delta_aic`, `delta_bic` (from the outcome's best) and `chosen_aic` /
+`chosen_bic`. `results_summary.json` under `scale_selection` gives per stage
+and outcome the scale each criterion chose on each split, how often each
+scale won and the median choice (no smooth as 0 m). With
+`spatial_adjust_select = "scale_ic"` the rows of the chosen scale in
+`outer_splits.csv` read `spatial_scale_m = selected`, with the scale that split
+chose in `spatial_selected_scale_m`; `outer_summary.csv` groups them as one
+scale and its Holm families use them.
+
+**`effective_bandwidth.csv`** gives the distance over which each smooth
+removes variation (Keller & Szpiro 2020, §3.1): per split, row set (`test`,
+and `train_val` with a selected tuning scale) and smooth (each candidate scale
+of a basis run, or `spatial_plus`, the step-2 smoother of the CGI's target
+model), `k_ks` (the first zero crossing of the pointwise median of loess
+curves, span 0.1, of each sampled row's smoother weights against distance) and
+`k_rk` (the median over sampled rows of the first distance with a negative
+weight; Rainey & Keller 2024), with `n_sampled` (at most 1,000 rows) and
+`clusters`. Distances are taken within each row's cluster.
 
 **`weighted.csv`** appears with the job setting `weight_column`. It holds
 the first split's held-out results weighted by that column, in the
