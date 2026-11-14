@@ -610,8 +610,35 @@ def _group_columns(g: Group) -> np.ndarray:
     return np.column_stack([g.Qt, g.C]) if g.m else g.Qt
 
 
-def _penalty(g: Group, lam: float) -> np.ndarray:
-    return np.concatenate([np.zeros(g.Qt.shape[1]), np.full(g.m, float(lam))])
+def _group_factor(Gg: np.ndarray, t: int) -> tuple:
+    """A group's weighted cross-product ``[[G_tt, G_tc], [G_ct, G_cc]]`` (a
+    stack over replicates, ``t`` trend columns) prepared for every penalty.
+
+    The unpenalized trend is eliminated (``S = G_cc − G_ct G_tt⁺ G_tc``) and
+    ``S`` eigen-decomposed once, so ``(S + λI)⁻¹`` costs a diagonal scaling
+    for each λ. A replicate that drew too few of the group's rows to fix its
+    trend gets the pseudo-inverse of ``G_tt``, whose undetermined directions
+    touch none of its weighted rows.
+    """
+    F = resampling._pinv_factor(Gg[:, :t, :t])
+    Tinv = np.swapaxes(F, 1, 2) @ F
+    if Gg.shape[1] == t:
+        return Tinv, None, None, None
+    K = Tinv @ Gg[:, :t, t:]
+    S = Gg[:, t:, t:] - np.swapaxes(Gg[:, :t, t:], 1, 2) @ K
+    e, V = np.linalg.eigh(0.5 * (S + np.swapaxes(S, 1, 2)))
+    return Tinv, K, np.clip(e, 0.0, None), V
+
+
+def _group_solve(factor: tuple, lam: float, rhs: np.ndarray, t: int) -> np.ndarray:
+    """``(G + diag(0_t, λ I))⁻¹ rhs`` per replicate from :func:`_group_factor`."""
+    Tinv, K, e, V = factor
+    if K is None:
+        return Tinv @ rhs
+    rt, rc = rhs[:, :t], rhs[:, t:]
+    c = rc - np.swapaxes(K, 1, 2) @ rt
+    c = V @ ((np.swapaxes(V, 1, 2) @ c) / (e + float(lam))[..., None])
+    return np.concatenate([Tinv @ rt - K @ c, c], axis=1)
 
 
 def replicate_slopes(
@@ -655,7 +682,7 @@ def replicate_slopes(
         grams = []
         for g, Xg in zip(groups, X, strict=True):
             Xw = Xg.T[None, :, :] * Wc[:, None, g.rows]
-            grams.append((Xw, Xw @ Xg))
+            grams.append((Xw, _group_factor(Xw @ Xg, g.Qt.shape[1])))
 
         # ── Step 1 on every replicate ───────────────────────────
         r_reps = []
@@ -666,10 +693,11 @@ def replicate_slopes(
             else:
                 r = np.empty((b, n))
                 for j, (g, Xg) in enumerate(zip(groups, X, strict=True)):
-                    Xw, Gg = grams[j]
-                    A = Gg + np.diag(_penalty(g, ex["lam"][j]))[None]
+                    Xw, fac = grams[j]
                     rhs = Xw @ x[g.rows]
-                    theta = _solve(A, rhs[..., None])[..., 0]
+                    theta = _group_solve(
+                        fac, ex["lam"][j], rhs[..., None], g.Qt.shape[1]
+                    )[..., 0]
                     r[:, g.rows] = x[g.rows][None, :] - theta @ Xg.T
             r_reps.append(r)
 
@@ -699,34 +727,23 @@ def _weighted_cross(groups, X, grams, Wc, dense, R, lam) -> np.ndarray:
         Gdr = Dw @ R
     Grr = np.einsum("bik,bi,bil->bkl", R, Wc, R)
     for j, (g, Xg) in enumerate(zip(groups, X, strict=True)):
-        Xw, Gg = grams[j]
-        A = Gg + np.diag(_penalty(g, lam[j]))[None]
+        Xw, fac = grams[j]
+        t = g.Qt.shape[1]
         H = Xw @ R[:, g.rows, :]
         if dense is not None:
             F = Xw @ dense[g.rows]
-            S = _solve(A, np.concatenate([F, H], axis=2))
+            S = _group_solve(fac, lam[j], np.concatenate([F, H], axis=2), t)
             Sf, Sh = S[..., :pd_], S[..., pd_:]
             Gdd = Gdd - np.swapaxes(F, 1, 2) @ Sf
             Gdr = Gdr - np.swapaxes(F, 1, 2) @ Sh
             Grr = Grr - np.swapaxes(H, 1, 2) @ Sh
         else:
-            Sh = _solve(A, H)
+            Sh = _group_solve(fac, lam[j], H, t)
             Grr = Grr - np.swapaxes(H, 1, 2) @ Sh
     if dense is not None:
         T = resampling._pinv_factor(Gdd) @ Gdr
         Grr = Grr - np.swapaxes(T, 1, 2) @ T
     return Grr
-
-
-def _solve(A: np.ndarray, rhs: np.ndarray) -> np.ndarray:
-    """``A⁻¹ rhs`` for a stack of symmetric matrices; a replicate that drew
-    too few rows of a group to fix its trend gets the pseudo-inverse, whose
-    undetermined directions touch none of its weighted rows."""
-    try:
-        return np.linalg.solve(A, rhs)
-    except np.linalg.LinAlgError:
-        F = resampling._pinv_factor(A)
-        return np.swapaxes(F, 1, 2) @ (F @ rhs)
 
 
 def _weighted_fit_residual(groups, X, grams, Wc, dense, x, lam) -> np.ndarray:
@@ -739,11 +756,12 @@ def _weighted_fit_residual(groups, X, grams, Wc, dense, x, lam) -> np.ndarray:
     gdx = Dw @ x
     blocks = []
     for j, (g, Xg) in enumerate(zip(groups, X, strict=True)):
-        Xw, Gg = grams[j]
-        A = Gg + np.diag(_penalty(g, lam[j]))[None]
+        Xw, fac = grams[j]
         F = Xw @ dense[g.rows]
         h = Xw @ x[g.rows]
-        S = _solve(A, np.concatenate([F, h[..., None]], axis=2))
+        S = _group_solve(
+            fac, lam[j], np.concatenate([F, h[..., None]], axis=2), g.Qt.shape[1]
+        )
         Gdd = Gdd - np.swapaxes(F, 1, 2) @ S[..., :pd_]
         gdx = gdx - (np.swapaxes(F, 1, 2) @ S[..., pd_:])[..., 0]
         blocks.append(S)
@@ -895,6 +913,7 @@ def report(
         "warnings": warnings,
         "effective_bandwidth": [],
     }
+    stages: list[tuple] = []
     for crit in [criterion, *[c for c in checks if c != criterion]]:
         is_check = crit != criterion
         tag = {"criterion": crit, "check": is_check}
@@ -974,24 +993,39 @@ def report(
                     **k_hat,
                 }
             )
+        stages.append((crit, is_check, tag, step1, fits, keys))
+
+    # ── Resamples of every criterion in one pass ────────────────
+    # The weighted cross-products and their factorizations are shared by
+    # every exposure, pair and criterion; only the penalties differ.
+    all_reps = None
+    if W is not None:
+        ex_list, pair_list = [], []
+        for _crit, _check, _tag, step1, fits, keys in stages:
+            base_e = len(ex_list)
+            ex_list += [{"x": exposures[e][1], "lam": step1[e]["lam"]} for e in names]
+            pair_list += [
+                {
+                    "exposure": base_e + names.index(e),
+                    "outcome": out_names.index(o),
+                    "lam": fits[(e, o)]["lam"],
+                }
+                for e, o in keys
+            ]
+        all_reps = replicate_slopes(
+            smoother,
+            W,
+            ex_list,
+            [outcomes[o] for o in out_names],
+            pair_list,
+            covariates=cov,
+            step1_covariates=step1_covariates,
+        )
+    for i, (crit, is_check, tag, step1, fits, keys) in enumerate(stages):
         reps = None
-        if W is not None:
-            reps = replicate_slopes(
-                smoother,
-                W,
-                [{"x": exposures[e][1], "lam": step1[e]["lam"]} for e in names],
-                [outcomes[o] for o in out_names],
-                [
-                    {
-                        "exposure": names.index(e),
-                        "outcome": out_names.index(o),
-                        "lam": fits[(e, o)]["lam"],
-                    }
-                    for e, o in keys
-                ],
-                covariates=cov,
-                step1_covariates=step1_covariates,
-            )
+        if all_reps is not None:
+            span = slice(i * len(keys), (i + 1) * len(keys))
+            reps = {k: v[:, span] for k, v in all_reps.items()}
 
         # ── Slopes ──────────────────────────────────────────────
         per_sd0_draws = {}
