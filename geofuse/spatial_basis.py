@@ -408,6 +408,29 @@ class SpatialBasis:
         return np.column_stack(parts)
 
 
+def cluster_components(
+    xy: np.ndarray,
+    *,
+    eps: float | None = None,
+    neighbours: int = DEFAULT_NEIGHBOURS,
+    min_component: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, float]:
+    """The clusters :func:`build_block_basis` builds on the finite rows of
+    ``xy``: ``(labels, merged, n_merged, eps_used)`` (:func:`connected_components`
+    then :func:`merge_small_components`). Pass them as ``components`` to build
+    several bases on one set of clusters without forming it again."""
+    xy = np.asarray(xy, dtype=np.float64)
+    finite = np.isfinite(xy).all(axis=1)
+    lab_f, eps_used = connected_components(xy[finite], eps=eps, k=neighbours)
+    moved_f = np.zeros(len(lab_f), dtype=bool)
+    n_merged = 0
+    if min_component:
+        lab_f, moved_f, n_merged = merge_small_components(
+            xy[finite], lab_f, int(min_component)
+        )
+    return lab_f, moved_f, n_merged, eps_used
+
+
 def build_block_basis(
     xy: np.ndarray,
     *,
@@ -418,6 +441,7 @@ def build_block_basis(
     knots_max: int = DEFAULT_KNOTS_MAX,
     scale_m: float | None = None,
     min_component: int | None = None,
+    components: "tuple | None" = None,
 ) -> SpatialBasis:
     """Assemble the per-component block-diagonal spatial basis for ``xy``.
 
@@ -434,7 +458,9 @@ def build_block_basis(
     ``scale_m`` everywhere; ``max_df`` and the knot bounds do not apply.
     ``min_component`` joins every smaller cluster to its nearest larger one's
     level (:func:`merge_small_components`): its entities share that cluster's
-    intercept and get no trend or radial terms of their own.
+    intercept and get no trend or radial terms of their own. ``components``
+    (from :func:`cluster_components` on the same ``xy``, ``eps``,
+    ``neighbours`` and ``min_component``) skips forming the clusters again.
 
     Non-finite rows contribute no spatial columns (they fall back to covariate
     control). Returns a :class:`SpatialBasis`; ``has_spatial`` is ``False`` when
@@ -468,13 +494,11 @@ def build_block_basis(
     labels = np.full(n, -1, dtype=np.int64)
     if scale_m is not None and eps is None:
         eps = 2.0 * float(scale_m)
-    lab_f, eps_used = connected_components(xy[finite], eps=eps, k=neighbours)
-    moved_f = np.zeros(len(lab_f), dtype=bool)
-    n_merged = 0
-    if min_component:
-        lab_f, moved_f, n_merged = merge_small_components(
-            xy[finite], lab_f, int(min_component)
+    if components is None:
+        components = cluster_components(
+            xy, eps=eps, neighbours=neighbours, min_component=min_component
         )
+    lab_f, moved_f, n_merged, eps_used = components
     labels[finite] = lab_f
     moved = np.zeros(n, dtype=bool)
     moved[finite] = moved_f

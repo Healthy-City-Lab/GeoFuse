@@ -63,23 +63,33 @@ def information_criteria(y: np.ndarray, X: np.ndarray | None) -> dict:
     log-likelihood ``−n/2 (ln 2π + ln(RSS/n) + 1)``, so ``aic = −2ℓ + 2k`` and
     ``bic = −2ℓ + k ln n``.
     """
-    y = np.asarray(y, dtype=np.float64)
-    n = len(y)
+    return _criteria(np.asarray(y, dtype=np.float64)[:, None], X)[0]
+
+
+def _criteria(Y: np.ndarray, X: np.ndarray | None) -> list[dict]:
+    """:func:`information_criteria` of every column of ``Y`` on one design,
+    from one least-squares solve."""
+    n = len(Y)
     D = np.ones((n, 1))
     if X is not None and np.size(X):
         D = np.column_stack([D, np.asarray(X, dtype=np.float64).reshape(n, -1)])
-    coef, _res, rank, _sv = np.linalg.lstsq(D, y, rcond=None)
-    r = y - D @ coef
-    rss = float(r @ r)
-    llf = -0.5 * n * (np.log(2 * np.pi) + np.log(max(rss, 1e-300) / n) + 1.0)
-    k = int(rank)
-    return {
-        "n": n,
-        "columns": int(D.shape[1] - 1),
-        "rank": k,
-        "aic": float(-2 * llf + 2 * k),
-        "bic": float(-2 * llf + k * np.log(n)),
-    }
+    coef, _res, rank, _sv = np.linalg.lstsq(D, Y, rcond=None)
+    R = Y - D @ coef
+    out = []
+    for j in range(Y.shape[1]):
+        rss = float(R[:, j] @ R[:, j])
+        llf = -0.5 * n * (np.log(2 * np.pi) + np.log(max(rss, 1e-300) / n) + 1.0)
+        k = int(rank)
+        out.append(
+            {
+                "n": n,
+                "columns": int(D.shape[1] - 1),
+                "rank": k,
+                "aic": float(-2 * llf + 2 * k),
+                "bic": float(-2 * llf + k * np.log(n)),
+            }
+        )
+    return out
 
 
 def candidate_bases(
@@ -93,6 +103,9 @@ def candidate_bases(
     """The fixed-scale basis at every scale on one set of clusters (gap
     ``eps_m``, default :data:`DEFAULT_EPS_M`)."""
     eps = float(eps_m) if eps_m else DEFAULT_EPS_M
+    clusters = sb.cluster_components(
+        xy, eps=eps, neighbours=neighbours, min_component=min_component
+    )
     return {
         float(s): sb.build_block_basis(
             xy,
@@ -100,6 +113,7 @@ def candidate_bases(
             neighbours=neighbours,
             scale_m=float(s),
             min_component=min_component,
+            components=clusters,
         )
         for s in scales
     }
@@ -136,11 +150,16 @@ def profile(
     if cov is not None:
         finite_xy &= np.isfinite(cov).all(axis=1)
     rows: list[dict] = []
-    for name, y in outcomes.items():
-        y = np.asarray(y, dtype=np.float64)
+    ys = {name: np.asarray(y, dtype=np.float64) for name, y in outcomes.items()}
+    # Outcomes complete on the same rows share the bases and one solve each.
+    sets: dict[bytes, list[str]] = {}
+    for name, y in ys.items():
         keep = finite_xy & np.isfinite(y)
-        if keep.sum() < 10:
-            continue
+        if keep.sum() >= 10:
+            sets.setdefault(np.packbits(keep).tobytes(), []).append(name)
+    fits_of: dict[str, list] = {}
+    for names in sets.values():
+        keep = finite_xy & np.isfinite(ys[names[0]])
         local = bases if bases is not None and keep.all() else candidate_bases(
             xy[keep],
             scales,
@@ -148,12 +167,19 @@ def profile(
             neighbours=neighbours,
             min_component=min_component,
         )
+        Y = np.column_stack([ys[name][keep] for name in names])
         c = None if cov is None else cov[keep]
-        fits = [(None, information_criteria(y[keep], c), 0)]
+        per = [(None, _criteria(Y, c), 0)]
         for s in scales:
             S = _columns(local[float(s)])
             design = S if c is None else np.column_stack([c, S])
-            fits.append((float(s), information_criteria(y[keep], design), S.shape[1]))
+            per.append((float(s), _criteria(Y, design), S.shape[1]))
+        for j, name in enumerate(names):
+            fits_of[name] = [(scale, ic[j], ncol) for scale, ic, ncol in per]
+    for name in ys:
+        fits = fits_of.get(name)
+        if fits is None:
+            continue
         best = {k: min(f[1][k] for f in fits) for k in CRITERIA}
         winner = {
             k: min(fits, key=lambda f: (f[1][k], f[1]["rank"]))[0] for k in CRITERIA
