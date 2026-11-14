@@ -25,6 +25,7 @@ spatial smooth (radial functions per spatial cluster).
 | Synergy posteriors: first fit and later held-out splits | 2.3–3.2× | — | other draws of the same posterior: means within 1.1 Monte Carlo errors of cold fits |
 | `geofuse` command-line processes | — | 3.1 GB → 0.02 GB each | — |
 | Null calibration: in-process nulls, compiled programs, pool size | 1.14× in-process | peak 13.4 GB → 10.1 GB (2 workers, 16 nulls) | identical null rows |
+| Spatial+ bootstrap (penalized smooths per site) | 12× (9.9 s → 0.83 s per replicate) | peak 0.77 GB (32 replicates at once) | 2.6 × 10⁻¹⁶ on the interval ends; 4 × 10⁻¹⁴ relative |
 
 Section 6 gives the time and memory of a whole study, alone and several at
 once.
@@ -277,13 +278,46 @@ Measured and left out:
 
 ---
 
-## 8. How these figures were measured
+## 8. Spatial+ resamples
+
+A Spatial+ report (`spatial_adjust_method = "spatial_plus"`) bootstraps D,
+ΔD and the paired ΔR² by refitting both Spatial+ steps on every replicate with
+every smoothing parameter fixed: each exposure's step 1 and each (exposure,
+outcome) pair's step 2, in every site group, for the main criterion and each
+check. A replicate is a weighted penalized least squares per group, whose
+matrix differs between those fits only in its penalty λ.
+
+| Change | Before | After | Largest difference |
+| --- | --- | --- | --- |
+| One factorization per group and replicate: the group's trend is eliminated and the rest eigen-decomposed once, so each λ costs a diagonal scaling (replaces one `numpy.linalg.solve` per fit) | 9.9 s per replicate | 0.83 s | 2.6 × 10⁻¹⁶ absolute, 4 × 10⁻¹⁴ relative, over every slope, D, ΔD and paired interval of 16 shared replicates |
+| The main criterion and its checks share one replicate pass (their penalties differ, their weighted cross-products do not) | included above | | |
+
+Measured on 6,091 held-out entities in 13 site groups (55–1,273 entities,
+48–297 penalized functions each), 5 covariates, 6 exposures, a target and 2
+negative controls, GCV with a REML check: the report without resamples takes
+6.6 s, and 2,000 replicates about 28 minutes (before, about 5.5 hours). The
+exact rewrite is ordinary linear algebra: the block solve
+`(G + diag(0, λI))⁻¹ r` through the trend's Schur complement `S`, with
+`S = V diag(e) Vᵀ` once, so `(S + λI)⁻¹ = V diag(1 / (e + λ)) Vᵀ` for every
+λ; a replicate that drew too few of a group's rows to fix its trend uses the
+trend's pseudo-inverse, as the solve it replaces did.
+
+Measured beside it: `numpy.linalg.solve` on a stack of 300 × 300 symmetric
+positive-definite matrices was 15× slower than a Cholesky factorization of the
+same stack on this machine, and small dense factorizations that ran on all 24
+threads slowed from about 8 ms to 115 ms within seconds of sustained load (on
+one thread they settled at 27 ms). The figures above use a fusion job's 4
+threads.
+
+---
+
+## 9. How these figures were measured
 
 Synthetic data only: 4,662 or 20,000 entities in 12 spatial clusters and three
 very small ones, 29 covariate columns (2 numeric, 9 categorical), a smooth
 spatial pattern shared by the outcome, the exposures and the negative
-controls, and the Spatial+ smooth at 10 or 20 df per cluster (169–319 control
-columns). Each fast computation ran on the same data, seeds and resamples as
+controls, and the basis smooth whose df the exposure model picks at 10 or 20
+df per cluster (169–319 control columns). Each fast computation ran on the same data, seeds and resamples as
 the computation it replaces. The sweep used 15,000 entities and a grid of 3
 channels × 10 radii × 6 statistics; the posteriors the same grid with 30
 covariates and the synergy form, 2 chains of 400 draws (cold warm-up 800), a
