@@ -285,7 +285,6 @@ class TestMetricCorrectness(unittest.TestCase):
             self.assertGreater(val, 0.0, f"marginal_r2 clamped to zero at b={b}")
 
 
-
 class TestEstimability(unittest.TestCase):
     def test_time_invariant_exposure_is_not_estimable(self):
         d = make_panel(n_entities=300, freeze_exposure=True, seed=3)

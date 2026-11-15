@@ -29,13 +29,11 @@ for _p in (HERE, ROOT):
         sys.path.insert(0, _p)
 
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
-import numpy as np
+import test_spatial_reporting as reporting_fixture  # noqa: E402
 
 from geofuse import runfile, settings
 from geofuse.fusion import SPATIAL_LABELS, MetricFusionEngine
 from geofuse.jobs import outer_splits, plans, runners
-
-import test_spatial_reporting as reporting_fixture  # noqa: E402
 
 
 class MappingTests(unittest.TestCase):
@@ -268,9 +266,7 @@ class LabelTests(unittest.TestCase):
             self.assertEqual(label, SPATIAL_LABELS[select])
             ref = "Rainey" if select == "df_exposure_ic" else "Keller & Szpiro"
             self.assertIn(ref, label)
-        self.assertIn(
-            "Dupont", outer_splits.method_label({"method": "spatial_plus"})
-        )
+        self.assertIn("Dupont", outer_splits.method_label({"method": "spatial_plus"}))
         # A record from before the rename keeps its own name.
         self.assertEqual(outer_splits.method_label({"method": "ks_aic"}), "ks_aic")
 

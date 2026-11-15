@@ -124,8 +124,9 @@ class EngineStartTests(unittest.TestCase):
 
 class GuardTests(unittest.TestCase):
     def test_a_failed_warm_fit_is_refitted_cold_and_recorded(self):
-        import test_fit_bayesian_index as fixture
         from unittest import mock
+
+        import test_fit_bayesian_index as fixture
 
         eng = fixture._stub_engine()
         kw = dict(

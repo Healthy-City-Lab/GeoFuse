@@ -160,12 +160,16 @@ def profile(
     fits_of: dict[str, list] = {}
     for names in sets.values():
         keep = finite_xy & np.isfinite(ys[names[0]])
-        local = bases if bases is not None and keep.all() else candidate_bases(
-            xy[keep],
-            scales,
-            eps_m=eps_m,
-            neighbours=neighbours,
-            min_component=min_component,
+        local = (
+            bases
+            if bases is not None and keep.all()
+            else candidate_bases(
+                xy[keep],
+                scales,
+                eps_m=eps_m,
+                neighbours=neighbours,
+                min_component=min_component,
+            )
         )
         Y = np.column_stack([ys[name][keep] for name in names])
         c = None if cov is None else cov[keep]
@@ -221,9 +225,7 @@ def summary(rows: list[dict], criterion: str) -> list[dict]:
         sub = [r for r in rows if r.get("stage") == stage and r["outcome"] == outcome]
         entry: dict = {"stage": stage, "outcome": outcome, "criterion": criterion}
         for crit in CRITERIA:
-            picks = {
-                r.get("split"): r["scale_m"] for r in sub if r[f"chosen_{crit}"]
-            }
+            picks = {r.get("split"): r["scale_m"] for r in sub if r[f"chosen_{crit}"]}
             wins: dict = {}
             for scale in picks.values():
                 label = "none" if scale is None else f"{float(scale):g}"

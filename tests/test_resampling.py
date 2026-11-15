@@ -184,7 +184,11 @@ class ResamplingLoopTests(unittest.TestCase):
 
                 def score_fn(t, p, c, metric=metric, method=method):
                     return osc.score(
-                        metric, t, p, c[:, :k], spatial_basis=c[:, k:],
+                        metric,
+                        t,
+                        p,
+                        c[:, :k],
+                        spatial_basis=c[:, k:],
                         spatial_method=method,
                     )
 
@@ -235,21 +239,39 @@ class NegativeControlTests(unittest.TestCase):
         clusters = np.random.default_rng(5).integers(0, 60, d["n"])
         for kw in ({}, {"clusters": clusters}):
             got = nc.paired_contrast(
-                d["x"], d["y"], d["c"], d["cov"], extra={"exposure": self.sx},
-                n_boot=80, seed=2, **kw,
+                d["x"],
+                d["y"],
+                d["c"],
+                d["cov"],
+                extra={"exposure": self.sx},
+                n_boot=80,
+                seed=2,
+                **kw,
             )
             want = nc.paired_contrast(
-                d["x"], d["y"], d["c"], np.column_stack([d["cov"], self.sx]),
-                n_boot=80, seed=2, **kw,
+                d["x"],
+                d["y"],
+                d["c"],
+                np.column_stack([d["cov"], self.sx]),
+                n_boot=80,
+                seed=2,
+                **kw,
             )
             self._same(got, want)
 
     def test_specificity_contrast_with_smooths(self):
         d = self.d
         got = nc.specificity_contrast(
-            d["x"], d["x2"], d["y"], d["c"], d["cov"],
-            extra={"exposure": self.sx, "other": self.sx2}, n_boot=60, seed=4,
+            d["x"],
+            d["x2"],
+            d["y"],
+            d["c"],
+            d["cov"],
+            extra={"exposure": self.sx, "other": self.sx2},
+            n_boot=60,
+            seed=4,
         )
+
         def beta(x, y, smooth):
             controls = np.column_stack([d["cov"], smooth])
             return nc.partial_slope(x, y, controls)["beta"]

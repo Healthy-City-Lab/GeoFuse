@@ -19,10 +19,8 @@ import numpy as np
 import pandas as pd
 import rasterio
 
-from . import metric_intake, parallel, preaggregation
+from . import metric_intake, parallel
 from .crs_utils import (
-    crs_uses_metre_axes,
-    estimate_metre_projected_crs_for_gdf,
     normalize_geographic_gdf_to_wgs84,
     select_grid_crs_with_warning,
 )
@@ -374,5 +372,3 @@ def fusion_param_key(channel_mode: str, weights: dict) -> tuple:
         sorted((str(k), v) for k, v in weights.items() if not str(k).startswith("__"))
     )
     return (channel_mode, items)
-
-

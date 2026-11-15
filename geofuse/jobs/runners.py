@@ -61,7 +61,6 @@ from geofuse.jobs.fusion_outputs import (
     _fusion_stage_weight,
     _jsonsafe_results,
     _log_stage_timing,
-    stage_timing_rows,
     _negative_control_report,
     _posterior_summary,
     _specificity_report,
@@ -69,6 +68,7 @@ from geofuse.jobs.fusion_outputs import (
     comparison_channel,
     paired_verdict,
     specificity_exposures,
+    stage_timing_rows,
     write_entity_table,
 )
 from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
@@ -1210,6 +1210,7 @@ def _paired_family_headline(family: list[dict], channel: str | None) -> dict | N
         head["selected_on"] = "train_val"
     return head
 
+
 def _fixed_scale(fixed_iqr: dict | None, name: str, default: float | None):
     """The per-IQR increment of exposure ``name``: its ``fixed_iqr`` entry,
     else ``default`` (``exposure_iqr``)."""
@@ -1235,6 +1236,7 @@ def _raw_exposures(
         for name in comparators_report or {}:
             out[name] = (comparator_mode(name), {"comparator": name})
     return out
+
 
 def _log_weighted(report: dict | None, label: str) -> None:
     """One line on the weighted held-out estimates: the weights' Kish
@@ -1721,8 +1723,10 @@ def _fusion_config_fingerprint(
 
     dfs = _spatial_df_list(spatial_adjust_df, spatial_adjust_max_df)
     # A df list 0 … N is the older ``max_df`` N, so it keeps that hash.
-    df_text = str(dfs[-1]) if dfs == list(range(dfs[-1] + 1)) else ",".join(
-        str(d) for d in dfs
+    df_text = (
+        str(dfs[-1])
+        if dfs == list(range(dfs[-1] + 1))
+        else ",".join(str(d) for d in dfs)
     )
 
     payload = "|".join(
@@ -4016,9 +4020,7 @@ def run_fusion(
             except JobCancelled:
                 raise
             except Exception as exc:
-                _log_fusion(
-                    "WARN", f"[{label}] Raw-unit effect sizes failed: {exc}"
-                )
+                _log_fusion("WARN", f"[{label}] Raw-unit effect sizes failed: {exc}")
 
             # ────────────────────────────────────────────
             # Weighted estimates
@@ -4048,9 +4050,7 @@ def run_fusion(
                 except JobCancelled:
                     raise
                 except Exception as exc:
-                    _log_fusion(
-                        "WARN", f"[{label}] Weighted estimates failed: {exc}"
-                    )
+                    _log_fusion("WARN", f"[{label}] Weighted estimates failed: {exc}")
                     stage(skey("weighted"), FAILED, str(exc))
                 else:
                     skipped = (weighted_report or {}).get("skipped")

@@ -212,5 +212,3 @@ def vector_metric_column(metric_data: gpd.GeoDataFrame, channel: str) -> str:
     if metric_col and metric_col in metric_data.columns:
         return str(metric_col)
     return metric_intake.resolve_channel_column(metric_data.columns, channel)
-
-

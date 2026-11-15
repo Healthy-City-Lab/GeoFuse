@@ -303,9 +303,7 @@ class Design:
         else:
             self.Qz = np.zeros((n, 0))
         self.V = (
-            smoother.cross(self.Qz)
-            if smoother.p
-            else np.zeros((0, self.Qz.shape[1]))
+            smoother.cross(self.Qz) if smoother.p else np.zeros((0, self.Qz.shape[1]))
         )
         self.s = (
             np.concatenate([g.s for g in smoother.groups])
@@ -1317,8 +1315,10 @@ def half_residual(design: Design, lam: np.ndarray):
     pb, pe = len(s), E.shape[1]
     # F = [U_b, E]; Fᵀ Qz and Fᵀ B (B = U_b diag(√s)).
     FQz = np.vstack([UbQz, E.T @ Qz])
-    FB = np.vstack([np.diag(np.sqrt(s)), np.zeros((pe, pb))]) if pb else np.zeros(
-        (pe, 0)
+    FB = (
+        np.vstack([np.diag(np.sqrt(s)), np.zeros((pe, pb))])
+        if pb
+        else np.zeros((pe, 0))
     )
     # Fᵀ (I − H) F = Fᵀ M_0 F − (Fᵀ B̃) A⁻¹ (B̃ᵀ F), with B̃ = M_0 B.
     st = design.state(lam)

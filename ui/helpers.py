@@ -666,5 +666,3 @@ def render_job_restart_panel(
                 st.session_state[RESTART_SESSION_KEY] = None
                 st.success("Restart submitted. Monitor progress in the sidebar.")
                 st.rerun()
-
-

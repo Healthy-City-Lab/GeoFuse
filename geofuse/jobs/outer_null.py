@@ -141,9 +141,7 @@ class Entities:
         (one per entity)."""
         out = fusion_df.copy()
         out["target"] = out["target"].astype(np.float64)
-        out.loc[self.index, "target"] = np.asarray(values, dtype=np.float64)[
-            self.codes
-        ]
+        out.loc[self.index, "target"] = np.asarray(values, dtype=np.float64)[self.codes]
         return out
 
 
@@ -733,7 +731,8 @@ def run(
         "summary": null_summary(records, observed, decisions),
         "variogram": variogram,
         "decisions": decisions,
-        "complete": complete and all(
+        "complete": complete
+        and all(
             len([r for r in records if r["kind"] == k]) >= n or k in decisions
             for k in _no.kinds(kind)
         ),

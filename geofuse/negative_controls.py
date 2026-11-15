@@ -176,7 +176,6 @@ def partial_slope(exposure, outcome, covariates=None, *, level: float = 0.95) ->
     }
 
 
-
 def raw_slope(
     exposure, outcome, covariates=None, *, scale: float = 1.0, level: float = 0.95
 ) -> dict:
@@ -619,9 +618,7 @@ def _specificity_blocks(
             specs.append((x, design(role), [ya, yb]))
     if any(n - d.rank - 1 < 2 for _, d, _ in specs):
         return out
-    scales = [
-        [float(d.residuals(v).std()) for v in (x, *ys)] for x, d, ys in specs
-    ]
+    scales = [[float(d.residuals(v).std()) for v in (x, *ys)] for x, d, ys in specs]
     if min(min(s) for s in scales) <= 1e-12:
         return out
 

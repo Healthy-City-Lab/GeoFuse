@@ -39,11 +39,11 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
 import geopandas as gpd  # noqa: F401
 import numpy as np
 import pandas as pd
+from spatial_names import SELECT, stand_in
 
 from geofuse import negative_controls as nc
 from geofuse.jobs import outer_splits
 from geofuse.statistical_testing import corrected_resampled_t
-from spatial_names import SELECT, stand_in
 
 # ────────────────────────────────────────────────────────────────────
 # The statistics' extra columns
@@ -432,9 +432,7 @@ class TestRecords(unittest.TestCase):
             },
         )
         self.assertEqual(outer_splits.spatial_columns(None), {})
-        self.assertEqual(
-            outer_splits.spatial_label(one), "basis df_exposure_ic df 3"
-        )
+        self.assertEqual(outer_splits.spatial_label(one), "basis df_exposure_ic df 3")
         self.assertEqual(
             outer_splits.spatial_label(pair),
             "basis df_outcome_ic df target 2, control none",
@@ -553,7 +551,6 @@ class TestAdjustedRun(unittest.TestCase):
                 self.assertIn(column, table[0])
                 methods = {r["spatial_method"] for r in table if r["spatial_method"]}
                 self.assertEqual(methods, {"basis"})
-
 
     def test_the_covariates_only_reports_say_so(self):
         for name in ("exposure_response.csv", "covariate_impact.csv"):

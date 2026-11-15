@@ -2906,9 +2906,7 @@ def _render_study_details_panel(
                 ),
             )
         if spatial_adjust_method == "basis":
-            _default(
-                "fusion_spatial_adjust_df", _df_list_text(spatial_adjust_df)
-            )
+            _default("fusion_spatial_adjust_df", _df_list_text(spatial_adjust_df))
             _default(
                 "fusion_spatial_adjust_criterion",
                 spatial_adjust_criterion,

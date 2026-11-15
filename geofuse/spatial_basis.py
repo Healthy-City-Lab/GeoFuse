@@ -557,9 +557,7 @@ def build_block_basis(
         "neighbours": int(neighbours),
         "knots_min": int(knots_min),
         "knots_max": int(knots_max),
-        **component_report(
-            xy[finite][~moved_f], lab_f[~moved_f], knots_per_component
-        ),
+        **component_report(xy[finite][~moved_f], lab_f[~moved_f], knots_per_component),
     }
     if min_component:
         summary.update(

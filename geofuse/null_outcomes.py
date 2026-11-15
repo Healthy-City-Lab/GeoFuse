@@ -173,9 +173,7 @@ class SpatialNull:
         )
         self.levels = _levels(self.groups)
         codes = {g: c for c, g in enumerate(self.levels)}
-        self.codes = np.array(
-            [codes[g] for g in self.groups.tolist()], dtype=np.int64
-        )
+        self.codes = np.array([codes[g] for g in self.groups.tolist()], dtype=np.int64)
         self.means = np.bincount(self.codes, weights=y) / np.bincount(self.codes)
         self.deviations = y - self.means[self.codes]
         self.bins_m = tuple(float(e) for e in bins_m)

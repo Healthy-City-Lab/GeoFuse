@@ -149,9 +149,7 @@ class TestNullCalibration(unittest.TestCase):
         cls.bundle = run_study(cls.folder, INPUTS, **cls.SETTINGS)[1]
         cls.null = cls.bundle["outer_null"]
         cls.resume = os.path.join(cls.folder, "out", "fusion_cache", "outer_null")
-        (cls.resume_file,) = [
-            f for f in os.listdir(cls.resume) if f.endswith(".jsonl")
-        ]
+        (cls.resume_file,) = [f for f in os.listdir(cls.resume) if f.endswith(".jsonl")]
         cls.rerun = run_study(cls.folder, INPUTS, **cls.SETTINGS)[1]["outer_null"]
         shutil.rmtree(cls.resume)
         cls.pooled = run_study(
@@ -221,7 +219,6 @@ class TestNullCalibration(unittest.TestCase):
             )
 
 
-
 def _record(index, p, kind="free", median=0.1):
     return {
         "kind": kind,
@@ -268,7 +265,6 @@ class TestSummary(unittest.TestCase):
         mixed = [_record(0, 0.01), _record(1, 0.5), _record(2, 0.5)]
         self.assertIsNone(outer_null._decide(mixed, rule))
         self.assertIsNone(outer_null._decide(hits, {}))
-
 
 
 class TestResultsPanel(unittest.TestCase):
@@ -389,7 +385,8 @@ class TestNullGroups(unittest.TestCase):
             "[[fusion]]\n"
             'name = "t"\n'
             'target = "cohort.gpkg"\n'
-            'outcomes = ["outcome"]\n' + textwrap.dedent(INPUTS + NULL_SETTINGS)
+            'outcomes = ["outcome"]\n'
+            + textwrap.dedent(INPUTS + NULL_SETTINGS)
             + 'outer_null_group = "no_such_column"\n'
         )
         path = os.path.join(self.folder, "missing.toml")
@@ -427,6 +424,7 @@ class TestGroupRecord(unittest.TestCase):
         self.assertEqual(ent.n_missing_group, 2)
         missing = outer_null.MISSING_GROUP
         self.assertEqual(list(ent.group), ["n", missing, "s", missing])
+
 
 if __name__ == "__main__":
     unittest.main()

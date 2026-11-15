@@ -26,8 +26,8 @@ for _p in (HERE, ROOT):
 
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
-
 import test_spatial_tuning as tuning
+
 from geofuse import settings
 from geofuse import spatial_plus as sp
 from geofuse.fusion import MetricFusionEngine

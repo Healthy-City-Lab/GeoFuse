@@ -23,9 +23,9 @@ if ROOT not in sys.path:
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
 import pandas as pd
+from spatial_names import stand_in
 
 from geofuse import objective_scoring
-from spatial_names import stand_in
 from geofuse.fusion import MetricFusionEngine as E
 
 _METHODS = (

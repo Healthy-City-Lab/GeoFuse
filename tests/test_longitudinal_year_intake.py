@@ -73,7 +73,6 @@ class TestYearKeyedIntake(unittest.TestCase):
         self.assertIn(("c", "2016"), waves)
         self.assertEqual(sorted(set(out["wave"])), ["2010", "2015", "2016"])
 
-
     def test_two_measurements_in_one_year_raise(self):
         f = _frame(["2010-01-01", "2010-09-09"], ["a", "a"])
         spec = _spec(("2010",), {"w": "/f.gpkg"}, {"2010": "g.tif"})

@@ -882,7 +882,6 @@ class GreeneryCache:
         """Route lookups for ``wave_index`` to the unit ``cfg_key``."""
         self._wave_unit[int(wave_index)] = cfg_key
 
-
     # ── Reuse / build ───────────────────────────────────────────
     def open_unit(
         self,

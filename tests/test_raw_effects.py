@@ -198,9 +198,7 @@ class TestRawEffectsRun(unittest.TestCase):
             self.assertIsNotNone(e["corrected_p"])
 
     def test_the_cgi_layers_are_described(self):
-        layers = [
-            d for d in self.outer["distributions"] if d["kind"] == "layer"
-        ]
+        layers = [d for d in self.outer["distributions"] if d["kind"] == "layer"]
         self.assertEqual({d["split"] for d in layers}, {0, 1})
         self.assertEqual({d["layer"] for d in layers}, {"ndvi", "gvi"})
         for d in layers:
@@ -241,7 +239,6 @@ class TestRawEffectsRun(unittest.TestCase):
         ) as f:
             self.assertNotIn("fixed_iqr", json.load(f))
 
-
     def test_the_command_line_prints_the_raw_rows(self):
         from pathlib import Path
 
@@ -271,6 +268,7 @@ class TestRawEffectsRun(unittest.TestCase):
         self.assertIn("Change", frame.columns)
         self.assertIn("field_here", set(frame["Exposure"]))
         self.assertIn("Raw-unit effect sizes", rec.text())
+
 
 if __name__ == "__main__":
     unittest.main()

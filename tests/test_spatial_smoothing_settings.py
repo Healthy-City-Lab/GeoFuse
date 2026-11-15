@@ -21,12 +21,12 @@ if ROOT not in sys.path:
 
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
+from spatial_names import spatial_kwargs
 
 from geofuse import exposure_response, objective_scoring, settings
 from geofuse import spatial_basis as sb
 from geofuse.cli import commands as cli
 from geofuse.fusion import MetricFusionEngine
-from spatial_names import spatial_kwargs
 from geofuse.jobs import runners
 
 
@@ -85,9 +85,7 @@ class LegacyAliasTests(unittest.TestCase):
             settings.check("fusion", values)
 
     def test_engine_default_is_the_log_spaced_list(self):
-        self.assertEqual(
-            _engine().spatial_adjust_df, (0, 1, 2, 3, 4, 6, 8, 11, 15, 20)
-        )
+        self.assertEqual(_engine().spatial_adjust_df, (0, 1, 2, 3, 4, 6, 8, 11, 15, 20))
         self.assertEqual(sb.DEFAULT_DF_CANDIDATES, settings.SPATIAL_DF_CANDIDATES)
         self.assertEqual(sb.CRITERIA, settings.SPATIAL_CRITERIA)
 

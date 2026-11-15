@@ -83,8 +83,6 @@ class TestStageTiming(unittest.TestCase):
         self.assertEqual(led.timing_report(), [])
 
 
-
-
 class TestARunThatDiesStopsItsClock(unittest.TestCase):
     """A stage counts up against the wall clock until its end is recorded.
 
@@ -123,7 +121,6 @@ class TestARunThatDiesStopsItsClock(unittest.TestCase):
         led = StageLedger.from_steps([("load", "Load")])
         led.mark_done("load")
         self.assertIsNone(led.stop_running(FAILED, "boom"))
-
 
 
 class TestParallelEfficiencyReport(unittest.TestCase):

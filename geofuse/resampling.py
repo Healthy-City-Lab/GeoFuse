@@ -230,7 +230,6 @@ class BlockDesign:
         M = G[:, d:, d:] - np.swapaxes(T, 1, 2) @ T
         return M * (sd[:, None] * sd[None, :])
 
-
     # ── Fits on one weight vector ───────────────────────────────
 
     def residuals(self, R: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
@@ -251,7 +250,6 @@ class BlockDesign:
         Rs = ((R2 - mean) / sd)[self.order]
         wp = w[self.order]
         Qd = self.Qd_sorted
-        d = Qd.shape[1]
 
         # Normal equations block by block: each block's coefficients are
         # expressed through the dense ones (Schur complement), solved, then

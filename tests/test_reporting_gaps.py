@@ -25,6 +25,7 @@ if ROOT not in sys.path:
 
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
+from spatial_names import spatial_kwargs
 
 from geofuse import JobCancelled
 from geofuse import negative_controls as nc
@@ -32,7 +33,6 @@ from geofuse import objective_scoring as osc
 from geofuse import resampling as rs
 from geofuse import spatial_basis as sb
 from geofuse.fusion import MetricFusionEngine
-from spatial_names import spatial_kwargs
 from geofuse.jobs import runners
 from geofuse.jobs.stage_ledger import DONE, FAILED
 
@@ -210,8 +210,14 @@ class StrainedResamplingTests(unittest.TestCase):
         pairs = (
             (
                 nc.specificity_contrast(
-                    x, other, target, control, cov,
-                    extra={"exposure": smooth, "other": smooth}, n_boot=300, seed=7,
+                    x,
+                    other,
+                    target,
+                    control,
+                    cov,
+                    extra={"exposure": smooth, "other": smooth},
+                    n_boot=300,
+                    seed=7,
                 ),
                 nc.specificity_contrast(
                     x, other, target, control, dense, n_boot=300, seed=7
@@ -219,8 +225,13 @@ class StrainedResamplingTests(unittest.TestCase):
             ),
             (
                 nc.paired_contrast(
-                    x, target, control, cov, extra={"exposure": smooth},
-                    n_boot=300, seed=7,
+                    x,
+                    target,
+                    control,
+                    cov,
+                    extra={"exposure": smooth},
+                    n_boot=300,
+                    seed=7,
                 ),
                 nc.paired_contrast(x, target, control, dense, n_boot=300, seed=7),
             ),
@@ -235,8 +246,13 @@ class StrainedResamplingTests(unittest.TestCase):
             dense = np.column_stack([cov, smooth])
             pair = (
                 nc.paired_contrast(
-                    x, target, control, cov, extra={"exposure": smooth},
-                    n_boot=300, seed=7,
+                    x,
+                    target,
+                    control,
+                    cov,
+                    extra={"exposure": smooth},
+                    n_boot=300,
+                    seed=7,
                 ),
                 nc.paired_contrast(x, target, control, dense, n_boot=300, seed=7),
             )

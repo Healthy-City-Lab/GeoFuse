@@ -704,6 +704,7 @@ def weighted_rows(report: dict | None, keep: "set[str] | None" = None) -> list[d
                 )
     return rows
 
+
 def raw_scales(report: dict | None) -> dict:
     """The ranges each exposure's raw-unit rows are per, ``{name: {"per_iqr":
     …, "per_p5_p95": …}}``, so the weighted rows use the same ones."""

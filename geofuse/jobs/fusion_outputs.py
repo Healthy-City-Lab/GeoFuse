@@ -211,8 +211,6 @@ def _write_fusion_outputs(
     ``mde`` (the minimum detectable effect) say what that inference rests on.
     """
 
-    import numpy as np
-
     os.makedirs(output_dir, exist_ok=True)
     sfx = f"__{label}" if multi_outcome else ""
     written: list[str] = []

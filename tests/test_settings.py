@@ -68,12 +68,8 @@ class EngineConstantTests(unittest.TestCase):
         self.assertEqual(settings.EXPOSURE_KERNELS, exposure.KERNELS)
         self.assertEqual(settings.CATEGORICAL_MISSING, fusion.CATEGORICAL_MISSING)
         self.assertEqual(settings.SPATIAL_SPLIT_MODES, fusion.SPATIAL_SPLIT_MODES)
-        self.assertEqual(
-            settings.SPATIAL_ADJUST_METHODS, fusion.SPATIAL_ADJUST_METHODS
-        )
-        self.assertEqual(
-            settings.SPATIAL_ADJUST_SELECTS, fusion.SPATIAL_ADJUST_SELECTS
-        )
+        self.assertEqual(settings.SPATIAL_ADJUST_METHODS, fusion.SPATIAL_ADJUST_METHODS)
+        self.assertEqual(settings.SPATIAL_ADJUST_SELECTS, fusion.SPATIAL_ADJUST_SELECTS)
         self.assertEqual(settings.SPATIAL_TUNE_METHODS, fusion.SPATIAL_TUNE_METHODS)
         self.assertEqual(settings.SPATIAL_TUNE_SELECTS, fusion.SPATIAL_TUNE_SELECTS)
         self.assertEqual(

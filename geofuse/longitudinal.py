@@ -639,5 +639,3 @@ def _project_columns(
     out = out.rename(columns={spec.entity_id_col: "entity_id"})
     out = gpd.GeoDataFrame(out, geometry="geometry", crs=frame.crs)
     return out
-
-

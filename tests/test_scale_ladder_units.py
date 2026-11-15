@@ -26,13 +26,13 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
 import pandas as pd
-
 import test_spatial_reporting as reporting_fixture
+from spatial_names import stand_in
+from test_spatial_scale import _scaled
+
 from geofuse import negative_controls as nc
 from geofuse.fusion import MetricFusionEngine, _absorbed_given_cov
-from spatial_names import stand_in
 from geofuse.jobs import outer_splits
-from test_spatial_scale import _scaled
 
 _EXTRA = ("compute_raw_effects",)
 
@@ -156,7 +156,11 @@ class TestAbsorbedGivenCovariates(unittest.TestCase):
         n = 500
         cov = rng.normal(size=(n, 3))
         smooth = rng.normal(size=(n, 12))
-        x = cov @ [0.5, -0.2, 0.1] + smooth[:, :3] @ [0.4, 0.3, 0.2] + rng.normal(size=n)
+        x = (
+            cov @ [0.5, -0.2, 0.1]
+            + smooth[:, :3] @ [0.4, 0.3, 0.2]
+            + rng.normal(size=n)
+        )
 
         def resid(X):
             Xc = np.column_stack([np.ones(n), X])

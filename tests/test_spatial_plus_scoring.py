@@ -101,9 +101,7 @@ class TestBasisScores(unittest.TestCase):
 class TestIndependentExposure(unittest.TestCase):
     def test_the_score_moves_only_by_noise(self):
         y, x, cov, s = _data(seed=3, n=4000, tie=0.0)
-        new = osc.score(
-            "spearman", y, x, cov, spatial_basis=s, spatial_method="basis"
-        )
+        new = osc.score("spearman", y, x, cov, spatial_basis=s, spatial_method="basis")
         ranks = np.column_stack([rankdata(c) for c in cov.T])
         ry = _resid(rankdata(y), np.column_stack([ranks, s]))
         old = abs(np.corrcoef(ry, _resid(rankdata(x), s))[0, 1])

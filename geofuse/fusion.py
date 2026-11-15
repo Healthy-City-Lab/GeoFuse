@@ -53,7 +53,6 @@ from .crs_utils import (
     crs_uses_metre_axes,
     default_geotiff_creation_options,
     estimate_metre_projected_crs_for_gdf,
-    metres_per_degree_at_lat,
     normalize_geographic_gdf_to_wgs84,
     reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
@@ -737,8 +736,10 @@ class MetricFusionEngine:
                 "spatial_tune_method 'spatial_plus_inputs' needs "
                 "spatial_adjust_method 'spatial_plus'."
             )
-        if select is not None and select.startswith("df_") and (
-            spatial_adjust_scale_m is not None or spatial_tune_scale_m is not None
+        if (
+            select is not None
+            and select.startswith("df_")
+            and (spatial_adjust_scale_m is not None or spatial_tune_scale_m is not None)
         ):
             raise ValueError(
                 f"spatial_adjust_select {select!r} sets the basis by a df; a "
@@ -847,9 +848,7 @@ class MetricFusionEngine:
         if spatial_adjust_min_component is None and self.spatial_adjust_scales:
             spatial_adjust_min_component = spatial_basis.DEFAULT_MIN_COMPONENT
         self.spatial_adjust_min_component: int | None = (
-            int(spatial_adjust_min_component)
-            if spatial_adjust_min_component
-            else None
+            int(spatial_adjust_min_component) if spatial_adjust_min_component else None
         )
         self._spatial_basis_cache: dict = {}
         # The scale selection of the current split and whether a report runs
@@ -929,9 +928,7 @@ class MetricFusionEngine:
         bad = [c for c in (spatial_plus_checks or ()) if c not in _sp.CRITERIA]
         if bad:
             raise ValueError(f"spatial_plus_checks may only hold {_sp.CRITERIA}.")
-        self.spatial_plus_groups_column: str | None = (
-            spatial_plus_groups_column or None
-        )
+        self.spatial_plus_groups_column: str | None = spatial_plus_groups_column or None
         self.spatial_plus_k: int = int(spatial_plus_k)
         self.spatial_plus_criterion: str = spatial_plus_criterion
         self.spatial_plus_checks: tuple[str, ...] = tuple(
@@ -1056,7 +1053,6 @@ class MetricFusionEngine:
         # The spatial blocking a held-out split used and the test share it
         # realised; ``None`` without spatial blocks.
         self._spatial_split_report: dict | None = None
-
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
@@ -2259,7 +2255,6 @@ class MetricFusionEngine:
         logger.info(f"NDVI downloaded: {result['tif']}")
         return result["tif"]
 
-
     def _clear_fold_caches(self) -> None:
         # Fold-static data (collapse codes, collapsed target/covariates,
         # points slices) keys off the live fold row sets, which change with
@@ -2290,7 +2285,6 @@ class MetricFusionEngine:
         if getattr(self, f"{channel}_ladder_spacing") == "log":
             return f"log ({len(self._ladder(channel))} rungs)"
         return f"linear (step {getattr(self, f'{channel}_buffer_step_m'):g} m)"
-
 
     def _cached_channel_values(
         self,
@@ -3835,9 +3829,7 @@ class MetricFusionEngine:
         # gap in a channel this study never reads cannot drop rows from it.
         cov, tuning = self._search_covariates(static)
         if getattr(self, "spatial_tune_method", "basis") == "spatial_plus_inputs":
-            if bayesian_index.eligible_forms(forms, len(index_channels)) != (
-                "linear",
-            ):
+            if bayesian_index.eligible_forms(forms, len(index_channels)) != ("linear",):
                 raise ValueError(
                     "spatial_plus_inputs tunes the linear form only (synergy "
                     "terms need positive inputs); set index_form to 'linear'."
@@ -3863,7 +3855,13 @@ class MetricFusionEngine:
         )
         if tuning is not None and tuning.get("method") != "spatial_plus_inputs":
             tuning = self._tuning_record(
-                tuning, X, y, static.get("cov"), channel_index, index_channels, prep_info
+                tuning,
+                X,
+                y,
+                static.get("cov"),
+                channel_index,
+                index_channels,
+                prep_info,
             )
         dropped = int(len(X) - len(Xr))
         if dropped:
@@ -4032,8 +4030,11 @@ class MetricFusionEngine:
             )
         warm_record = {
             "source": source if start is not None else "none",
-            "warmup": int(start["warmup"]) if start is not None and not fallback
-            else int(warmup),
+            "warmup": (
+                int(start["warmup"])
+                if start is not None and not fallback
+                else int(warmup)
+            ),
             "fallback": fallback,
         }
         self._posterior_warm[(self._active_greenery_channel, res.form)] = {
@@ -4296,18 +4297,18 @@ class MetricFusionEngine:
         yt[keep] = out["y"]
         # ── The record: per channel, then the outcome smoother ─
         edf_x = self._plus_inputs_cache[key]["edf_x"]
-        channel_of = np.repeat(
-            np.arange(X.shape[1]), int(np.prod(X.shape[2:]))
-        )[cols]
+        channel_of = np.repeat(np.arange(X.shape[1]), int(np.prod(X.shape[2:])))[cols]
         per_channel = {}
         for ci, ch in zip(channel_index, index_channels, strict=True):
             mine = channel_of == ci
             if not mine.any():
                 continue
             per_channel[ch] = {
-                "median_edf": float(np.nanmedian(edf_x[mine].sum(axis=1)))
-                if np.isfinite(edf_x[mine]).any()
-                else None,
+                "median_edf": (
+                    float(np.nanmedian(edf_x[mine].sum(axis=1)))
+                    if np.isfinite(edf_x[mine]).any()
+                    else None
+                ),
                 "absorbed": float(np.nanmedian(out["absorbed"][mine])),
             }
         from . import spatial_scale_selection as _ss
@@ -5224,9 +5225,7 @@ class MetricFusionEngine:
             }
             column = _search_weight_column(self)
             if column in data.columns:
-                st["sample_weight"] = data[column].to_numpy(dtype=np.float64)[
-                    first_idx
-                ]
+                st["sample_weight"] = data[column].to_numpy(dtype=np.float64)[first_idx]
             st["coords"] = (
                 np.column_stack(
                     [
@@ -5712,15 +5711,17 @@ class MetricFusionEngine:
             cols = basis.design(max(1, basis.max_df)) if basis.has_spatial else None
             entry = {
                 "basis": basis,
-                "chosen": None
-                if cols is None or not cols.shape[1]
-                else {
-                    "columns": cols,
-                    "df": int(cols.shape[1]),
-                    "ic": {},
-                    "at_cap": False,
-                    "scale_m": scale,
-                },
+                "chosen": (
+                    None
+                    if cols is None or not cols.shape[1]
+                    else {
+                        "columns": cols,
+                        "df": int(cols.shape[1]),
+                        "ic": {},
+                        "at_cap": False,
+                        "scale_m": scale,
+                    }
+                ),
             }
             self._spatial_basis_cache[key] = entry
             if scale not in self._spatial_scale_summaries:
@@ -5874,9 +5875,7 @@ class MetricFusionEngine:
             ),
             "clusters": (first or {}).get("n_components"),
             "paired_rule": (
-                self.spatial_paired_smooth
-                if self._basis == "exposure"
-                else "outcome"
+                self.spatial_paired_smooth if self._basis == "exposure" else "outcome"
             ),
             "selections": int(self._spatial_selections["n"]),
             "selections_at_cap": int(self._spatial_selections["at_cap"]),
@@ -6676,9 +6675,7 @@ class MetricFusionEngine:
                 c: pd.to_numeric(frame[c], errors="coerce").to_numpy(dtype=np.float64)
                 for c in controls
             },
-            "cov": (
-                frame[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None
-            ),
+            "cov": (frame[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None),
         }
 
     def _select_scales(self) -> None:
@@ -6797,8 +6794,6 @@ class MetricFusionEngine:
         if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
             return True
         return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
-
-
 
     def _score_greenery(
         self,
@@ -8539,14 +8534,18 @@ class MetricFusionEngine:
             chosen = self._spatial_selection(coords, target, cov, cgi_c)
             s = None if chosen is None else chosen["columns"]
             df = None if chosen is None else chosen["df"]
-            return s, s, {
-                **self._method_record(),
-                "rule": "shared",
-                "df_cgi": df,
-                "df_exposure": df,
-                "scale_m": self._spatial_scale,
-                **self._selected_tag(),
-            }
+            return (
+                s,
+                s,
+                {
+                    **self._method_record(),
+                    "rule": "shared",
+                    "df_cgi": df,
+                    "df_exposure": df,
+                    "scale_m": self._spatial_scale,
+                    **self._selected_tag(),
+                },
+            )
         rule = self.spatial_paired_smooth if method == "exposure" else "outcome"
 
         def cols(chosen):
@@ -10161,9 +10160,7 @@ class MetricFusionEngine:
             out["slopes"][name] = {
                 "target": tag(_w.slope(xt, t, with_smooth(s_t), w), rec_t),
                 "controls": {
-                    c: tag(
-                        _w.slope(xt, v[test], with_smooth(s_c[c][0]), w), s_c[c][1]
-                    )
+                    c: tag(_w.slope(xt, v[test], with_smooth(s_c[c][0]), w), s_c[c][1])
                     for c, v in controls.items()
                 },
             }

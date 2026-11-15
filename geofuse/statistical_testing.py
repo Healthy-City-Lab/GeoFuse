@@ -493,9 +493,7 @@ def _batched_scores(
         else:
             m = np.empty((stop - start, len(group_rows)))
             for b in range(start, stop):
-                m[b - start] = np.bincount(
-                    boot_groups[b], minlength=len(group_rows)
-                )
+                m[b - start] = np.bincount(boot_groups[b], minlength=len(group_rows))
             W = m[:, codes]
         try:
             scores[start:stop] = scorer(W)

@@ -33,9 +33,9 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
 
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
-
 import test_paired_smooth as paired_fixture
 import test_spatial_reporting as reporting_fixture
+
 from geofuse import settings
 from geofuse import spatial_basis as sb
 from geofuse.fusion import MetricFusionEngine, _absorbed_share
@@ -279,9 +279,11 @@ class LadderTests(unittest.TestCase):
                 for name in ("a", "b"):
                     rows.append(
                         {
-                            "quantity": "cgi_minus_comparator"
-                            if scale == "3000"
-                            else "held_out_beta",
+                            "quantity": (
+                                "cgi_minus_comparator"
+                                if scale == "3000"
+                                else "held_out_beta"
+                            ),
                             "exposure": name,
                             "estimate": 0.1 + shift + 0.01 * k,
                             "ci_low": None,
@@ -304,7 +306,9 @@ class LadderTests(unittest.TestCase):
     def test_the_label_names_the_scale(self):
         record = {"method": "ks_aic", "df": 40, "scale_m": 5_000.0}
         self.assertEqual(outer_splits.spatial_label(record), "ks_aic at 5 km")
-        self.assertEqual(outer_splits.spatial_columns(record)["spatial_scale_m"], "5000")
+        self.assertEqual(
+            outer_splits.spatial_columns(record)["spatial_scale_m"], "5000"
+        )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -336,7 +340,9 @@ class SettingsTests(unittest.TestCase):
         report = eng.spatial_selection_report()
         self.assertEqual(report["selection"], "fixed scale")
         self.assertEqual(report["paired_rule"], "shared")
-        self.assertIsNone(engine(spatial_adjust_method="ks_aic").spatial_adjust_min_component)
+        self.assertIsNone(
+            engine(spatial_adjust_method="ks_aic").spatial_adjust_min_component
+        )
 
 
 if __name__ == "__main__":

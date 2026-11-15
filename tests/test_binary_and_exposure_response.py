@@ -271,8 +271,6 @@ class TestEngineRouting(unittest.TestCase):
         self.assertAlmostEqual(routed, direct, places=6)
 
 
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -548,7 +546,6 @@ class TestScaleInvariance(unittest.TestCase):
                 places=6,
                 msg=f"|z| moved at scale {scale:g}",
             )
-
 
     def test_cross_sectional_metrics_are_invariant(self):
         """Why normalising the inputs is not required for the OLS-based path."""

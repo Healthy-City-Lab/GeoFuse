@@ -86,9 +86,7 @@ class FitTests(unittest.TestCase):
         self.assertAlmostEqual(
             design.quad(x, y, lam), x @ (np.eye(n) - H) @ y, delta=1e-8
         )
-        np.testing.assert_allclose(
-            design.residual(x, lam), x - H @ x, atol=1e-10
-        )
+        np.testing.assert_allclose(design.residual(x, lam), x - H @ x, atol=1e-10)
         self.assertAlmostEqual(design.edf(lam)[0], np.trace(H), places=8)
         gcv = n * (resid @ resid) / (n - np.trace(H)) ** 2
         self.assertAlmostEqual(
@@ -108,9 +106,7 @@ class FitTests(unittest.TestCase):
             nu = len(y) - design.r0
             pos = P[P > 0]
             return (
-                nu * np.log(pen_rss / nu)
-                + np.linalg.slogdet(A)[1]
-                - np.log(pos).sum()
+                nu * np.log(pen_rss / nu) + np.linalg.slogdet(A)[1] - np.log(pos).sum()
             )
 
         values = []
@@ -171,7 +167,9 @@ class OneGroupReferenceTests(unittest.TestCase):
             grid = np.linspace(top - 30, top + 8, 400)
             best = grid[int(np.argmin([g(r) for r in grid]))]
             res = minimize_scalar(
-                g, bounds=(best - 0.2, best + 0.2), method="bounded",
+                g,
+                bounds=(best - 0.2, best + 0.2),
+                method="bounded",
                 options={"xatol": 1e-10},
             )
             return np.exp(res.x)

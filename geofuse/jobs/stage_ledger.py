@@ -28,7 +28,6 @@ FAILED = "failed"
 SKIPPED = "skipped"
 
 
-
 @dataclass
 class Stage:
     """One named step with a status, fractional progress, and a short message.
@@ -119,7 +118,6 @@ class StageLedger:
     def get(self, key: str) -> Stage | None:
         return self._by_key.get(key)
 
-
     # ────────────────────────────────────────────────────────────
     # Mutations
     # ────────────────────────────────────────────────────────────
@@ -165,7 +163,6 @@ class StageLedger:
         # A skipped stage did no work, so it never gets a duration.
         self.set_status(key, SKIPPED, progress=1.0, message=message)
 
-
     def stop_running(self, status: str = FAILED, message: str = "") -> str | None:
         """Close the clock on whatever stage was still running, and return its key.
 
@@ -200,4 +197,3 @@ class StageLedger:
             key=lambda r: r[2],
             reverse=True,
         )
-

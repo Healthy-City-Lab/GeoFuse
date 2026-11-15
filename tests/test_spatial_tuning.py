@@ -21,8 +21,8 @@ for _p in (os.path.dirname(os.path.abspath(__file__)), ROOT):
 
 import geopandas  # noqa: F401  (pyproj before torchvision, see vision.py)
 import numpy as np
-
 import test_fit_bayesian_index as fixture
+
 from geofuse import bayesian_index, cgi_formulas, parallel
 from geofuse import spatial_basis as sb
 from geofuse.fusion import MetricFusionEngine
@@ -235,9 +235,7 @@ class EngineSettingTests(unittest.TestCase):
         )
 
     def test_the_reported_scale_defaults_to_the_tuning_scale(self):
-        eng = self._make(
-            spatial_adjust_method="basis", spatial_tune_scale_m=5000
-        )
+        eng = self._make(spatial_adjust_method="basis", spatial_tune_scale_m=5000)
         self.assertEqual(eng.spatial_adjust_scales, (5000.0,))
         self.assertEqual(eng._tune_eps, 10_000.0)
 
