@@ -25,7 +25,8 @@ spatial smooth (radial functions per spatial cluster).
 | Synergy posteriors: first fit and later held-out splits | 2.3–3.2× | — | other draws of the same posterior: means within 1.1 Monte Carlo errors of cold fits |
 | `geofuse` command-line processes | — | 3.1 GB → 0.02 GB each | — |
 | Null calibration: in-process nulls, compiled programs, pool size | 1.14× in-process | peak 13.4 GB → 10.1 GB (2 workers, 16 nulls) | identical null rows |
-| Spatial+ bootstrap (penalized smooths per site) | 12× (9.9 s → 0.83 s per replicate) | peak 0.77 GB (32 replicates at once) | 2.6 × 10⁻¹⁶ on the interval ends; 4 × 10⁻¹⁴ relative |
+| Spatial+ bootstrap (penalized smooths per site) | 55× under sustained load: 8.7 s → 0.81 s → 0.16 s per replicate (4 workers) | 0.77 GB per process, up to 4 workers | 2.6 × 10⁻¹⁶ on the interval ends; the workers' replicates equal the serial ones |
+| Scale profile of a basis run (AIC-NE / BIC-NE) | 6.5× sustained (30.7 s → 4.7 s), 11× from cold (29.6 s → 2.6 s) | — | 3 × 10⁻¹¹ on AIC / BIC of about 10⁴; identical choices |
 
 Section 6 gives the time and memory of a whole study, alone and several at
 once.
@@ -291,11 +292,18 @@ matrix differs between those fits only in its penalty λ.
 | --- | --- | --- | --- |
 | One factorization per group and replicate: the group's trend is eliminated and the rest eigen-decomposed once, so each λ costs a diagonal scaling (replaces one `numpy.linalg.solve` per fit) | 9.9 s per replicate | 0.83 s | 2.6 × 10⁻¹⁶ absolute, 4 × 10⁻¹⁴ relative, over every slope, D, ΔD and paired interval of 16 shared replicates |
 | The main criterion and its checks share one replicate pass (their penalties differ, their weighted cross-products do not) | included above | | |
+| Chunks of 32 replicates run across worker processes (`parallel.map_batches`, one BLAS thread each), from 128 replicates on, at most 4 workers | 0.81 s per replicate | 0.16 s with 4 workers | replicates equal the serial ones |
 
 Measured on 6,091 held-out entities in 13 site groups (55–1,273 entities,
 48–297 penalized functions each), 5 covariates, 6 exposures, a target and 2
-negative controls, GCV with a REML check: the report without resamples takes
-6.6 s, and 2,000 replicates about 28 minutes (before, about 5.5 hours). The
+negative controls, GCV with a REML check, over an hour of sustained load: the
+report without resamples takes 6.6 s; 2,000 replicates took about 4.8 hours
+before (8.5 s per replicate at the start of a 19-minute run, 8.9 s at its end),
+27 minutes with the factorization shared (0.81 s, flat over the run) and 5.3
+minutes with 4 workers (0.16 s). Eight workers measured only 1.15× faster
+than four on 512 replicates, and a run with 8 workers next to other programs
+ran this 32 GB host low on memory, so the automatic pool stops at four
+(`REPLICATE_WORKERS_MAX`). The
 exact rewrite is ordinary linear algebra: the block solve
 `(G + diag(0, λI))⁻¹ r` through the trend's Schur complement `S`, with
 `S = V diag(e) Vᵀ` once, so `(S + λI)⁻¹ = V diag(1 / (e + λ)) Vᵀ` for every
@@ -306,8 +314,22 @@ Measured beside it: `numpy.linalg.solve` on a stack of 300 × 300 symmetric
 positive-definite matrices was 15× slower than a Cholesky factorization of the
 same stack on this machine, and small dense factorizations that ran on all 24
 threads slowed from about 8 ms to 115 ms within seconds of sustained load (on
-one thread they settled at 27 ms). The figures above use a fusion job's 4
-threads.
+one thread they settled at 27 ms). A fixed probe (a Cholesky factorization of
+8 matrices of 303 × 303 on 4 threads) took 5.5 ms on the idle machine, 77–85
+ms after each long run and 37 ms after a short pause: the host throttles under
+sustained load, and every figure above was measured in that state unless
+marked cold. The figures above use a fusion job's 4 threads.
+
+**Scale profile.** Every basis run profiles AIC-NE / BIC-NE of the target and
+the controls over 9 candidate scales on each split's train+val rows. The
+clusters (DBSCAN at the cluster gap and the merging of small clusters) were
+formed again for every scale and every outcome; they are now formed once per
+row set (`spatial_basis.cluster_components`, passed as `components`), and
+outcomes complete on the same rows share the candidate bases and one
+least-squares solve per candidate. On 18,061 entities, 3 outcomes: 29.6 s →
+2.6 s cold, 30.7 s → 4.7 s (median of 10) under sustained load; the largest
+AIC / BIC difference is 3 × 10⁻¹¹ and every choice, row count and column count
+is identical.
 
 ---
 
