@@ -281,6 +281,28 @@ class ReplicateTests(unittest.TestCase):
             self.assertAlmostEqual(reps["slope"][b, 0], th[0], delta=1e-10)
 
 
+class PoolTests(unittest.TestCase):
+    def test_worker_processes_give_the_serial_resamples(self):
+        _xy, _l, cov, x, y, sm = _field(k=40)
+        rng = np.random.default_rng(3)
+        n = len(y)
+        from geofuse import resampling
+
+        W = resampling.row_weights(rng.integers(0, n, size=(70, n)), n)
+        G = len(sm.groups)
+        args = (
+            sm,
+            W,
+            [{"x": x, "lam": np.full(G, 1.0)}],
+            [y],
+            [{"exposure": 0, "outcome": 0, "lam": np.full(G, 2.0)}],
+        )
+        serial = sp.replicate_slopes(*args, covariates=cov, workers=1)
+        pooled = sp.replicate_slopes(*args, covariates=cov, workers=2)
+        for key in ("slope", "delta"):
+            np.testing.assert_allclose(pooled[key], serial[key], rtol=1e-12, atol=0)
+
+
 class ReportTests(unittest.TestCase):
     def _report(self, **kw):
         xy, labels, cov, x, y, _sm = _field(k=40)

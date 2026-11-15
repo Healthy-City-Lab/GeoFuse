@@ -77,6 +77,17 @@ _EIG_RTOL = 1e-11
 #: Replicates refitted at once.
 REPLICATE_CHUNK = 32
 
+#: Replicates below which the resamples run in the calling process (starting
+#: worker processes costs more than it saves), and the memory each worker
+#: reserves (one chunk's weighted cross-products and their factors at about
+#: 13 groups of 300 functions).
+PARALLEL_MIN_REPLICATES = 4 * REPLICATE_CHUNK
+REPLICATE_WORKER_BYTES = 1 << 30
+
+#: Most workers the automatic pool starts: 8 measured only 1.15x faster than 4
+#: on a 24-core host while doubling the memory the pool holds.
+REPLICATE_WORKERS_MAX = 4
+
 
 # ────────────────────────────────────────────────────────────────────
 # Groups and their smooths
@@ -649,6 +660,7 @@ def replicate_slopes(
     pairs: list[dict],
     covariates: np.ndarray | None = None,
     step1_covariates: bool = False,
+    workers: int | None = None,
 ) -> np.ndarray:
     """Step-2 slopes of every pair on every replicate, penalties fixed.
 
@@ -660,9 +672,40 @@ def replicate_slopes(
     ``{slope, delta}``, each ``(B, len(pairs))``: the slope in the exposure's
     units and the drop in the penalized residual sum of squares when the
     exposure joins the model.
+
+    Chunks of :data:`REPLICATE_CHUNK` replicates are independent, so from
+    :data:`PARALLEL_MIN_REPLICATES` replicates on they run across worker
+    processes (``workers``; ``None`` sizes the pool on cores and free memory,
+    :func:`geofuse.parallel.process_worker_count`, at most
+    :data:`REPLICATE_WORKERS_MAX`), each pinned to one BLAS
+    thread; every chunk's result is the one the calling process would compute.
     """
     W = np.atleast_2d(np.asarray(W, dtype=np.float64))
     B, n = W.shape
+    n_chunks = -(-B // REPLICATE_CHUNK)
+    if workers is None:
+        from geofuse import parallel
+
+        workers = (
+            parallel.process_worker_count(
+                n_chunks,
+                cap=REPLICATE_WORKERS_MAX,
+                bytes_per_worker=REPLICATE_WORKER_BYTES,
+            )
+            if B >= PARALLEL_MIN_REPLICATES
+            else 1
+        )
+    if int(workers) > 1 and n_chunks > 1:
+        return _replicate_pool(
+            smoother,
+            W,
+            exposures,
+            outcomes,
+            pairs,
+            covariates,
+            step1_covariates,
+            int(workers),
+        )
     groups = smoother.groups
     X = [_group_columns(g) for g in groups]
     dense = None
@@ -715,6 +758,78 @@ def replicate_slopes(
                     ok, M[:, 0, 1] ** 2 / safe, np.nan
                 )
     return {"slope": out, "delta": delta}
+
+
+# ── The resamples across worker processes ─────────────────────
+
+_REPLICATE_STATE: dict = {}
+
+
+def _replicate_init(payload: bytes) -> None:
+    """Worker initializer: the smoother, exposures, outcomes and pairs."""
+    import pickle
+
+    _REPLICATE_STATE.clear()
+    _REPLICATE_STATE.update(pickle.loads(payload))
+
+
+def _replicate_task(start: int, W: np.ndarray) -> tuple[int, dict]:
+    """One chunk of replicates in a worker."""
+    st = _REPLICATE_STATE
+    out = replicate_slopes(
+        st["smoother"],
+        W,
+        st["exposures"],
+        st["outcomes"],
+        st["pairs"],
+        covariates=st["covariates"],
+        step1_covariates=st["step1_covariates"],
+        workers=1,
+    )
+    return start, out
+
+
+def _replicate_pool(
+    smoother, W, exposures, outcomes, pairs, covariates, step1_covariates, workers
+) -> dict:
+    """:func:`replicate_slopes` with its chunks across ``workers`` processes."""
+    import pickle
+
+    from geofuse import parallel
+
+    payload = pickle.dumps(
+        {
+            "smoother": smoother,
+            "exposures": exposures,
+            "outcomes": outcomes,
+            "pairs": pairs,
+            "covariates": covariates,
+            "step1_covariates": step1_covariates,
+        },
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+    B = len(W)
+    slope = np.full((B, len(pairs)), np.nan)
+    delta = np.full((B, len(pairs)), np.nan)
+
+    def collect(result):
+        start, out = result
+        stop = start + len(out["slope"])
+        slope[start:stop] = out["slope"]
+        delta[start:stop] = out["delta"]
+
+    parallel.map_batches(
+        _replicate_task,
+        [
+            (start, W[start : start + REPLICATE_CHUNK])
+            for start in range(0, B, REPLICATE_CHUNK)
+        ],
+        workers=workers,
+        initializer=_replicate_init,
+        initargs=(payload,),
+        on_result=collect,
+    )
+    return {"slope": slope, "delta": delta}
 
 
 def _weighted_cross(groups, X, grams, Wc, dense, R, lam) -> np.ndarray:
@@ -832,6 +947,7 @@ def report(
     scales: "dict[str, dict] | None" = None,
     n_boot: int = 1000,
     seed: int = 42,
+    workers: int | None = None,
 ) -> dict:
     """Spatial+ on one row set: every exposure on the target and each control.
 
@@ -856,7 +972,8 @@ def report(
       edf, criterion value).
 
     Rows of a check criterion carry ``check = True``. The bootstraps refit
-    both steps on every replicate with every λ fixed at its full-sample value.
+    both steps on every replicate with every λ fixed at its full-sample value,
+    across ``workers`` processes (:func:`replicate_slopes`).
     """
     xy = np.asarray(xy, dtype=float)
     target = np.asarray(target, dtype=float)
@@ -1020,6 +1137,7 @@ def report(
             pair_list,
             covariates=cov,
             step1_covariates=step1_covariates,
+            workers=workers,
         )
     for i, (crit, is_check, tag, step1, fits, keys) in enumerate(stages):
         reps = None
