@@ -1,8 +1,6 @@
 import base64
-import glob
 import html
 import io
-import math
 import os
 from datetime import date
 from pathlib import Path
@@ -24,7 +22,6 @@ from helpers import (
 from jinja2 import Template
 from map_preview import add_mixed_geojson_preview, add_outcome_colored_geometry_layer
 from PIL import Image as PILImage
-from shapely.geometry import box as shapely_box
 from streamlit_folium import st_folium
 
 try:
@@ -36,7 +33,7 @@ from geofuse import cgi_formulas as _cgi_formulas
 from geofuse import metric_sampling as _metric_sampling
 from geofuse import mixed_effects_scoring as _mes
 from geofuse import settings as _gf_settings
-from geofuse.crs_utils import buffer_gdf_union_metres, reproject_geodataframe_to_wgs84
+from geofuse.jobs.outer_splits import finite_or_none, spatial_label
 from geofuse.persistence import caches
 from geofuse.vector_io import (
     geometry_sha256,
@@ -261,67 +258,6 @@ def _add_outcome_geometry_preview(
 # ────────────────────────────────────────────────────────────────────
 
 
-def _scan_metric_files(output_dir: str, suffix: str) -> list:
-    """Return sorted (basename, path) for raster metrics ``*_{suffix}.tif`` / ``.tiff``.
-
-    Coverage checks use fast raster bounds only. Matching GeoJSON files duplicate the
-    same grids and are excluded from this scan.
-    """
-    seen: dict[str, str] = {}
-    for ext in (".tif", ".tiff"):
-        pattern = os.path.join(output_dir, f"*_{suffix}{ext}")
-        for p in glob.glob(pattern):
-            seen[os.path.basename(p)] = p
-    return [(bn, seen[bn]) for bn in sorted(seen.keys())]
-
-
-def _compute_buffered_extent(
-    tmp_target_path: str,
-    is_vector_target: bool,
-    buffer_meters: float,
-    vector_layer: str | int | None = None,
-) -> "gpd.GeoDataFrame | None":
-    """Compute the buffered target extent as a GeoDataFrame in EPSG:4326."""
-    try:
-        if is_vector_target:
-            kwargs: dict = {}
-            if vector_layer is not None and Path(tmp_target_path).suffix.lower() in (
-                ".gpkg",
-                ".zip",
-            ):
-                kwargs["layer"] = vector_layer
-            gdf = reproject_geodataframe_to_wgs84(
-                gpd.read_file(tmp_target_path, **kwargs)
-            )
-        else:
-            with rasterio.open(tmp_target_path) as src:
-                b = src.bounds
-                src_crs = src.crs
-            gdf = gpd.GeoDataFrame(
-                {"geometry": [shapely_box(b.left, b.bottom, b.right, b.top)]},
-                crs=src_crs,
-            ).to_crs("EPSG:4326")
-
-        return buffer_gdf_union_metres(gdf, buffer_meters).to_crs("EPSG:4326")
-    except Exception:
-        return None
-
-
-def _check_coverage(metric_path: str, buffered_gdf: "gpd.GeoDataFrame") -> bool:
-    """Return True if the metric raster's extent fully covers buffered_gdf."""
-    try:
-        if not metric_path.lower().endswith((".tif", ".tiff")):
-            return False
-        with rasterio.open(metric_path) as src:
-            metric_box = shapely_box(*src.bounds)
-            metric_crs = src.crs
-
-        target_geom = buffered_gdf.to_crs(metric_crs).geometry.union_all()
-        return metric_box.covers(target_geom)
-    except Exception:
-        return False
-
-
 # ────────────────────────────────────────────────────────────────────
 # Restart workflow
 # ────────────────────────────────────────────────────────────────────
@@ -444,8 +380,21 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "n_bins",
     "cache_metrics",
     "test_size",
+    "split_seed",
+    "outer_splits",
+    "outer_comparators",
+    "outer_report",
+    "outer_null_runs",
+    "outer_null_kind",
+    "outer_null_group",
+    "outer_null_stop_after",
+    "outer_null_stop_low",
+    "outer_null_stop_high",
+    "outer_null_workers",
     "objective_metric",
     "residualize_method",
+    "residualize_spline_df",
+    "residualize_spline_min_unique",
     "search_scoring_method",
     "ndvi_start_date",
     "ndvi_end_date",
@@ -459,9 +408,12 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "categorical_missing",
     "moderator_columns",
     "negative_controls",
+    "specificity_contrast",
     "comparators",
     "comparators_primary",
+    "weight_column",
     "exposure_iqr",
+    "exposure_response_spline_df",
     "standalone_channels",
     "longitudinal_spec_payload",
     "cgi_grid_spacing_m",
@@ -472,10 +424,30 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "whole_grid_scaling",
     "area_balanced_split",
     "spatial_adjust_method",
-    "spatial_adjust_max_df",
+    "spatial_adjust_df",
+    "spatial_adjust_criterion",
     "spatial_adjust_eps_m",
+    "spatial_adjust_neighbours",
+    "spatial_adjust_knots_min",
+    "spatial_adjust_knots_max",
+    "spatial_paired_smooth",
+    "spatial_adjust_scale_m",
+    "spatial_adjust_min_component",
+    "spatial_tune_scale_m",
+    "spatial_adjust_select",
+    "spatial_tune_method",
+    "spatial_tune_select",
+    "spatial_plus_groups_column",
+    "spatial_plus_k",
+    "spatial_plus_criterion",
+    "spatial_plus_checks",
+    "spatial_plus_step1_covariates",
+    "spatial_select_scales_m",
+    "spatial_select_criterion",
+    "spatial_select_controls",
     "spatial_split",
     "spatial_block_size_m",
+    "spatial_split_mode",
     "n_spatial_blocks",
     "channel_set",
     "index_form",
@@ -487,6 +459,11 @@ _FUSION_RUN_CONFIG_KEYS: tuple[str, ...] = (
     "posterior_draws",
     "posterior_warmup",
     "posterior_chains",
+    "synergy_warm_start",
+    "outer_warm_start",
+    "outer_posterior_draws",
+    "outer_posterior_warmup",
+    "outer_posterior_chains",
     "radius_prior",
     "gvi_min_coverage",
     "check_collinearity",
@@ -503,6 +480,229 @@ _RADIUS_PRIOR_LABELS: dict[str, str] = {
     "range": "Range-based (spacing-invariant)",
 }
 
+# Comparators scored on every held-out split (``settings.OUTER_COMPARATORS``).
+_OUTER_COMPARATOR_LABELS: dict[str, str] = {
+    "primary": "Primary comparators",
+    "all": "All comparators",
+}
+
+# The weight-column picker's "no weights" entry.
+_NO_WEIGHT_COLUMN = "(none)"
+
+# What the later held-out splits report (``settings.OUTER_REPORTS``).
+_OUTER_REPORT_LABELS: dict[str, str] = {
+    "full": "Every interval and p-value",
+    "decision": "Decision estimates only",
+}
+
+# Null outcomes of the decision calibration (``settings.NULL_KINDS``).
+_NULL_KIND_LABELS: dict[str, str] = {
+    "spatial": "Spatially structured",
+    "free": "Freely permuted",
+    "both": "Both kinds",
+}
+
+# How held-out spatial blocks are chosen (``settings.SPATIAL_SPLIT_MODES``).
+_SPATIAL_SPLIT_MODE_LABELS: dict[str, str] = {
+    "stripe": "Striped across the extent",
+    "random": "Drawn at random",
+}
+
+# Criteria that pick the spatial df (``settings.SPATIAL_CRITERIA``).
+_SPATIAL_CRITERION_LABELS: dict[str, str] = {"aic": "AIC", "bic": "BIC"}
+
+# Smooth of each exposure in a paired test when the exposure model picks the
+# df
+# (``settings.SPATIAL_PAIRED_SMOOTHS``).
+_SPATIAL_PAIRED_SMOOTH_LABELS: dict[str, str] = {
+    "own": "Each exposure's own",
+    "cgi": "The CGI's",
+    "outcome": "Selected on the outcome",
+    "max": "The larger df of the two",
+}
+
+
+# Spatial-confounding adjustments (``settings.SPATIAL_ADJUST_METHODS``).
+_SPATIAL_ADJUST_LABELS: dict[str, str] = {
+    "none": "Off (control listed covariates only)",
+    "basis": "Thin-plate basis (Keller & Szpiro 2020)",
+    "spatial_plus": "Spatial+ (Dupont et al. 2022)",
+}
+
+# How a basis adjustment sets its size (``settings.SPATIAL_ADJUST_SELECTS``).
+_SPATIAL_SELECT_LABELS: dict[str, str] = {
+    "df_outcome_ic": "df by AIC/BIC of the outcome model (recommended)",
+    "df_exposure_ic": "df by AIC/BIC of the exposure model (df-Spatial+)",
+    "fixed_scale": "Fixed pattern scale",
+    "scale_ic": "Scale by AIC/BIC of the outcome model",
+}
+
+# How the tuning scale is set (``settings.SPATIAL_TUNE_SELECTS``).
+_SPATIAL_TUNE_SELECT_LABELS: dict[str, str] = {
+    "fixed_scale": "The scale given",
+    "scale_ic": "Chosen per split by AIC/BIC",
+}
+
+# Negative controls of a scale selection (``settings.SPATIAL_SELECT_CONTROLS``).
+_SPATIAL_SELECT_CONTROLS_LABELS: dict[str, str] = {
+    "target": "The target's scale",
+    "own": "Each control's own",
+}
+
+# Criteria that pick the Spatial+ penalties (``settings.SPATIAL_PLUS_CRITERIA``).
+_SPATIAL_PLUS_CRITERION_LABELS: dict[str, str] = {"gcv": "GCV", "reml": "REML"}
+
+
+def _render_scale_selection() -> tuple[list[int], str, str]:
+    """The scale-selection inputs: candidate scales, criterion and the
+    controls' rule; returns ``(scales, criterion, controls)``."""
+    _default(
+        "fusion_spatial_select_scales_m",
+        _df_list_text(_fs_default("spatial_select_scales_m")),
+    )
+    _default(
+        "fusion_spatial_select_criterion",
+        _fs_default("spatial_select_criterion"),
+        list(_SPATIAL_CRITERION_LABELS),
+    )
+    _default(
+        "fusion_spatial_select_controls",
+        _fs_default("spatial_select_controls"),
+        list(_SPATIAL_SELECT_CONTROLS_LABELS),
+    )
+    text = st.text_input(
+        "Candidate scales (m)",
+        key="fusion_spatial_select_scales_m",
+        help=(
+            "Pattern scales the selection compares, besides no smooth, on one "
+            "set of clusters: the criterion of the outcome model without the "
+            "exposure picks one per split."
+        ),
+    )
+    try:
+        scales = _FS["spatial_select_scales_m"].check("spatial_select_scales_m", text)
+    except _gf_settings.SettingError as exc:
+        st.error(f"{exc} Using the default scales.")
+        scales = list(_fs_default("spatial_select_scales_m"))
+    cols = st.columns(2)
+    with cols[0]:
+        criterion = st.selectbox(
+            "Scale criterion",
+            options=list(_SPATIAL_CRITERION_LABELS),
+            format_func=lambda k: _SPATIAL_CRITERION_LABELS[k],
+            key="fusion_spatial_select_criterion",
+            help="BIC picks a coarser or equal scale; both are saved.",
+        )
+    with cols[1]:
+        controls = st.selectbox(
+            "Controls' scale",
+            options=list(_SPATIAL_SELECT_CONTROLS_LABELS),
+            format_func=lambda k: _SPATIAL_SELECT_CONTROLS_LABELS[k],
+            key="fusion_spatial_select_controls",
+            help="Negative controls use the target's scale, or select their own.",
+        )
+    return list(scales), str(criterion), str(controls)
+
+
+def _render_spatial_plus() -> tuple[dict, float | None, int | None]:
+    """The Spatial+ options; returns ``(settings, eps_m, min_component)``."""
+    _default("fusion_spatial_plus_groups_column", "")
+    for name in ("spatial_plus_k", "spatial_plus_step1_covariates"):
+        _default(f"fusion_{name}", _fs_default(name))
+    _default(
+        "fusion_spatial_plus_criterion",
+        _fs_default("spatial_plus_criterion"),
+        list(_SPATIAL_PLUS_CRITERION_LABELS),
+    )
+    _default("fusion_spatial_plus_checks", list(_fs_default("spatial_plus_checks")))
+    _default("fusion_spatial_tune_inputs", False)
+    _default("fusion_spatial_adjust_eps_m", _fs_default("spatial_adjust_eps_m") or 0)
+    _default("fusion_spatial_adjust_min_component", 0)
+    with st.expander("Spatial+ — advanced", expanded=False):
+        groups = st.text_input(
+            "Spatial+ groups column",
+            key="fusion_spatial_plus_groups_column",
+            help=(
+                "A target column whose values are the groups (a site); each "
+                "group gets its own intercept, trend and penalized smooth. "
+                "Empty = clusters split at the cluster gap."
+            ),
+        )
+        cols = st.columns(2)
+        with cols[0]:
+            k = st.number_input(
+                "Basis size per group",
+                **_fs_bounds("spatial_plus_k"),
+                step=10,
+                key="fusion_spatial_plus_k",
+                help="Knots per group, at most its rows − 4 (mgcv's k).",
+            )
+            criterion = st.selectbox(
+                "Penalty criterion",
+                options=list(_SPATIAL_PLUS_CRITERION_LABELS),
+                format_func=lambda c: _SPATIAL_PLUS_CRITERION_LABELS[c],
+                key="fusion_spatial_plus_criterion",
+                help="Picks every group's smoothing parameter: GCV, or REML.",
+            )
+        with cols[1]:
+            eps_ui = st.number_input(
+                "Cluster gap eps (m, 0 = 10 km)",
+                min_value=0,
+                step=100,
+                key="fusion_spatial_adjust_eps_m",
+                help="Distance above which entities fall into different groups.",
+            )
+            min_component = st.number_input(
+                "Smallest cluster (0 = auto)",
+                min_value=0,
+                max_value=int(_FS["spatial_adjust_min_component"].hi),
+                step=1,
+                key="fusion_spatial_adjust_min_component",
+                help="A smaller cluster joins its nearest larger one. 0 = 30.",
+            )
+        checks = st.multiselect(
+            "Check criteria",
+            options=list(_SPATIAL_PLUS_CRITERION_LABELS),
+            format_func=lambda c: _SPATIAL_PLUS_CRITERION_LABELS[c],
+            key="fusion_spatial_plus_checks",
+            help="Also run these criteria; their rows are marked as checks.",
+        )
+        step1_cov = st.checkbox(
+            "Exposure step adjusts for the covariates",
+            key="fusion_spatial_plus_step1_covariates",
+            help=(
+                "The published method removes only the exposure's spatial part "
+                "in its first step; this adds the covariates there too."
+            ),
+        )
+        tune_inputs = st.checkbox(
+            "Residualize the search inputs",
+            key="fusion_spatial_tune_inputs",
+            help=(
+                "Tune on local greenery: every layer, radius and statistic is "
+                "residualized on its own penalized smooth before the search "
+                "(a geofuse extension of Spatial+; linear form only)."
+            ),
+        )
+    settings = {
+        "spatial_plus_groups_column": groups.strip() or None,
+        "spatial_plus_k": int(k),
+        "spatial_plus_criterion": str(criterion),
+        "spatial_plus_checks": [
+            c for c in _SPATIAL_PLUS_CRITERION_LABELS if c in checks
+        ],
+        "spatial_plus_step1_covariates": bool(step1_cov),
+        "spatial_tune_method": "spatial_plus_inputs" if tune_inputs else "basis",
+    }
+    eps = float(eps_ui) if eps_ui and eps_ui > 0 else None
+    return settings, eps, int(min_component) or None
+
+
+def _df_list_text(dfs) -> str:
+    """A df list as the text the tab shows: ``"0, 1, 2"``."""
+    return ", ".join(str(int(d)) for d in dfs)
+
+
 # Missing categorical covariate values (``settings.CATEGORICAL_MISSING``).
 _CATEGORICAL_MISSING_LABELS: dict[str, str] = {
     "drop": "Drop the row",
@@ -514,9 +714,28 @@ _CATEGORICAL_MISSING_LABELS: dict[str, str] = {
 _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "objective_metric": "fusion_objective_metric",
     "residualize_method": "fusion_residualize_method",
+    "residualize_spline_df": "fusion_residualize_spline_df",
+    "residualize_spline_min_unique": "fusion_residualize_spline_min_unique",
+    "exposure_response_spline_df": "fusion_exposure_response_spline_df",
     "categorical_missing": "fusion_categorical_missing",
     "search_scoring_method": "fusion_search_scoring_method",
     "test_size": "fusion_test_size",
+    "split_seed": "fusion_split_seed",
+    "outer_splits": "fusion_outer_splits",
+    "outer_comparators": "fusion_outer_comparators",
+    "weight_column": "fusion_weight_column",
+    "outer_report": "fusion_outer_report",
+    "outer_null_runs": "fusion_outer_null_runs",
+    "outer_null_kind": "fusion_outer_null_kind",
+    "outer_null_group": "fusion_outer_null_group",
+    "outer_null_stop_after": "fusion_outer_null_stop_after",
+    "outer_null_stop_low": "fusion_outer_null_stop_low",
+    "outer_null_stop_high": "fusion_outer_null_stop_high",
+    "outer_null_workers": "fusion_outer_null_workers",
+    "synergy_warm_start": "fusion_synergy_warm_start",
+    "outer_warm_start": "fusion_outer_warm_start",
+    "outer_posterior_draws": "fusion_outer_posterior_draws",
+    "specificity_contrast": "fusion_specificity_contrast",
     "n_bins": "fusion_stratification_bins",
     "channel_set": "fusion_channel_set",
     "index_form": "fusion_index_form",
@@ -541,9 +760,24 @@ _FUSION_PARAM_TO_WIDGET: dict[str, str] = {
     "area_balanced_split": "fusion_area_balanced_split",
     "spatial_split": "fusion_spatial_split",
     "spatial_block_size_m": "fusion_spatial_block_size_m",
+    "spatial_split_mode": "fusion_spatial_split_mode",
     "spatial_adjust_method": "fusion_spatial_adjust_method",
-    "spatial_adjust_max_df": "fusion_spatial_adjust_max_df",
+    "spatial_adjust_criterion": "fusion_spatial_adjust_criterion",
     "spatial_adjust_eps_m": "fusion_spatial_adjust_eps_m",
+    "spatial_adjust_neighbours": "fusion_spatial_adjust_neighbours",
+    "spatial_adjust_knots_min": "fusion_spatial_adjust_knots_min",
+    "spatial_adjust_knots_max": "fusion_spatial_adjust_knots_max",
+    "spatial_paired_smooth": "fusion_spatial_paired_smooth",
+    "spatial_adjust_min_component": "fusion_spatial_adjust_min_component",
+    "spatial_tune_scale_m": "fusion_spatial_tune_scale_m",
+    "spatial_tune_select": "fusion_spatial_tune_select",
+    "spatial_plus_k": "fusion_spatial_plus_k",
+    "spatial_plus_criterion": "fusion_spatial_plus_criterion",
+    "spatial_plus_checks": "fusion_spatial_plus_checks",
+    "spatial_plus_step1_covariates": "fusion_spatial_plus_step1_covariates",
+    "spatial_plus_groups_column": "fusion_spatial_plus_groups_column",
+    "spatial_select_criterion": "fusion_spatial_select_criterion",
+    "spatial_select_controls": "fusion_spatial_select_controls",
     "resume_existing_study": "fusion_resume_study",
     "multi_objective_requested": "fusion_multi_objective_run",
     "gvi_buffer_min_m": "fusion_gvi_buffer_min",
@@ -572,6 +806,13 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_gvi_ladder_rungs",
         "fusion_ndvi_ladder_rungs",
         "fusion_stratification_bins",
+        "fusion_split_seed",
+        "fusion_outer_splits",
+        "fusion_outer_null_runs",
+        "fusion_outer_null_stop_after",
+        "fusion_outer_null_stop_low",
+        "fusion_outer_null_stop_high",
+        "fusion_outer_null_workers",
         "fusion_sweep_splits",
         "fusion_discovery_reps",
         "fusion_discovery_shuffles",
@@ -581,8 +822,13 @@ _FUSION_SEED_INT_WIDGETS: frozenset[str] = frozenset(
         "fusion_posterior_chains",
         "fusion_cgi_grid_spacing_m",
         "fusion_spatial_block_size_m",
-        "fusion_spatial_adjust_max_df",
         "fusion_spatial_adjust_eps_m",
+        "fusion_spatial_adjust_neighbours",
+        "fusion_spatial_adjust_knots_min",
+        "fusion_spatial_adjust_knots_max",
+        "fusion_residualize_spline_df",
+        "fusion_residualize_spline_min_unique",
+        "fusion_exposure_response_spline_df",
     }
 )
 
@@ -614,6 +860,36 @@ def _seed_fusion_form(p: dict) -> None:
                 val = int(val)
             st.session_state[widget] = val
     st.session_state["fusion_run_standalones"] = bool(p.get("standalone_channels"))
+    # The df list is a text field; a study recorded with the older maximum
+    # comes back as the list 0 … max.
+    dfs = p.get("spatial_adjust_df")
+    if dfs is None and p.get("spatial_adjust_max_df") is not None:
+        dfs = list(range(0, int(p["spatial_adjust_max_df"]) + 1))
+    if dfs is not None:
+        st.session_state["fusion_spatial_adjust_df"] = _df_list_text(dfs)
+    scales = p.get("spatial_adjust_scale_m")
+    st.session_state["fusion_spatial_adjust_scale_m"] = (
+        _df_list_text(scales) if scales else ""
+    )
+    # A study recorded before the select setting existed names its method the
+    # older way; it comes back as what it computed.
+    if p.get("spatial_adjust_method") is not None:
+        method, select = _gf_settings.spatial_method_pair(
+            p["spatial_adjust_method"],
+            p.get("spatial_adjust_select"),
+            scales=scales,
+            tune_scale=p.get("spatial_tune_scale_m"),
+        )
+        st.session_state["fusion_spatial_adjust_method"] = method
+        if select is not None:
+            st.session_state["fusion_spatial_adjust_select"] = select
+    if p.get("spatial_select_scales_m"):
+        st.session_state["fusion_spatial_select_scales_m"] = _df_list_text(
+            p["spatial_select_scales_m"]
+        )
+    st.session_state["fusion_spatial_tune_inputs"] = (
+        p.get("spatial_tune_method") == "spatial_plus_inputs"
+    )
 
     types = dict(p.get("covariate_types") or {})
     cols = list(p.get("covariate_columns") or [])
@@ -1201,7 +1477,7 @@ def _container_headers(file_paths: list[str]) -> list[str]:
     bases = [os.path.basename(p) for p in file_paths]
     dupes = {b for b in bases if bases.count(b) > 1}
     out: list[str] = []
-    for p, b in zip(file_paths, bases):
+    for p, b in zip(file_paths, bases, strict=True):
         if b in dupes:
             parent = os.path.basename(os.path.dirname(p)) or os.path.dirname(p)
             out.append(f"{parent}/{b}" if parent else b)
@@ -1320,7 +1596,7 @@ def _render_year_fallback(
     from file_picker import path_to_widget_id
 
     assignment: dict[str, list[str]] = {}
-    for path, head in zip(file_paths, headers):
+    for path, head in zip(file_paths, headers, strict=True):
         taken = {w for q, ws in stored.items() if q != path for w in ws}
         options = [w for w in waves if w not in taken]
         wkey = f"fusion_{ch_short}_assign__{path_to_widget_id(path)}"
@@ -1370,7 +1646,7 @@ def _render_year_assignment(
             "items": [w for w in waves if w not in claimed],
         }
     ]
-    for idx, (path, head) in enumerate(zip(file_paths, headers), start=1):
+    for idx, (path, head) in enumerate(zip(file_paths, headers, strict=True), start=1):
         containers.append({"header": f"{idx}. {head}", "items": stored.get(path, [])})
 
     # Remount when the file list or year set changes: a custom component keyed
@@ -1587,6 +1863,31 @@ def _render_metric_assignment_panel(
     return state
 
 
+def _outer_null_settings(
+    report: str,
+    runs: int,
+    kind: str,
+    group: str,
+    stop_after: int,
+    stop_low: int,
+    stop_high: int,
+    workers: int,
+) -> dict:
+    """The Validation box's decision-report and null-calibration fields as
+    run settings: the stopping counts only with a decision point, 0 = unset."""
+    after = int(stop_after) or None
+    return {
+        "outer_report": str(report),
+        "outer_null_runs": int(runs),
+        "outer_null_kind": str(kind),
+        "outer_null_group": str(group).strip() or None,
+        "outer_null_stop_after": after,
+        "outer_null_stop_low": int(stop_low) if after else None,
+        "outer_null_stop_high": (int(stop_high) or None) if after else None,
+        "outer_null_workers": int(workers) or None,
+    }
+
+
 def _render_study_details_panel(
     is_longitudinal: bool,
     available_covariates: list[str],
@@ -1601,7 +1902,9 @@ def _render_study_details_panel(
     """
     st.subheader("Study Details")
 
-    # ── Row 1: covariates ───────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Row 1: covariates
+    # ────────────────────────────────────────────────────────────
     with st.container():
         categorical_candidates = list(categorical_candidates or [])
         if available_covariates:
@@ -1705,6 +2008,23 @@ def _render_study_details_panel(
                     "is unaffected."
                 ),
             )
+            _default(
+                "fusion_exposure_response_spline_df",
+                _fs_default("exposure_response_spline_df"),
+            )
+            exposure_response_spline_df = int(
+                st.number_input(
+                    "Exposure-response spline df",
+                    **_fs_bounds("exposure_response_spline_df"),
+                    step=1,
+                    key="fusion_exposure_response_spline_df",
+                    help=(
+                        "Natural cubic spline size of the exposure-response "
+                        "curve and of its test against a straight line. "
+                        "Reporting only — the search is unaffected."
+                    ),
+                )
+            )
             if covariate_columns:
                 st.caption(
                     "Fitting: "
@@ -1719,12 +2039,15 @@ def _render_study_details_panel(
             categorical_missing = _fs_default("categorical_missing")
             moderator_columns = []
             exposure_iqr_ui = 0.0
+            exposure_response_spline_df = _fs_default("exposure_response_spline_df")
             st.caption(
                 "_No attribute columns available for covariates "
                 "(raster target or no spare columns)._"
             )
 
-    # ── Objective metric + test split + stratification bins ─────
+    # ────────────────────────────────────────────────────────────
+    # Objective metric + test split + stratification bins
+    # ────────────────────────────────────────────────────────────
     metric_options = list(_MIXEDLM_METRICS if is_longitudinal else _CROSS_METRICS)
     default_metric = metric_options[0]
     prior = st.session_state.get("fusion_objective_metric")
@@ -1783,6 +2106,17 @@ def _render_study_details_panel(
                 "sweep splits and refits over."
             ),
         )
+        _default("fusion_split_seed", _fs_default("split_seed"))
+        split_seed = st.number_input(
+            "Split seed",
+            **_fs_bounds("split_seed"),
+            step=1,
+            key="fusion_split_seed",
+            help=(
+                "Seed of the held-out test split. Another seed holds out other "
+                "rows, so a result can be checked against the split it rests on."
+            ),
+        )
     with col_o3:
         _default("fusion_stratification_bins", _fs_default("n_bins"))
         n_bins = st.number_input(
@@ -1797,8 +2131,12 @@ def _render_study_details_panel(
         "(split repeatedly by the sweep)._"
     )
 
-    # ── Covariate residualization (cross-sectional metrics) ─────
+    # ────────────────────────────────────────────────────────────
+    # Covariate residualization (cross-sectional metrics)
+    # ────────────────────────────────────────────────────────────
     residualize_method = "linear"
+    residualize_spline_df = _fs_default("residualize_spline_df")
+    residualize_spline_min_unique = _fs_default("residualize_spline_min_unique")
     if not is_longitudinal:
         _res_ignored = objective_metric in _RESIDUALIZE_IGNORED_METRICS
         _res_rec = (
@@ -1824,8 +2162,39 @@ def _render_study_details_panel(
                 f"greenery↔outcome association. {_res_rec}"
             ),
         )
+        if residualize_method == "spline" and not _res_ignored:
+            _default("fusion_residualize_spline_df", residualize_spline_df)
+            _default(
+                "fusion_residualize_spline_min_unique", residualize_spline_min_unique
+            )
+            _spline_cols = st.columns(2)
+            with _spline_cols[0]:
+                residualize_spline_df = int(
+                    st.number_input(
+                        "Covariate spline df",
+                        **_fs_bounds("residualize_spline_df"),
+                        step=1,
+                        key="fusion_residualize_spline_df",
+                        help="Natural cubic spline size of each continuous covariate.",
+                    )
+                )
+            with _spline_cols[1]:
+                residualize_spline_min_unique = int(
+                    st.number_input(
+                        "Distinct values for a spline",
+                        **_fs_bounds("residualize_spline_min_unique"),
+                        step=1,
+                        key="fusion_residualize_spline_min_unique",
+                        help=(
+                            "A covariate with fewer distinct values (a code, a "
+                            "dummy) enters linearly instead."
+                        ),
+                    )
+                )
 
-    # ── Longitudinal-only mixed-effects toggles ─────────────────
+    # ────────────────────────────────────────────────────────────
+    # Longitudinal-only mixed-effects toggles
+    # ────────────────────────────────────────────────────────────
     mixedlm_random_slope = True
     mixedlm_time_fixed = True
     association_target = "level"
@@ -1964,7 +2333,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Resume + standalones ────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Resume + standalones
+    # ────────────────────────────────────────────────────────────
     _default("fusion_resume_study", _fs_default("resume_existing_study"))
     _default("fusion_clear_preaggr", _fs_default("clear_preaggregation_cache"))
     _default("fusion_run_standalones", _fs_default("run_standalones"))
@@ -2000,7 +2371,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Channel collinearity check (iterative VIF) ──────────────
+    # ────────────────────────────────────────────────────────────
+    # Channel collinearity check (iterative VIF)
+    # ────────────────────────────────────────────────────────────
     # Runs after pre-aggregation, before the search, and reports the channels
     # whose pixel values are redundant with the others (high VIF); dropping
     # them from the search is a separate choice.
@@ -2041,7 +2414,9 @@ def _render_study_details_panel(
             ),
         )
 
-    # ── Discovery ───────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Discovery
+    # ────────────────────────────────────────────────────────────
     st.markdown("**Discovery**")
     st.caption(
         "The radius, the aggregation statistic and the functional form are all "
@@ -2198,17 +2573,211 @@ def _render_study_details_panel(
                 step=1,
                 key="fusion_posterior_chains",
             )
+        _default("fusion_outer_splits", _fs_default("outer_splits"))
+        _default(
+            "fusion_outer_comparators",
+            _fs_default("outer_comparators"),
+            list(_OUTER_COMPARATOR_LABELS),
+        )
+        col_v2, col_v3 = st.columns(2)
+        with col_v2:
+            outer_splits_ui = st.number_input(
+                "Held-out splits",
+                **_fs_bounds("outer_splits"),
+                step=1,
+                key="fusion_outer_splits",
+                help=(
+                    "Repeat split, tuning and held-out scoring on this many "
+                    "test splits (seeds: the split seed, then the next ones), "
+                    "and report each result's spread and a corrected resampled "
+                    "t-test across them. 1 = one split. Each extra split costs "
+                    "about one sweep and posterior per study."
+                ),
+            )
+        with col_v3:
+            outer_comparators_ui = st.selectbox(
+                "Comparators on every split",
+                options=list(_OUTER_COMPARATOR_LABELS),
+                format_func=_OUTER_COMPARATOR_LABELS.get,
+                key="fusion_outer_comparators",
+                help=(
+                    "Comparator exposures scored on the repeated splits; the "
+                    "first split always scores all of them."
+                ),
+            )
+        for name in ("synergy_warm_start", "outer_warm_start"):
+            _default(f"fusion_{name}", _fs_default(name))
+        _default("fusion_outer_posterior_draws", 0)
+        col_w1, col_w2, col_w3 = st.columns(3)
+        with col_w1:
+            synergy_warm_start_ui = st.checkbox(
+                "Start synergy from a linear fit",
+                key="fusion_synergy_warm_start",
+                help=(
+                    "A synergy posterior starts where a short linear fit of the "
+                    "same grid ended, which shortens its warm-up. Only the "
+                    "Monte Carlo draws change."
+                ),
+            )
+        with col_w2:
+            outer_warm_start_ui = st.checkbox(
+                "Warm-start later splits",
+                key="fusion_outer_warm_start",
+                help=(
+                    "Each held-out split after the first starts its posteriors "
+                    "from the previous fit of the same form, tuning only its "
+                    "step size over a short warm-up; a fit that does not mix as "
+                    "well is redone from a cold start. Only the Monte Carlo "
+                    "draws change."
+                ),
+            )
+        with col_w3:
+            outer_draws_ui = st.number_input(
+                "Draws on later splits (0 = as the first)",
+                min_value=0,
+                max_value=int(_FS["outer_posterior_draws"].hi),
+                step=100,
+                key="fusion_outer_posterior_draws",
+                help="Posterior draws (and warm-up) of the later held-out splits.",
+            )
+        _default(
+            "fusion_outer_report",
+            _fs_default("outer_report"),
+            list(_OUTER_REPORT_LABELS),
+        )
+        _default("fusion_outer_null_runs", _fs_default("outer_null_runs"))
+        _default(
+            "fusion_outer_null_kind",
+            _fs_default("outer_null_kind"),
+            list(_NULL_KIND_LABELS),
+        )
+        _default("fusion_outer_null_group", "")
+        for name in ("stop_after", "stop_low", "stop_high", "workers"):
+            _default(f"fusion_outer_null_{name}", 0)
+        repeated = int(outer_splits_ui) > 1
+        st.markdown("**Null calibration of the held-out decision**")
+        col_n1, col_n2 = st.columns(2)
+        with col_n1:
+            outer_report_ui = st.selectbox(
+                "Later splits report",
+                options=list(_OUTER_REPORT_LABELS),
+                format_func=_OUTER_REPORT_LABELS.get,
+                key="fusion_outer_report",
+                disabled=not repeated,
+                help=(
+                    "Decision estimates only: the later splits skip their "
+                    "bootstrap intervals and permutation p-values and keep "
+                    "the estimates the corrected tests read, which are the "
+                    "same either way."
+                ),
+            )
+            outer_null_runs_ui = st.number_input(
+                "Null outcomes (0 = none)",
+                **_fs_bounds("outer_null_runs"),
+                step=10,
+                key="fusion_outer_null_runs",
+                disabled=not repeated,
+                help=(
+                    "Outcomes unrelated to greenery, each run through the "
+                    "same search and held-out splits; the share whose "
+                    "corrected p falls below 0.05 is the false-positive "
+                    "rate of the decision. Each costs about one repeated "
+                    "study in the decision report."
+                ),
+            )
+            outer_null_kind_ui = st.selectbox(
+                "Null outcome kind",
+                options=list(_NULL_KIND_LABELS),
+                format_func=_NULL_KIND_LABELS.get,
+                key="fusion_outer_null_kind",
+                disabled=not repeated,
+                help=(
+                    "Spatially structured: the area means of the outcome "
+                    "permuted across areas and variogram-matched surrogates "
+                    "within them. Freely permuted: the outcome shuffled over "
+                    "entities."
+                ),
+            )
+            outer_null_group_ui = st.text_input(
+                "Null areas column",
+                key="fusion_outer_null_group",
+                disabled=not repeated,
+                help=(
+                    "A categorical covariate whose area means the spatial "
+                    "null permutes. Empty = the spatial smooth's clusters."
+                ),
+            )
+        with col_n2:
+            outer_null_stop_after_ui = st.number_input(
+                "Decide after nulls (0 = run all)",
+                min_value=0,
+                max_value=int(_FS["outer_null_stop_after"].hi),
+                step=10,
+                key="fusion_outer_null_stop_after",
+                disabled=not repeated,
+                help=(
+                    "A sequential rule set before any result is seen: after "
+                    "this many nulls, stop when the rejections are at or "
+                    "below the lower count or at or above the upper one."
+                ),
+            )
+            outer_null_stop_low_ui = st.number_input(
+                "Stop at or below (rejections)",
+                min_value=0,
+                max_value=int(_FS["outer_null_stop_low"].hi),
+                step=1,
+                key="fusion_outer_null_stop_low",
+                disabled=not repeated,
+            )
+            outer_null_stop_high_ui = st.number_input(
+                "Stop at or above (rejections, 0 = never)",
+                min_value=0,
+                max_value=int(_FS["outer_null_stop_high"].hi),
+                step=1,
+                key="fusion_outer_null_stop_high",
+                disabled=not repeated,
+            )
+            outer_null_workers_ui = st.number_input(
+                "Nulls at once (0 = automatic)",
+                min_value=0,
+                max_value=int(_FS["outer_null_workers"].hi),
+                step=1,
+                key="fusion_outer_null_workers",
+                disabled=not repeated,
+                help=(
+                    "Null outcomes run in parallel, each worker holding one "
+                    "copy of the study and its own sampler (about 2–3 GB); 0 "
+                    "uses up to 4, fewer when cores or memory are short."
+                ),
+            )
     posterior_warmup_ui = int(posterior_draws_ui)
 
-    # ── Per-pixel CGI scoring ───────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Per-pixel CGI scoring
+    # ────────────────────────────────────────────────────────────
     whole_grid_scaling = True
     area_balanced_split = True
     spatial_split = False
     spatial_block_size_m: float | None = None
+    spatial_split_mode = "stripe"
     n_spatial_blocks: int | None = None
     spatial_adjust_method = "none"
-    spatial_adjust_max_df = 10
+    spatial_adjust_df = list(_fs_default("spatial_adjust_df"))
+    spatial_adjust_criterion = _fs_default("spatial_adjust_criterion")
     spatial_adjust_eps_m: float | None = None
+    spatial_adjust_neighbours = _fs_default("spatial_adjust_neighbours")
+    spatial_adjust_knots_min = _fs_default("spatial_adjust_knots_min")
+    spatial_adjust_knots_max = _fs_default("spatial_adjust_knots_max")
+    spatial_paired_smooth = _fs_default("spatial_paired_smooth")
+    spatial_adjust_scale_m: list[int] | None = None
+    spatial_adjust_min_component: int | None = None
+    spatial_tune_scale_m: int | None = None
+    spatial_adjust_select = _fs_default("spatial_adjust_select")
+    spatial_tune_select = _fs_default("spatial_tune_select")
+    spatial_select_scales_m = list(_fs_default("spatial_select_scales_m"))
+    spatial_select_criterion = _fs_default("spatial_select_criterion")
+    spatial_select_controls = _fs_default("spatial_select_controls")
+    spatial_plus_settings: dict = {}
     st.markdown("**Per-pixel CGI scoring**")
     _grid = _FS["cgi_grid_spacing_m"]
     _grid_options = list(range(int(_grid.lo), int(_grid.hi) + 1, int(_grid.step)))
@@ -2254,9 +2823,9 @@ def _render_study_details_panel(
             key="fusion_spatial_split",
             help=(
                 "Hold out whole spatial blocks (and resample blocks in the "
-                "sweep) so geographic autocorrelation can't "
-                "inflate scores. Test blocks are striped across the full "
-                "extent so every region is represented in the held-out test."
+                "sweep) so geographic autocorrelation can't inflate scores. "
+                "Test blocks are striped across the full extent, or drawn at "
+                "random (Test blocks)."
             ),
         )
         if spatial_split:
@@ -2274,13 +2843,24 @@ def _render_study_details_panel(
             spatial_block_size_m = (
                 float(block_size_ui) if block_size_ui and block_size_ui > 0 else None
             )
+            _modes = list(_FS["spatial_split_mode"].choices)
+            _default(
+                "fusion_spatial_split_mode", _fs_default("spatial_split_mode"), _modes
+            )
+            spatial_split_mode = st.selectbox(
+                "Test blocks",
+                options=_modes,
+                format_func=lambda k: _SPATIAL_SPLIT_MODE_LABELS[k],
+                key="fusion_spatial_split_mode",
+                help=(
+                    "Striped: test blocks evenly spaced along the block order; "
+                    "the split seed only shifts the stripe, so few test sets "
+                    "exist. Drawn at random: each split seed draws other blocks "
+                    "until they hold the test share."
+                ),
+            )
 
         # ── Spatial-confounding adjustment ──────────────────
-        _spatial_adjust_labels = {
-            "none": "Off (control listed covariates only)",
-            "ks_aic": "KS-AIC (recommended)",
-            "spatial_plus": "Spatial+ (df-Spatial+)",
-        }
         _spatial_adjust_keys = list(_FS["spatial_adjust_method"].choices)
         _default(
             "fusion_spatial_adjust_method",
@@ -2290,37 +2870,149 @@ def _render_study_details_panel(
         spatial_adjust_method = st.selectbox(
             "Spatial-confounding adjustment",
             options=_spatial_adjust_keys,
-            format_func=lambda k: _spatial_adjust_labels[k],
+            format_func=lambda k: _SPATIAL_ADJUST_LABELS[k],
             key="fusion_spatial_adjust_method",
             help=(
-                "Remove unmeasured smooth spatial confounding by adding a "
-                "coordinate smooth (per spatial cluster, df chosen by AIC) to the "
-                "objective. KS-AIC (Keller & Szpiro) is recommended; Spatial+ "
-                "residualizes the greenery exposure on the smooth instead. The "
-                "reported CGI association becomes fine-scale (within-cluster) "
-                "contrast, so the optimal CGI parameters will shift versus an "
-                "unadjusted run."
+                "Remove unmeasured smooth spatial confounding from the reported "
+                "results. Thin-plate basis: an unpenalized basis of the "
+                "coordinates (per spatial cluster) joins the held-out scores, "
+                "paired tests, slopes, negative controls and specificity "
+                "contrast (Keller & Szpiro 2020). Spatial+: penalized smooths "
+                "per site, the exposure's spatial part removed first (Dupont, "
+                "Wood & Augustin 2022), reported beside the unadjusted results. "
+                "The CGI's tuning is unchanged unless tuning within areas is set."
             ),
         )
-        if spatial_adjust_method != "none":
+        if spatial_adjust_method == "basis":
+            _select_keys = list(_FS["spatial_adjust_select"].choices)
             _default(
-                "fusion_spatial_adjust_max_df", _fs_default("spatial_adjust_max_df")
+                "fusion_spatial_adjust_select",
+                _fs_default("spatial_adjust_select"),
+                _select_keys,
+            )
+            spatial_adjust_select = st.selectbox(
+                "Basis size",
+                options=_select_keys,
+                format_func=lambda k: _SPATIAL_SELECT_LABELS[k],
+                key="fusion_spatial_adjust_select",
+                help=(
+                    "How the basis size is set: the df by AIC/BIC of the "
+                    "outcome model without the exposure (Keller & Szpiro 2020); "
+                    "the df by AIC/BIC of the exposure model (df-Spatial+; "
+                    "unpenalized, so the same adjustment with another size); a "
+                    "fixed pattern scale (set it under the advanced options); "
+                    "or the scale chosen by AIC/BIC of the outcome model among "
+                    "candidate scales."
+                ),
+            )
+        if spatial_adjust_method == "basis":
+            _default("fusion_spatial_adjust_df", _df_list_text(spatial_adjust_df))
+            _default(
+                "fusion_spatial_adjust_criterion",
+                spatial_adjust_criterion,
+                list(_SPATIAL_CRITERION_LABELS),
             )
             _default(
                 "fusion_spatial_adjust_eps_m", _fs_default("spatial_adjust_eps_m") or 0
             )
+            for name in (
+                "spatial_adjust_neighbours",
+                "spatial_adjust_knots_min",
+                "spatial_adjust_knots_max",
+            ):
+                _default(f"fusion_{name}", _fs_default(name))
+            _default(
+                "fusion_spatial_paired_smooth",
+                spatial_paired_smooth,
+                list(_SPATIAL_PAIRED_SMOOTH_LABELS),
+            )
+            _default("fusion_spatial_adjust_scale_m", "")
+            _default("fusion_spatial_adjust_min_component", 0)
+            _default("fusion_spatial_tune_scale_m", 0)
             with st.expander("Spatial adjustment — advanced", expanded=False):
-                spatial_adjust_max_df = int(
-                    st.number_input(
-                        "Max spatial df per cluster",
-                        **_fs_bounds("spatial_adjust_max_df"),
-                        step=1,
-                        key="fusion_spatial_adjust_max_df",
-                        help=(
-                            "Upper bound on the radial smooth functions per spatial "
-                            "cluster; AIC selects the actual count up to this."
-                        ),
+                spatial_tune_scale_m = (
+                    int(
+                        st.number_input(
+                            "Tune within areas of (m)",
+                            min_value=0,
+                            max_value=int(_FS["spatial_tune_scale_m"].hi),
+                            step=1000,
+                            key="fusion_spatial_tune_scale_m",
+                            help=(
+                                "Choose the layer, radius, statistic and weights "
+                                "on variation within areas of about this size: "
+                                "the smooth at this scale joins the covariates "
+                                "of the search. The scores use the same scale "
+                                "unless pattern scales are set. 0 = tune on all "
+                                "variation."
+                            ),
+                        )
                     )
+                    or None
+                )
+                scale_text = st.text_input(
+                    "Spatial pattern scales (m)",
+                    key="fusion_spatial_adjust_scale_m",
+                    help=(
+                        "Define the smooth by a distance instead of a df: "
+                        "exposure variation coarser than about this scale is "
+                        "treated as confounded, the same everywhere. Choose it "
+                        "from the study's confounding hypothesis. The first "
+                        "scale is the primary one; the slopes are also "
+                        "reported at the others and unadjusted. Empty = df "
+                        "candidates."
+                    ),
+                )
+                if scale_text.strip():
+                    try:
+                        spatial_adjust_scale_m = _FS["spatial_adjust_scale_m"].check(
+                            "spatial_adjust_scale_m", scale_text
+                        )
+                    except _gf_settings.SettingError as exc:
+                        st.error(f"{exc} Using the df candidates.")
+                spatial_adjust_min_component = (
+                    int(
+                        st.number_input(
+                            "Smallest cluster (0 = auto)",
+                            min_value=0,
+                            max_value=int(_FS["spatial_adjust_min_component"].hi),
+                            step=1,
+                            key="fusion_spatial_adjust_min_component",
+                            help=(
+                                "A smaller cluster shares its nearest larger "
+                                "cluster's level instead of its own. 0 = 30 "
+                                "with pattern scales, none with df candidates."
+                            ),
+                        )
+                    )
+                    or None
+                )
+                df_text = st.text_input(
+                    "Spatial df candidates",
+                    key="fusion_spatial_adjust_df",
+                    help=(
+                        "Radial smooth functions per spatial cluster the "
+                        "criterion compares, besides no smooth (0 = cluster "
+                        "intercepts and linear trends only). When the largest "
+                        "wins, the run warns: add larger values."
+                    ),
+                )
+                try:
+                    spatial_adjust_df = _FS["spatial_adjust_df"].check(
+                        "spatial_adjust_df", df_text
+                    )
+                except _gf_settings.SettingError as exc:
+                    st.error(f"{exc} Using the default list.")
+                    spatial_adjust_df = list(_fs_default("spatial_adjust_df"))
+                spatial_adjust_criterion = st.selectbox(
+                    "Spatial df criterion",
+                    options=list(_SPATIAL_CRITERION_LABELS),
+                    format_func=lambda k: _SPATIAL_CRITERION_LABELS[k],
+                    key="fusion_spatial_adjust_criterion",
+                    help=(
+                        "Information criterion that picks the df: AIC, or BIC "
+                        "(a heavier penalty, so a smaller or equal df)."
+                    ),
                 )
                 eps_ui = st.number_input(
                     "Cluster gap eps (m, 0 = auto)",
@@ -2334,8 +3026,83 @@ def _render_study_details_panel(
                     ),
                 )
                 spatial_adjust_eps_m = float(eps_ui) if eps_ui and eps_ui > 0 else None
+                _graph_cols = st.columns(3)
+                with _graph_cols[0]:
+                    spatial_adjust_neighbours = int(
+                        st.number_input(
+                            "Cluster neighbours",
+                            **_fs_bounds("spatial_adjust_neighbours"),
+                            step=1,
+                            key="fusion_spatial_adjust_neighbours",
+                            help=(
+                                "With eps at 0, entities linked through this many "
+                                "nearest neighbours form one cluster."
+                            ),
+                        )
+                    )
+                with _graph_cols[1]:
+                    spatial_adjust_knots_min = int(
+                        st.number_input(
+                            "Fewest knots per cluster",
+                            **_fs_bounds("spatial_adjust_knots_min"),
+                            step=1,
+                            key="fusion_spatial_adjust_knots_min",
+                        )
+                    )
+                with _graph_cols[2]:
+                    spatial_adjust_knots_max = int(
+                        st.number_input(
+                            "Most knots per cluster",
+                            **_fs_bounds("spatial_adjust_knots_max"),
+                            step=1,
+                            key="fusion_spatial_adjust_knots_max",
+                        )
+                    )
+                if spatial_adjust_select == "df_exposure_ic":
+                    spatial_paired_smooth = st.selectbox(
+                        "Paired-test smooth",
+                        options=list(_SPATIAL_PAIRED_SMOOTH_LABELS),
+                        format_func=lambda k: _SPATIAL_PAIRED_SMOOTH_LABELS[k],
+                        key="fusion_spatial_paired_smooth",
+                        help=(
+                            "Which smooth each exposure of a paired CGI-vs-"
+                            "exposure test is scored with. Its own makes the "
+                            "paired difference the difference of the two "
+                            "printed scores."
+                        ),
+                    )
+                _default(
+                    "fusion_spatial_tune_select",
+                    _fs_default("spatial_tune_select"),
+                    list(_SPATIAL_TUNE_SELECT_LABELS),
+                )
+                spatial_tune_select = st.selectbox(
+                    "Tuning scale",
+                    options=list(_SPATIAL_TUNE_SELECT_LABELS),
+                    format_func=lambda k: _SPATIAL_TUNE_SELECT_LABELS[k],
+                    key="fusion_spatial_tune_select",
+                    help=(
+                        "The scale tuned within: the one given above, or "
+                        "chosen on each split's train+val rows by AIC/BIC of "
+                        "the outcome model among the candidate scales."
+                    ),
+                )
+                if "scale_ic" in (spatial_adjust_select, spatial_tune_select):
+                    (
+                        spatial_select_scales_m,
+                        spatial_select_criterion,
+                        spatial_select_controls,
+                    ) = _render_scale_selection()
+        if spatial_adjust_method == "spatial_plus":
+            (
+                spatial_plus_settings,
+                spatial_adjust_eps_m,
+                spatial_adjust_min_component,
+            ) = _render_spatial_plus()
 
-    # ── Exposure buffer ─────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Exposure buffer
+    # ────────────────────────────────────────────────────────────
     for name in (
         "exposure_kernel",
         "exposure_radius_m",
@@ -2409,8 +3176,12 @@ def _render_study_details_panel(
         ),
         "objective_metric": objective_metric,
         "residualize_method": str(residualize_method),
+        "residualize_spline_df": int(residualize_spline_df),
+        "residualize_spline_min_unique": int(residualize_spline_min_unique),
+        "exposure_response_spline_df": int(exposure_response_spline_df),
         "search_scoring_method": str(search_scoring_method),
         "test_size": float(test_size),
+        "split_seed": int(split_seed),
         "n_bins": int(n_bins),
         "mixedlm_random_slope": bool(mixedlm_random_slope),
         "mixedlm_time_fixed": bool(mixedlm_time_fixed),
@@ -2429,14 +3200,62 @@ def _render_study_details_panel(
         "whole_grid_scaling": bool(whole_grid_scaling),
         "area_balanced_split": bool(area_balanced_split),
         "spatial_adjust_method": str(spatial_adjust_method),
-        "spatial_adjust_max_df": int(spatial_adjust_max_df),
+        "spatial_adjust_df": list(spatial_adjust_df),
+        "spatial_adjust_criterion": str(spatial_adjust_criterion),
         "spatial_adjust_eps_m": spatial_adjust_eps_m,
+        "spatial_adjust_neighbours": int(spatial_adjust_neighbours),
+        "spatial_adjust_knots_min": int(spatial_adjust_knots_min),
+        "spatial_adjust_knots_max": int(spatial_adjust_knots_max),
+        "spatial_paired_smooth": str(spatial_paired_smooth),
+        "spatial_adjust_scale_m": spatial_adjust_scale_m,
+        "spatial_adjust_min_component": spatial_adjust_min_component,
+        "spatial_tune_scale_m": spatial_tune_scale_m,
+        "spatial_adjust_select": str(spatial_adjust_select),
+        "spatial_tune_method": spatial_plus_settings.get(
+            "spatial_tune_method", _fs_default("spatial_tune_method")
+        ),
+        "spatial_tune_select": (
+            str(spatial_tune_select)
+            if spatial_adjust_method == "basis"
+            else _fs_default("spatial_tune_select")
+        ),
+        **{
+            key: spatial_plus_settings.get(key, _fs_default(key))
+            for key in (
+                "spatial_plus_groups_column",
+                "spatial_plus_k",
+                "spatial_plus_criterion",
+                "spatial_plus_checks",
+                "spatial_plus_step1_covariates",
+            )
+        },
+        "spatial_select_scales_m": list(spatial_select_scales_m),
+        "spatial_select_criterion": str(spatial_select_criterion),
+        "spatial_select_controls": str(spatial_select_controls),
         "spatial_split": bool(spatial_split),
         "spatial_block_size_m": spatial_block_size_m,
+        "spatial_split_mode": str(spatial_split_mode),
         "n_spatial_blocks": n_spatial_blocks,
         "channel_set": str(channel_set_ui),
         "index_form": str(index_form_ui),
         "sweep_splits": int(sweep_splits_ui),
+        "outer_splits": int(outer_splits_ui),
+        "outer_comparators": str(outer_comparators_ui),
+        "synergy_warm_start": bool(synergy_warm_start_ui),
+        "outer_warm_start": bool(outer_warm_start_ui),
+        "outer_posterior_draws": int(outer_draws_ui) or None,
+        "outer_posterior_warmup": None,
+        "outer_posterior_chains": None,
+        **_outer_null_settings(
+            outer_report_ui,
+            outer_null_runs_ui,
+            outer_null_kind_ui,
+            outer_null_group_ui,
+            outer_null_stop_after_ui,
+            outer_null_stop_low_ui,
+            outer_null_stop_high_ui,
+            outer_null_workers_ui,
+        ),
         "discovery_reps": int(discovery_reps_ui),
         "discovery_shuffles": int(discovery_shuffles_ui),
         "gain_splits": int(gain_splits_ui),
@@ -2549,6 +3368,21 @@ def _covariate_missing_caption(report: dict | None) -> str | None:
     )
 
 
+def _spatial_cell(entry: dict) -> dict:
+    """``{"Spatial smooth": label}`` for a spatially adjusted slope, else ``{}``."""
+    label = spatial_label(entry.get("spatial_adjustment"))
+    return {"Spatial smooth": label} if label else {}
+
+
+def _paired_smooth_label(row: dict) -> str:
+    """A paired row's smooths as text: the rule, then each side's df."""
+    record = row.get("spatial_adjustment") or {}
+    label = spatial_label(record)
+    if not label:
+        return "—"
+    return f"{record.get('rule')}: {label}" if record.get("rule") else label
+
+
 def _comparator_rows(results_view: dict) -> list[dict]:
     """One table row per exposure: the CGI, then each comparator."""
     comparators = results_view.get("comparators") or {}
@@ -2558,6 +3392,7 @@ def _comparator_rows(results_view: dict) -> list[dict]:
     }
     sources = [("CGI", None, results_view.get("comparator_reference") or {})]
     sources += [(name, c, c) for name, c in comparators.items()]
+    spatial = any((b.get("test") or {}).get("spatial_adjustment") for *_, b in sources)
     rows = []
     for name, c, block in sources:
         test = block.get("test") or {}
@@ -2570,12 +3405,16 @@ def _comparator_rows(results_view: dict) -> list[dict]:
             "n": test.get("n"),
             "β per SD": _fmt(test.get("beta")),
         }
+        if spatial:
+            row["Spatial smooth"] = spatial_label(test.get("spatial_adjustment")) or "—"
         p = paired.get(name) or {}
         row["CGI − comparator"] = "" if c is None else _fmt(p.get("observed_diff"))
         row["Δ 95% CI"] = (
             "" if c is None else f"[{_fmt(p.get('lower'))}, {_fmt(p.get('upper'))}]"
         )
         row["Δ p"] = "" if c is None else _fmt(p.get("p_value"), 4)
+        if spatial:
+            row["Δ spatial smooth"] = _paired_smooth_label(p) if c else ""
         if c is None:
             row["Holm p"] = ""
         elif p.get("descriptive"):
@@ -2584,6 +3423,161 @@ def _comparator_rows(results_view: dict) -> list[dict]:
             row["Holm p"] = _fmt(p.get("p_value_holm"), 4)
         rows.append(row)
     return rows
+
+
+_OUTER_QUANTITY_LABELS: dict[str, str] = {
+    "held_out_score": "Held-out score",
+    "held_out_beta": "β per SD",
+    "cgi_minus_channel": "CGI − channel",
+    "cgi_minus_comparator": "CGI − comparator",
+    "negative_control_beta": "Negative-control β",
+    "exposure_beta": "Exposure β per SD",
+    "exposure_negative_control_beta": "Exposure negative-control β",
+    "specificity_difference": "Specificity ΔD (CGI − exposure)",
+    "negative_control_d": "Negative-control D",
+    "held_out_per_iqr": "Change per IQR",
+    "held_out_per_p5_p95": "Change per p5–p95",
+    "exposure_per_iqr": "Exposure change per IQR",
+    "exposure_per_p5_p95": "Exposure change per p5–p95",
+    "exposure_negative_control_per_iqr": "Negative-control change per IQR",
+    "exposure_negative_control_per_p5_p95": "Negative-control change per p5–p95",
+    "held_out_per_sd0": "Change per SD0",
+    "exposure_per_sd0": "Exposure change per SD0",
+    "exposure_negative_control_per_sd0": "Negative-control change per SD0",
+}
+
+# Each split's CGI posterior (``outer_splits.POSTERIOR_QUANTITIES``).
+_OUTER_POSTERIOR_LABELS: dict[str, str] = {
+    "posterior_beta": "β",
+    "posterior_weight": "Weight",
+    "posterior_r50": "R50 (m)",
+    "posterior_r90": "R90 (m)",
+}
+
+
+def _render_outer_splits(results_view: dict) -> None:
+    """Each result's spread across the repeated held-out splits."""
+    outer = results_view.get("outer_splits") or {}
+    every = outer.get("summary") or []
+    summary = [e for e in every if e.get("quantity") not in _OUTER_POSTERIOR_LABELS]
+    if not every:
+        return
+    st.divider()
+    st.markdown("**Across held-out splits**")
+    seeds = outer.get("seeds") or []
+    st.caption(
+        f"Split, tuning and held-out scoring repeated on {outer.get('k')} test "
+        "splits"
+        + (f" (seeds {seeds[0]}–{seeds[-1]})" if seeds else "")
+        + ". The splits share data, so the test across them is a corrected "
+        "resampled t, not a combination of the per-split p-values. The held-out "
+        "score is not tested (it cannot be negative); its signed slope is. "
+        "Every other table on this page reads the first split."
+        + (
+            " Every slope is adjusted for that split's coordinate smooth; "
+            "outer_splits.csv gives its df per split."
+            if any(e.get("spatial_method") for e in summary)
+            else ""
+        )
+    )
+    with_control = any("control" in e for e in summary)
+    weighted = any(e.get("weighting") for e in summary)
+    rows = [
+        {
+            **({"Weighting": e.get("weighting") or "unweighted"} if weighted else {}),
+            "Result": _OUTER_QUANTITY_LABELS.get(e.get("quantity"), e.get("quantity")),
+            "Exposure": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            **({"Control": e.get("control") or "—"} if with_control else {}),
+            "Splits": e.get("n_splits"),
+            "Median": _fmt(e.get("median"), 4),
+            "2.5–97.5 %": f"[{_fmt(e.get('q025'), 4)}, {_fmt(e.get('q975'), 4)}]",
+            "Holds in": (
+                "—"
+                if _num(e.get("share_holds")) is None
+                else f"{float(e['share_holds']):.0%}"
+            ),
+            "Corrected p": _fmt(e.get("corrected_p"), 4),
+            "Holm p": _fmt(e.get("corrected_p_holm"), 4),
+        }
+        for e in summary
+    ]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    _render_outer_posterior(every)
+
+
+def _render_outer_null(results_view: dict) -> None:
+    """The held-out decision's false-positive rate under null outcomes."""
+    null = results_view.get("outer_null") or {}
+    summary = null.get("summary") or []
+    if not summary:
+        return
+    st.markdown("**Null calibration of the held-out decision**")
+    groups = (null.get("groups") or {}).get("source")
+    st.caption(
+        "Outcomes unrelated to greenery, each run through the same search and "
+        "the same held-out splits. Rate = share with corrected p below 0.05, "
+        "with its exact 95 % interval; calibrated p = the real outcome's "
+        "corrected p ranked among the nulls'."
+        + (f" Spatial nulls permute the area means of {groups}." if groups else "")
+        + ("" if null.get("complete", True) else " Not every null finished.")
+    )
+    rows = [
+        {
+            "Null": _NULL_KIND_LABELS.get(e.get("null_kind"), e.get("null_kind")),
+            "Result": _OUTER_QUANTITY_LABELS.get(e.get("quantity"), e.get("quantity")),
+            "Exposure": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            "Rejected": f"{e.get('hits')}/{e.get('finished')}",
+            "Rate": "—" if _num(e.get("rate")) is None else f"{float(e['rate']):.1%}",
+            "95 % CI": (
+                "—"
+                if _num(e.get("ci_low")) is None
+                else f"[{float(e['ci_low']):.1%}, {float(e['ci_high']):.1%}]"
+            ),
+            "Calibrated p": _fmt(e.get("calibrated_p"), 3),
+            "Stopping rule": e.get("decision") or "—",
+        }
+        for e in summary
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def _render_outer_posterior(summary: list[dict]) -> None:
+    """Each split's CGI posterior, summarised across the splits."""
+    entries = [e for e in summary if e.get("quantity") in _OUTER_POSTERIOR_LABELS]
+    if not entries:
+        return
+    st.markdown("**Posterior across held-out splits**")
+    st.caption(
+        "The composite's posterior refitted on each split's train+val rows: "
+        "median and range across the splits, the share of splits in which a term "
+        "carries the largest weight, and how often each form was chosen. These "
+        "are in-sample fits, so they are described, not tested."
+    )
+
+    def digits(quantity: str) -> int:
+        return {"posterior_beta": 4, "posterior_weight": 3}.get(quantity, 0)
+
+    rows = [
+        {
+            "Result": _OUTER_POSTERIOR_LABELS[e["quantity"]],
+            "Term": _CHANNEL_DISPLAY.get(e.get("exposure"), e.get("exposure")),
+            "Splits": e.get("n_splits"),
+            "Median": _fmt(e.get("median"), digits(e["quantity"])),
+            "Range": (
+                f"[{_fmt(e.get('min'), digits(e['quantity']))}, "
+                f"{_fmt(e.get('max'), digits(e['quantity']))}]"
+            ),
+            "Largest weight in": (
+                "—"
+                if _num(e.get("share_largest")) is None
+                else f"{float(e['share_largest']):.0%}"
+            ),
+            "Forms": e.get("forms") or "—",
+        }
+        for e in entries
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _render_comparators(results_view: dict, metric_name: str) -> None:
@@ -2616,6 +3610,118 @@ def _render_comparators(results_view: dict, metric_name: str) -> None:
             ":orange[Non-specific on a negative control:] "
             + ", ".join(f"`{n}`" for n in flagged)
             + " — the control's association cannot be told apart from the target's."
+        )
+
+
+def _render_specificity_contrast(results_view: dict) -> None:
+    """Is the CGI more specific than each other exposure, per control."""
+    rows = (results_view.get("specificity_contrast") or {}).get("rows") or []
+    if not rows:
+        return
+    st.divider()
+    st.markdown("**Specificity contrast**")
+    st.caption(
+        "Per negative control, on the held-out entities where the target, the "
+        "control and both exposures are observed: D = |β target| − |β control| "
+        "for the composite and for each other exposure, and ΔD = D(CGI) − D(e). "
+        "A positive ΔD means the composite is the more specific of the two. The "
+        "interval and the one-sided p (ΔD > 0) come from a paired bootstrap that "
+        "refits all four slopes; Holm runs over the primary comparators per "
+        "control. β are covariate-adjusted slopes in SD units."
+    )
+    table = [
+        {
+            "Exposure": _CHANNEL_DISPLAY.get(r.get("exposure"), r.get("exposure")),
+            "Kind": (
+                "Comparison channel"
+                if r.get("kind") == "channel"
+                else ("Primary comparator" if r.get("primary") else "Comparator")
+            ),
+            "Control": r.get("control"),
+            "β target (CGI)": _fmt(r.get("beta_target_cgi"), 4),
+            "β control (CGI)": _fmt(r.get("beta_control_cgi"), 4),
+            "β target (e)": _fmt(r.get("beta_target_exposure"), 4),
+            "β control (e)": _fmt(r.get("beta_control_exposure"), 4),
+            "D (CGI)": _fmt(r.get("d_cgi"), 4),
+            "D (e)": _fmt(r.get("d_exposure"), 4),
+            "ΔD": _fmt(r.get("delta_d"), 4),
+            "95 % CI": f"[{_fmt(r.get('ci_low'), 4)}, {_fmt(r.get('ci_high'), 4)}]",
+            "p": _fmt(r.get("p_value"), 4),
+            "Holm p": _fmt(r.get("p_value_holm"), 4),
+            "n": r.get("n"),
+            **_spatial_cell(r),
+        }
+        for r in rows
+    ]
+    st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+    if any(r.get("spatial_adjustment") for r in rows):
+        st.caption(
+            "Spatially adjusted: every slope also controls for a coordinate "
+            "basis, each exposure's own when the exposure model picks the df "
+            "and each outcome's own when the outcome model does; the column "
+            "gives the df of the two smooths in play."
+        )
+
+
+def _render_raw_effects(results_view: dict) -> None:
+    """Held-out slopes in the outcome's units per IQR and per p5–p95 range."""
+    from geofuse.jobs.outer_splits import raw_rows
+
+    raw = results_view.get("raw_effects") or {}
+    exposures = raw.get("exposures") or {}
+    if not exposures:
+        return
+    st.divider()
+    st.markdown("**Raw-unit effect sizes**")
+    st.caption(
+        "On the held-out entities of the first split: the covariate-adjusted "
+        "change in the outcome, in its own units, per interquartile range and "
+        "per 5th–95th percentile range of each exposure, both set on the "
+        "train+val entities (or the fixed increment the job gives). Same "
+        "covariates and smooth as the per-SD slopes."
+    )
+    labels = {
+        "held_out_per_iqr": "Target, per IQR",
+        "held_out_per_p5_p95": "Target, per p5–p95",
+        "exposure_per_iqr": "Target, per IQR",
+        "exposure_per_p5_p95": "Target, per p5–p95",
+        "exposure_negative_control_per_iqr": "Control, per IQR",
+        "exposure_negative_control_per_p5_p95": "Control, per p5–p95",
+        "held_out_per_sd0": "Target, per SD0",
+        "exposure_per_sd0": "Target, per SD0",
+        "exposure_negative_control_per_sd0": "Control, per SD0",
+    }
+    table = [
+        {
+            "Exposure": _CHANNEL_DISPLAY.get(r["exposure"], r["exposure"]),
+            "Contrast": labels.get(r["quantity"], r["quantity"]),
+            "Control": r.get("control") or "—",
+            "Per": _fmt(r.get("scale"), 4),
+            "Change": _fmt(r.get("estimate"), 4),
+            "95 % CI": f"[{_fmt(r.get('ci_low'), 4)}, {_fmt(r.get('ci_high'), 4)}]",
+            "p": _fmt(r.get("p_value"), 4),
+            "n": r.get("n"),
+        }
+        for r in raw_rows(raw)
+    ]
+    st.dataframe(pd.DataFrame(table), width="stretch", hide_index=True)
+    if any(r["quantity"].endswith("_per_sd0") for r in raw_rows(raw)):
+        st.caption(
+            "SD0 is the exposure's held-out SD after the covariates only, so a "
+            "change per SD0 keeps one unit at every pattern scale and "
+            "unadjusted; its p-value is the per-SD slope's."
+        )
+    layers = raw.get("layers") or {}
+    cgi = (exposures.get("cgi") or {}).get("distribution") or {}
+    if layers and _num(cgi.get("iqr")) is not None:
+        st.caption(
+            f"The composite's IQR is {_fmt(cgi.get('iqr'), 4)}; at the cell it "
+            "reads, each layer's IQR is "
+            + ", ".join(
+                f"{_CHANNEL_DISPLAY.get(ch, ch)} {_fmt(d.get('iqr'), 4)}"
+                for ch, d in layers.items()
+            )
+            + " (train+val entities)."
         )
 
 
@@ -2675,7 +3781,7 @@ def _render_collinearity_report(results_view: dict) -> None:
     st.markdown("**VIF: before vs after reduction**")
     rows: list[dict] = []
     final_by_name = {kept[i]: final[i] for i in range(len(kept))} if final else {}
-    for ch, vif_in in zip(channels, initial):
+    for ch, vif_in in zip(channels, initial, strict=False):
         rows.append(
             {
                 "Channel": ch,
@@ -2948,6 +4054,11 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
             "and magnitude in the full model; partial R² is the variance only "
             "that covariate explains (drop in R² when it's removed from Full)."
         )
+    if impact.get("spatial_adjustment") == "not applied":
+        st.caption(
+            "Spatial smooth not applied: this table, `exposure_response.csv` and "
+            "`moderation.csv` control for the covariates only."
+        )
 
     _r2_label = "Marginal R²" if is_mixedlm else "R²"
     summary_cols = st.columns(3)
@@ -3004,7 +4115,9 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
         )
 
         # One cubic per categorical, over that variable's levels in value order.
-        coef_of = dict(zip(df["covariate"].astype(str), df["coef"].astype(float)))
+        coef_of = dict(
+            zip(df["covariate"].astype(str), df["coef"].astype(float), strict=True)
+        )
         grouped: dict[str, list[tuple[str, float]]] = {}
         for term in order:
             name, level = _split_term(term)
@@ -3021,14 +4134,14 @@ def _render_covariate_impact(results_view: dict, metric_name: str) -> None:
                 y=list(values),
                 mode="lines+markers",
                 name=f"{name} trend (deg {degree})",
-                line=dict(color=_TREND_COLOR, width=2.5),
-                marker=dict(color=_TREND_COLOR, size=6, symbol="diamond"),
+                line={"color": _TREND_COLOR, "width": 2.5},
+                marker={"color": _TREND_COLOR, "size": 6, "symbol": "diamond"},
                 hovertemplate=f"{name} fitted: %{{y:.4f}}<extra></extra>",
             )
             fitted_any.append(f"{name} (deg {degree}, {len(labels)} levels)")
         fig.update_layout(
-            margin=dict(l=60, r=20, t=60, b=120),
-            xaxis=dict(categoryorder="array", categoryarray=order),
+            margin={"l": 60, "r": 20, "t": 60, "b": 120},
+            xaxis={"categoryorder": "array", "categoryarray": order},
         )
         st.plotly_chart(fig, width="stretch")
         cap = (
@@ -3100,7 +4213,7 @@ def _render_composite_map_viewer(results_view: dict, engine) -> None:
         "target outcome. All composite subplots share the [0, 1] colorbar."
     )
 
-    label_to_path = {label: path for label, path in composite_options}
+    label_to_path = dict(composite_options)
     _labels = [label for label, _ in composite_options]
     _default("fusion_map_picks", [_labels[0]], _labels, multi=True)
     picks = st.multiselect(
@@ -3371,7 +4484,7 @@ def _render_distance_decay(summary: dict, _pd, _label) -> None:
             [
                 {"Distance (m)": float(d), "Channel": _label(ci_), "Weight": float(w)}
                 for ci_, row in enumerate(weights)
-                for d, w in zip(dist, row)
+                for d, w in zip(dist, row, strict=False)
             ]
         )
         try:
@@ -3380,7 +4493,7 @@ def _render_distance_decay(summary: dict, _pd, _label) -> None:
             fig = _px.line(long, x="Distance (m)", y="Weight", color="Channel")
             fig.update_layout(
                 height=260,
-                margin=dict(l=50, r=20, t=30, b=50),
+                margin={"l": 50, "r": 20, "t": 30, "b": 50},
                 yaxis_title="Implied weight (1 at the entity)",
             )
             st.plotly_chart(fig, width="stretch")
@@ -3506,9 +4619,9 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
             )
             fig.update_layout(
                 height=280,
-                margin=dict(l=50, r=20, t=30, b=50),
+                margin={"l": 50, "r": 20, "t": 30, "b": 50},
                 yaxis_title="Posterior weight",
-                xaxis=dict(categoryorder="array", categoryarray=order),
+                xaxis={"categoryorder": "array", "categoryarray": order},
             )
             st.plotly_chart(fig, width="stretch")
         except Exception:
@@ -3559,7 +4672,7 @@ def _render_fitted_grid(summary: dict, _pd, _label) -> None:
                     for i in range(min(len(stats), len(lo_c)))
                     if lo_c[i] > uniform or hi_c[i] < uniform
                 ]
-                for lo_c, hi_c in zip(a_lo, a_hi)
+                for lo_c, hi_c in zip(a_lo, a_hi, strict=False)
             ]
         informative = informative or []
         st.caption(
@@ -3629,7 +4742,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
     def _label(i: int) -> str:
         return (labels[i] if i < len(labels) else f"ch{i}").upper()
 
-    # ── What the sweep picked ───────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # What the sweep picked
+    # ────────────────────────────────────────────────────────────
     st.markdown("**Sweep**")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -3751,7 +4866,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
             "at that rung and were left out."
         )
 
-    # ── Posterior ───────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Posterior
+    # ────────────────────────────────────────────────────────────
     weights = summary.get("weight_mean") or []
     if weights:
         st.markdown("**Posterior weights (influence shares)**")
@@ -3848,7 +4965,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "warmup before quoting the credible intervals."
             )
 
-    # ── Reproducibility ─────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Reproducibility
+    # ────────────────────────────────────────────────────────────
     disc = summary.get("discovery") or {}
     if disc:
         st.markdown("**Does the discovery reproduce?**")
@@ -3930,7 +5049,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                     "study fills these in."
                 )
 
-    # ── Composite vs its own channels ───────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Composite vs its own channels
+    # ────────────────────────────────────────────────────────────
     gain = summary.get("holdout_gain") or {}
     if gain:
         st.markdown("**Composite vs standalone channels**")
@@ -4005,7 +5126,9 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
                 "on the rows it scores."
             )
 
-    # ── Null calibration ────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Null calibration
+    # ────────────────────────────────────────────────────────────
     null = summary.get("null_calibration") or {}
     if null:
         rate = _num(null.get("rate"))
@@ -4065,18 +5188,15 @@ def _render_posterior_diagnostics(summary: dict, metric_name: str) -> None:
         st.caption(f"_Discovery took {elapsed:.0f}s._")
 
 
-def _num(x) -> float | None:
-    """``float(x)`` when it is a real number, else ``None``.
+# Every reporting block can carry NaN where a model didn't fit; such values
+# render as "—" like any other missing one.
+_num = finite_or_none
 
-    Every reporting block can carry ``NaN`` where a model didn't fit; formatting
-    one prints the literal "nan" into a metric tile, so non-finite values are
-    funnelled to ``None`` and rendered as "—" like any other missing value.
-    """
-    try:
-        fx = float(x)
-    except (TypeError, ValueError):
-        return None
-    return fx if math.isfinite(fx) else None
+
+def _rounded(x, places: int = 4) -> float | None:
+    """:func:`_num` rounded to *places* decimals for a table cell."""
+    fx = _num(x)
+    return None if fx is None else round(fx, places)
 
 
 def _fmt(x, places: int = 3) -> str:
@@ -4117,9 +5237,9 @@ _P_KIND_HELP = {
 def _render_results_headline(results_view: dict, metric_name: str) -> None:
     """At-a-glance CGI bottom line: the held-out test greenery effect (headline,
     with the whole-data figure in its tooltip), the held-out significance check,
-    direction, and the CGI-vs-standalone verdict as two whole-data (all)
-    sub-answers — the paired objective difference and the AIC/BIC
-    penalized-model comparison."""
+    direction, and the CGI-vs-standalone verdict as two sub-answers — the
+    held-out paired objective difference (the verdict) and the in-sample
+    AIC/BIC penalized-model comparison."""
     effects = results_view.get("cgi_effects") or {}
     # A block whose mixed model didn't fit is all-NaN; drop it here so the
     # tiles below fall through to the held-out cluster bootstrap, which is an
@@ -4250,8 +5370,8 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
         else:
             st.metric("Held-out significance", "—")
 
-    # 3) CGI vs best standalone — sub-answer A: whole-data (all) paired
-    #    objective difference.
+    # 3) CGI vs standalone — sub-answer A, the verdict: held-out paired
+    #    objective difference against the channel chosen on train+val.
     with cols2[0]:
         if paired:
             diff = _f(paired.get("observed_diff"))
@@ -4260,7 +5380,7 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
             pp_holm = _f(paired.get("p_value_holm"))
             fam_n = paired.get("family_size")
             ch = paired.get("standalone_channel")
-            verdict = "CGI better" if paired.get("favors_cgi") else "not better"
+            verdict = paired.get("verdict") or "—"
             if diff is not None:
                 ci_str = (
                     f"[{lo:.4f}, {hi:.4f}]"
@@ -4274,64 +5394,77 @@ def _render_results_headline(results_view: dict, metric_name: str) -> None:
                     if pp_holm is not None and fam_n
                     else ""
                 )
+                all_diff = _f(paired.get("observed_diff_all"))
+                all_str = (
+                    f" Whole-data (all, in-sample) Δ={all_diff:.4f}."
+                    if all_diff is not None
+                    else ""
+                )
                 help_txt = (
-                    f"Whole-data (all) paired bootstrap difference in "
-                    f"{metric_name} (CGI − `{ch}`): Δ={diff:.4f} {ci_str}, "
-                    f"one-sided p={p_str} (positive favours CGI).{holm_str}"
+                    f"Held-out paired bootstrap difference in {metric_name} "
+                    f"(CGI − `{ch}`, the channel scoring best on train+val): "
+                    f"Δ={diff:.4f} {ci_str}, one-sided p={p_str} (positive "
+                    f"favours CGI).{holm_str}{all_str}"
                 )
             else:
-                help_txt = "Comparison unavailable."
-            st.metric("CGI vs standalone — objective (all)", verdict, help=help_txt)
+                help_txt = (
+                    "The held-out rows could not be scored, so there is no verdict."
+                )
+            st.metric(
+                "CGI vs standalone — objective (held-out)", verdict, help=help_txt
+            )
         elif has_standalones:
             # Standalones ran but the paired bootstrap produced nothing — the
             # whole-data model didn't fit for one of the two composites. Say so
             # instead of implying the studies were never enabled.
             st.metric(
-                "CGI vs standalone — objective (all)",
+                "CGI vs standalone — objective (held-out)",
                 "unavailable",
                 help=(
-                    "The paired whole-data comparison could not be computed — "
-                    "the mixed model did not fit for CGI or for the standalone "
-                    "composite on the full dataset. See the job log for which "
-                    "channel failed; the AIC/BIC comparison beside this tile is "
-                    "the independent second opinion."
+                    "The paired comparison could not be computed — the model "
+                    "did not fit for CGI or for the standalone composite, or "
+                    "the channel chosen on train+val has no paired row. See the "
+                    "job log for which channel failed."
                 ),
             )
         else:
             st.metric(
-                "CGI vs standalone — objective (all)",
+                "CGI vs standalone — objective (held-out)",
                 "—",
                 help="Enable standalone studies to compare CGI against them.",
             )
 
-    # 4) CGI vs best standalone — sub-answer B: whole-data (all) AIC/BIC
-    #    penalized-model comparison.
+    # 4) CGI vs standalone — sub-answer B: in-sample AIC/BIC
+    #    penalized-model comparison, secondary to the held-out verdict.
     with cols2[1]:
         if aic_bic and aic_bic.get("ok"):
+            d_aic = _f(aic_bic.get("delta_aic"))
             d_bic = _f(aic_bic.get("delta_bic"))
             st.metric(
-                "CGI vs standalone — AIC/BIC (all)",
+                "CGI vs standalone — AIC/BIC (in-sample)",
                 str(aic_bic.get("verdict", "—")),
                 help=(
-                    "AIC/BIC of CGI (all channels) vs the best single channel "
-                    f"(`{aic_bic.get('best_channel')}`), both fit on the whole "
-                    "dataset. "
+                    "In-sample OLS of all channels vs the single channel "
+                    f"scoring best on train+val (`{aic_bic.get('best_channel')}`),"
+                    " both fit on the whole dataset; a secondary statistic, not "
+                    "the verdict. It does not score the tuned composite itself, "
+                    "and BIC charges ln n per extra channel. "
                     + (
-                        f"ΔBIC={d_bic:.1f} (positive favours CGI)."
-                        if d_bic is not None
+                        f"ΔAIC={d_aic:.1f}, ΔBIC={d_bic:.1f} (positive favours CGI)."
+                        if d_aic is not None and d_bic is not None
                         else ""
                     )
                 ),
             )
         elif aic_bic is not None:
             st.metric(
-                "CGI vs standalone — AIC/BIC (all)",
+                "CGI vs standalone — AIC/BIC (in-sample)",
                 "inconclusive",
                 help=str(aic_bic.get("reason", "Comparison unavailable.")),
             )
         else:
             st.metric(
-                "CGI vs standalone — AIC/BIC (all)",
+                "CGI vs standalone — AIC/BIC (in-sample)",
                 "—",
                 help="Enable standalone studies to compare CGI against them.",
             )
@@ -4426,7 +5559,7 @@ def _render_study_detail(
             total_weight = sum(
                 float(final_params.get(k, 0)) for k in formula.weight_keys
             )
-            for col, key in zip(weight_cols, formula.weight_keys):
+            for col, key in zip(weight_cols, formula.weight_keys, strict=True):
                 label = _weight_key_label(key)
                 pct = (
                     100.0 * float(final_params.get(key, 0)) / total_weight
@@ -4441,7 +5574,7 @@ def _render_study_detail(
             groups = [all_keys[i : i + 3] for i in range(0, len(all_keys), 3)]
             for group in groups:
                 cols = st.columns(len(group))
-                for col, key in zip(cols, group):
+                for col, key in zip(cols, group, strict=True):
                     val = float(final_params.get(key, 0))
                     if key in formula.power_keys:
                         pretty = key.removesuffix("_power").upper() + " power"
@@ -4456,7 +5589,7 @@ def _render_study_detail(
         channels = _cgi_formulas.formula_channels(formula.name)
         st.markdown("**Radii (m)**")
         radii_cols = st.columns(max(len(channels), 1))
-        for col, ch in zip(radii_cols, channels):
+        for col, ch in zip(radii_cols, channels, strict=False):
             label = _CHANNEL_DISPLAY.get(ch, ch.upper())
             with col:
                 try:
@@ -4633,6 +5766,7 @@ def _render_negative_controls(report: dict | None) -> None:
                 "n": tgt.get("n"),
                 "|β| target − |β| control": "-",
                 "Non-specific": "-",
+                **_spatial_cell(tgt),
             }
         ]
         for name, c in (res.get("controls") or {}).items():
@@ -4648,6 +5782,7 @@ def _render_negative_controls(report: dict | None) -> None:
                         f"{_fmt(c.get('delta_ci_high'), 3)}]"
                     ),
                     "Non-specific": "yes" if c.get("nonspecific") else "no",
+                    **_spatial_cell(c),
                 }
             )
         st.caption(title)
@@ -4687,6 +5822,11 @@ def _render_negative_controls(report: dict | None) -> None:
             "outcome greenery should not cause - residual confounding or "
             "selection, not only the pathway. Read the effect with that in mind."
         )
+    adjusted = any(
+        (res.get("target") or {}).get("spatial_adjustment")
+        for res in splits.values()
+        if res
+    )
     st.caption(
         "Each control is scored with the composite frozen as tuned; it never "
         "entered the search. β is the covariate-adjusted slope with both sides "
@@ -4696,6 +5836,14 @@ def _render_negative_controls(report: dict | None) -> None:
         "interval excludes zero while the difference's interval includes it. "
         "Compare against a standalone study's table to see whether the "
         "composite is more or less specific than a single channel."
+        + (
+            " Spatially adjusted: β, the difference and the objective also "
+            "control for a coordinate basis, the composite's when the exposure "
+            "model picks the df and each outcome's own when the outcome model "
+            "does (its df in the Spatial smooth column)."
+            if adjusted
+            else ""
+        )
     )
 
 
@@ -4757,7 +5905,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                 barmode="group",
                 title=f"{metric_name} by study and subset",
             )
-            fig.update_layout(margin=dict(l=60, r=20, t=60, b=80))
+            fig.update_layout(margin={"l": 60, "r": 20, "t": 60, "b": 80})
             st.plotly_chart(fig, width="stretch")
         except Exception:
             st.bar_chart(
@@ -4793,7 +5941,7 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
             import plotly.express as _px
 
             fig_t = _px.bar(t_df, x="Study", y="Held-out |t|")
-            fig_t.update_layout(height=300, margin=dict(l=60, r=20, t=30, b=80))
+            fig_t.update_layout(height=300, margin={"l": 60, "r": 20, "t": 30, "b": 80})
             st.plotly_chart(fig_t, width="stretch")
         except Exception:
             st.bar_chart(t_df.set_index("Study"), width="stretch")
@@ -4819,6 +5967,8 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                     "Standalone": _CHANNEL_DISPLAY.get(
                         d.get("standalone_channel"), str(d.get("standalone_channel"))
                     ),
+                    "CGI score": _rounded(d.get("cgi_score")),
+                    "Standalone score": _rounded(d.get("standalone_score")),
                     f"Δ {metric_name} (CGI − ch)": (
                         round(float(diff), 4) if diff is not None else None
                     ),
@@ -4829,12 +5979,19 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
                     ),
                     "p (one-sided)": f"{float(pr):.3g}" if pr is not None else None,
                     "p (Holm)": f"{float(ph):.3g}" if ph is not None else None,
+                    "Verdict": d.get("verdict"),
+                    **(
+                        {"Δ spatial smooth": _paired_smooth_label(d)}
+                        if d.get("spatial_adjustment")
+                        else {}
+                    ),
                 }
             )
         st.dataframe(pd.DataFrame(fam_rows), width="stretch")
         st.caption(
-            "Whole-data paired bootstrap difference of CGI against each "
-            "standalone channel (positive Δ favours CGI). `p (Holm)` controls "
+            "Held-out paired bootstrap difference of CGI against each "
+            "standalone channel (positive Δ favours CGI); both scores and the "
+            "interval come from the same held-out rows. `p (Holm)` controls "
             "the family-wise error rate across these comparisons. When several "
             "outcomes are optimised, treat those as a further family and discount "
             "the p-values accordingly."
@@ -4843,17 +6000,18 @@ def _render_cross_study_comparison(results_view: dict, metric_name: str) -> None
     # ── AIC/BIC verdict detail ──────────────────────────────────
     aic_bic = results_view.get("cgi_vs_standalone_aic_bic") or None
     if aic_bic and aic_bic.get("ok"):
-        st.markdown("**Penalized model comparison (AIC / BIC)**")
+        st.markdown("**Penalized model comparison (AIC / BIC, in-sample)**")
         best_ch = _CHANNEL_DISPLAY.get(
             aic_bic.get("best_channel"), str(aic_bic.get("best_channel"))
         )
         st.caption(
             f"Full model = `outcome ~ veg + terrain + ndvi (+ covariates)`; "
-            f"reduced model = `outcome ~ {best_ch} (+ covariates)` — the best "
-            f"single channel by whole-data (all) score. Both models are fit on "
-            f"the whole dataset (all entities). Lower AIC/BIC is better; a "
-            f"positive Δ favours CGI. **Verdict: {aic_bic.get('verdict')}** "
-            f"(n = {aic_bic.get('n')})."
+            f"reduced model = `outcome ~ {best_ch} (+ covariates)` — the "
+            f"single channel scoring best on train+val. Both models are fit on "
+            f"the whole dataset (all entities), so this is an in-sample "
+            f"statistic, secondary to the held-out paired difference above. "
+            f"Lower AIC/BIC is better; a positive Δ favours CGI. "
+            f"**{aic_bic.get('verdict')}** (n = {aic_bic.get('n')})."
         )
         comp_rows = [
             {
@@ -5073,6 +6231,10 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Comparator exposures ────────────────────────────────────
     _render_comparators(results_view, metric_name)
+    _render_specificity_contrast(results_view)
+    _render_raw_effects(results_view)
+    _render_outer_splits(results_view)
+    _render_outer_null(results_view)
 
     # ── Channel collinearity report ─────────────────────────────
     _render_collinearity_report(results_view)
@@ -5085,6 +6247,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
 
     # ── Composite map viewer ────────────────────────────────────
     _render_composite_map_viewer(results_view, engine)
+    # TODO: enable once geofuse.cgi_generator.generate is implemented.
     with st.expander("Generate CGI Map", expanded=False):
         st.caption(
             "Planned: this study's CGI over a whole area, computed from its "
@@ -5153,7 +6316,7 @@ def _render_fusion_results_body(output_dir: str) -> None:
             )
 
             _tabs = st.tabs([disp for _, disp, _ in _csv_entries])
-            for _tab, (_, _, _path) in zip(_tabs, _csv_entries):
+            for _tab, (_, _, _path) in zip(_tabs, _csv_entries, strict=True):
                 with _tab:
                     st.caption(f"Source: `{_path}`")
                     st.dataframe(pd.read_csv(_path), width="stretch")
@@ -5317,13 +6480,15 @@ def render(output_dir: str) -> None:
     if "fusion_engines_by_target" not in st.session_state:
         st.session_state.fusion_engines_by_target = {}
 
-    # ── Loaded-results overview ─────────────────────────────────
+    # ────────────────────────────────────────────────────────────
+    # Loaded-results overview
+    # ────────────────────────────────────────────────────────────
     # Rendered first so it survives the configuration early-returns below.
     _render_fusion_results_section(output_dir)
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # ROW 1: Configuration (Left) | Preview (Right)
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     col_fusion_left, col_fusion_right = st.columns([1, 1])
 
     tmp_target_path = None
@@ -5469,6 +6634,22 @@ def render(output_dir: str) -> None:
                                     "Cross-sectional runs only."
                                 ),
                             )
+                            st.checkbox(
+                                "Specificity contrast",
+                                key="fusion_specificity_contrast",
+                                disabled=not st.session_state.get(
+                                    "fusion_negative_controls"
+                                ),
+                                help=(
+                                    "Test, per negative control on the held-out "
+                                    "entities, whether the composite is more "
+                                    "specific than each primary comparator and the "
+                                    "channel chosen on train+val: the difference in "
+                                    "|β target| − |β control|, all four slopes "
+                                    "refitted on each paired bootstrap resample. "
+                                    "Repeated on every held-out split."
+                                ),
+                            )
                         taken = set(target_outcome_columns) | set(
                             (st.session_state.get("fusion_negative_controls") or [])
                             + (st.session_state.get("fusion_covariate_columns") or [])
@@ -5508,6 +6689,22 @@ def render(output_dir: str) -> None:
                                     "The pre-specified comparators the paired "
                                     "tests' Holm correction runs over; the others "
                                     "are reported as descriptive. Empty = all."
+                                ),
+                            )
+                        weight_options = [_NO_WEIGHT_COLUMN] + [
+                            c for c in numeric_cols if c not in target_outcome_columns
+                        ]
+                        if target_outcome_columns and len(weight_options) > 1:
+                            _keep_valid("fusion_weight_column", weight_options)
+                            st.selectbox(
+                                "Sampling weight column",
+                                options=weight_options,
+                                key="fusion_weight_column",
+                                help=(
+                                    "Sampling or analytic weights: every held-out "
+                                    "result is also reported weighted by this "
+                                    "column, next to the unweighted one. The "
+                                    "search stays unweighted."
                                 ),
                             )
                         if len(target_outcome_columns) > 1:
@@ -5557,9 +6754,9 @@ def render(output_dir: str) -> None:
             preview_vector_gdf if is_vector_target else None,
         )
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # SECTION 2 — Optimization setup
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
     opt_state = _render_optimization_setup_panel(
         preview_vector_gdf if is_vector_target else None,
@@ -5573,9 +6770,9 @@ def render(output_dir: str) -> None:
     is_longitudinal = opt_state["is_longitudinal"]
     year_aware = is_longitudinal or opt_state["cross_sectional_date_on"]
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # SECTION 3 — Metric file assignment
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
     metric_state = _render_metric_assignment_panel(
         opt_state["discovered_waves"],
@@ -5604,9 +6801,9 @@ def render(output_dir: str) -> None:
     ndvi_resolution_m = None
     gvi_grid_spacing_m = None
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # SECTION 4 — Study details (form)
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
 
     # Attribute columns the user can pick as covariates — numeric columns are
@@ -5702,6 +6899,9 @@ def render(output_dir: str) -> None:
         if is_vector_target
         else []
     )
+    specificity_contrast_param = bool(
+        st.session_state.get("fusion_specificity_contrast") and negative_controls_param
+    )
     # Comparators, also picked in the target section. One that has since become
     # an outcome, a covariate or a control is refused at submit.
     comparators_param = (
@@ -5714,6 +6914,14 @@ def render(output_dir: str) -> None:
         for c in (st.session_state.get("fusion_comparators_primary") or [])
         if c in comparators_param
     ] or None
+    # The weight column, also picked in the target section; a study re-run
+    # from a run file keeps the one it recorded.
+    weight_pick = st.session_state.get("fusion_weight_column")
+    weight_column_param = (
+        (None if weight_pick in (None, _NO_WEIGHT_COLUMN) else str(weight_pick))
+        if is_vector_target
+        else None
+    )
     # Memory a quadratic objective needs at this target's size, refused when
     # it exceeds the machine's RAM unless the user ticked the override.
     objective_size = _gf_settings.objective_size_check(
@@ -5734,6 +6942,7 @@ def render(output_dir: str) -> None:
     exposure_iqr_param = study_state.get("exposure_iqr")
     objective_metric = study_state["objective_metric"]
     test_size = study_state["test_size"]
+    split_seed = int(study_state.get("split_seed", 42))
     n_bins = study_state["n_bins"]
     resume_existing_study = study_state["resume_existing_study"]
     run_standalones = study_state["run_standalones"]
@@ -5761,14 +6970,19 @@ def render(output_dir: str) -> None:
         study_state.get("search_scoring_method", "mom_em3")
     )
     spatial_adjust_method_param = str(study_state.get("spatial_adjust_method", "none"))
-    spatial_adjust_max_df_param = int(study_state.get("spatial_adjust_max_df", 10))
+    spatial_adjust_df_param = study_state.get("spatial_adjust_df")
+    if spatial_adjust_df_param is None:
+        spatial_adjust_df_param = _gf_settings.spatial_df_candidates(study_state)
     spatial_adjust_eps_m_param = study_state.get("spatial_adjust_eps_m")
     spatial_split_param = bool(study_state.get("spatial_split", False))
     spatial_block_size_m_param = study_state.get("spatial_block_size_m")
+    spatial_split_mode_param = str(study_state.get("spatial_split_mode", "stripe"))
     n_spatial_blocks_param = study_state.get("n_spatial_blocks")
     channel_set_param = str(study_state.get("channel_set", "ndvi + gvi"))
     index_form_param = str(study_state.get("index_form", "sweep"))
     sweep_splits_param = int(study_state.get("sweep_splits", 40))
+    outer_splits_param = int(study_state.get("outer_splits", 1))
+    outer_comparators_param = str(study_state.get("outer_comparators", "primary"))
     discovery_reps_param = int(study_state.get("discovery_reps", 5))
     discovery_shuffles_param = int(study_state.get("discovery_shuffles", 12))
     gain_splits_param = int(study_state.get("gain_splits", 20))
@@ -5788,9 +7002,9 @@ def render(output_dir: str) -> None:
         study_state.get("drop_collinear_channels", False)
     )
 
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     # Run controls and progress
-    # =========================================================================
+    # ────────────────────────────────────────────────────────────
     st.divider()
 
     col_run2, col_run3 = st.columns([1, 1])
@@ -6146,8 +7360,17 @@ def render(output_dir: str) -> None:
                 "n_bins": int(n_bins),
                 "cache_metrics": bool(cache_metrics),
                 "test_size": float(test_size),
+                "split_seed": int(split_seed),
                 "objective_metric": objective_metric,
                 "residualize_method": residualize_method_param,
+                **{
+                    k: study_state.get(k, _fs_default(k))
+                    for k in (
+                        "residualize_spline_df",
+                        "residualize_spline_min_unique",
+                        "exposure_response_spline_df",
+                    )
+                },
                 "search_scoring_method": search_scoring_method_param,
                 "ndvi_start_date": ndvi_auto_start.isoformat(),
                 "ndvi_end_date": ndvi_auto_end.isoformat(),
@@ -6161,6 +7384,7 @@ def render(output_dir: str) -> None:
                 "categorical_missing": categorical_missing_param,
                 "moderator_columns": list(moderator_columns_param),
                 "negative_controls": negative_controls_param,
+                "specificity_contrast": specificity_contrast_param,
                 "comparators": comparators_param,
                 "comparators_primary": comparators_primary_param,
                 "exposure_iqr": (
@@ -6190,10 +7414,38 @@ def render(output_dir: str) -> None:
                 "spatial_adjust_method": (
                     spatial_adjust_method_param if is_vector_target else "none"
                 ),
-                "spatial_adjust_max_df": int(spatial_adjust_max_df_param),
+                # Always a value: the runner reads a missing one as a job
+                # recorded before the select setting existed.
+                "spatial_adjust_select": study_state.get(
+                    "spatial_adjust_select", _fs_default("spatial_adjust_select")
+                ),
+                "spatial_adjust_df": list(spatial_adjust_df_param),
                 "spatial_adjust_eps_m": (
                     spatial_adjust_eps_m_param if is_vector_target else None
                 ),
+                **{
+                    k: study_state.get(k, _fs_default(k))
+                    for k in (
+                        "spatial_adjust_criterion",
+                        "spatial_adjust_neighbours",
+                        "spatial_adjust_knots_min",
+                        "spatial_adjust_knots_max",
+                        "spatial_paired_smooth",
+                        "spatial_adjust_scale_m",
+                        "spatial_adjust_min_component",
+                        "spatial_tune_scale_m",
+                        "spatial_tune_method",
+                        "spatial_tune_select",
+                        "spatial_plus_groups_column",
+                        "spatial_plus_k",
+                        "spatial_plus_criterion",
+                        "spatial_plus_checks",
+                        "spatial_plus_step1_covariates",
+                        "spatial_select_scales_m",
+                        "spatial_select_criterion",
+                        "spatial_select_controls",
+                    )
+                },
                 # Spatial block validation applies to vector targets only;
                 # raster targets keep the row-level stratified split.
                 "spatial_split": (
@@ -6202,12 +7454,19 @@ def render(output_dir: str) -> None:
                 "spatial_block_size_m": (
                     spatial_block_size_m_param if is_vector_target else None
                 ),
+                "spatial_split_mode": (
+                    spatial_split_mode_param
+                    if is_vector_target and spatial_split_param
+                    else "stripe"
+                ),
                 "n_spatial_blocks": (
                     n_spatial_blocks_param if is_vector_target else None
                 ),
                 "channel_set": channel_set_param,
                 "index_form": index_form_param,
                 "sweep_splits": int(sweep_splits_param),
+                "outer_splits": int(outer_splits_param),
+                "outer_comparators": outer_comparators_param,
                 "discovery_reps": int(discovery_reps_param),
                 "discovery_shuffles": int(discovery_shuffles_param),
                 "gain_splits": int(gain_splits_param),
@@ -6215,6 +7474,27 @@ def render(output_dir: str) -> None:
                 "posterior_draws": int(posterior_draws_param),
                 "posterior_warmup": int(posterior_warmup_param),
                 "posterior_chains": int(posterior_chains_param),
+                **{
+                    k: study_state.get(k, _fs_default(k))
+                    for k in (
+                        "synergy_warm_start",
+                        "outer_warm_start",
+                        "outer_posterior_draws",
+                        "outer_posterior_warmup",
+                        "outer_posterior_chains",
+                        "outer_report",
+                        "outer_null_runs",
+                        "outer_null_kind",
+                        "outer_null_group",
+                        "outer_null_stop_after",
+                        "outer_null_stop_low",
+                        "outer_null_stop_high",
+                        "outer_null_workers",
+                        "fixed_iqr",
+                        "weight_search",
+                    )
+                },
+                "weight_column": weight_column_param,
                 "radius_prior": radius_prior_param,
                 "gvi_min_coverage": gvi_min_coverage_param,
                 "check_collinearity": bool(check_collinearity_param),

@@ -20,6 +20,15 @@ import numpy as np
 import pandas as pd
 
 from ..logger import get_logger
+from .outer_splits import (
+    distribution_rows,
+    finite_or_none,
+    raw_rows,
+    spatial_columns,
+    spatial_label,
+    spatial_plus_table,
+    weighted_rows,
+)
 from .stage_ledger import StageLedger
 
 _log_fusion = get_logger("FUSION")
@@ -50,6 +59,10 @@ _FUSION_STAGE_WEIGHTS: dict[str, float] = {
     "reports": 1.0,
     "comparators": 4.0,
     "negative_control_retune": 20.0,
+    "weighted": 2.0,
+    "spatial_plus": 6.0,
+    "outer_splits": 40.0,
+    "outer_null": 80.0,
 }
 
 _FUSION_RETUNE_STAGE: tuple[str, str] = (
@@ -60,6 +73,26 @@ _FUSION_RETUNE_STAGE: tuple[str, str] = (
 _FUSION_COMPARATORS_STAGE: tuple[str, str] = (
     "comparators",
     "Score comparator exposures",
+)
+
+_FUSION_WEIGHTED_STAGE: tuple[str, str] = (
+    "weighted",
+    "Weighted estimates",
+)
+
+_FUSION_SPATIAL_PLUS_STAGE: tuple[str, str] = (
+    "spatial_plus",
+    "Spatial+ estimates",
+)
+
+_FUSION_OUTER_SPLITS_STAGE: tuple[str, str] = (
+    "outer_splits",
+    "Repeat on other held-out splits",
+)
+
+_FUSION_OUTER_NULL_STAGE: tuple[str, str] = (
+    "outer_null",
+    "Null calibration of the held-out decision",
 )
 
 _FUSION_LONGITUDINAL_STAGE: tuple[str, str] = (
@@ -178,8 +211,6 @@ def _write_fusion_outputs(
     ``mde`` (the minimum detectable effect) say what that inference rests on.
     """
 
-    import numpy as np
-
     os.makedirs(output_dir, exist_ok=True)
     sfx = f"__{label}" if multi_outcome else ""
     written: list[str] = []
@@ -188,12 +219,7 @@ def _write_fusion_outputs(
     def _path(name: str) -> str:
         return os.path.join(output_dir, name)
 
-    def _f(v: Any) -> float | None:
-        try:
-            fv = float(v)
-            return fv if np.isfinite(fv) else None
-        except (TypeError, ValueError):
-            return None
+    _f = finite_or_none
 
     def _ci(bundle: dict) -> dict:
         return (bundle.get("test_results") or {}).get("test_ci") or {}
@@ -505,14 +531,22 @@ def _write_fusion_outputs(
         # Stamp this study onto the rows it just produced, so the composite
         # and each single channel sit in one table — which is the comparison
         # a published single-channel result is read against.
+        not_applied = er_report.get("spatial_adjustment")
         for _r in er_rows[_row_start:]:
             _r["study"] = _study_key
             _r["test_n"] = er_report.get("inference_n")
+            if not_applied:
+                _r["spatial_adjustment"] = not_applied
         curve = (nonlinear or {}).get("curve")
         if curve:
             er_curve_rows.extend(
-                {"study": _study_key, "exposure": x, "effect": y}
-                for x, y in zip(curve["exposure"], curve["effect"])
+                {
+                    "study": _study_key,
+                    "exposure": x,
+                    "effect": y,
+                    **({"spatial_adjustment": not_applied} if not_applied else {}),
+                }
+                for x, y in zip(curve["exposure"], curve["effect"], strict=True)
             )
     if er_rows:
         _emit_csv(
@@ -531,6 +565,7 @@ def _write_fusion_outputs(
         mod_rows: list[dict] = []
         for block in moderation:
             name = block.get("moderator")
+            _block_start = len(mod_rows)
             for row in block.get("simple_slopes") or []:
                 mod_rows.append(
                     {
@@ -587,13 +622,18 @@ def _write_fusion_outputs(
                     "p_value": _f(block.get("interaction_p")),
                 }
             )
+            if block.get("spatial_adjustment"):
+                for _r in mod_rows[_block_start:]:
+                    _r["spatial_adjustment"] = block["spatial_adjustment"]
         _emit_csv(f"moderation{sfx}.csv", mod_rows)
 
     # ── negative_controls.csv (specificity) ─────────────────────
     # One row per exposure x split x outcome: the target first, then each
     # control with its paired contrast against the target and the non-specific
     # flag. ``exposure`` says whether the frozen exposure was the CGI, a
-    # standalone or a comparator.
+    # standalone or a comparator. In a spatially adjusted run the
+    # ``spatial_*`` columns name the smooth each row's slopes adjust for, as
+    # in comparators.csv, specificity_contrast.csv and outer_splits.csv.
     comparators = (cgi_bundle or {}).get("comparators") or {}
     nc_sources = [
         (key, "cgi" if key == "cgi" else "standalone", b.get("negative_controls"))
@@ -632,6 +672,7 @@ def _write_fusion_outputs(
                         "nonspecific": (
                             e.get("nonspecific") if role == "control" else None
                         ),
+                        **spatial_columns(e.get("spatial_adjustment")),
                     }
                 )
     if nc_rows:
@@ -675,6 +716,7 @@ def _write_fusion_outputs(
                 "beta": _f(row.get("beta")),
                 "beta_ci_low": _f(row.get("beta_ci_low")),
                 "beta_ci_high": _f(row.get("beta_ci_high")),
+                **spatial_columns(row.get("spatial_adjustment")),
             }
             for name, primary, block in sources
             for split in _SPLITS
@@ -695,10 +737,92 @@ def _write_fusion_outputs(
                 "n": r.get("n"),
                 "inference_n": r.get("inference_n"),
                 "favors_cgi": r.get("favors_cgi"),
+                "verdict": r.get("verdict"),
+                "observed_diff_all": _f(r.get("observed_diff_all")),
+                "cgi_score_all": _f(r.get("cgi_score_all")),
+                "comparator_score_all": _f(r.get("standalone_score_all")),
+                "n_all": r.get("n_all"),
+                **spatial_columns(r.get("spatial_adjustment")),
             }
             for r in (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
         ]
         _emit_csv(f"cgi_vs_comparator_paired{sfx}.csv", paired_rows)
+
+    # ── specificity_contrast.csv ────────────────────────────────
+    # One row per exposure x control on the held-out rows: the four slopes,
+    # each exposure's D = |β_target| − |β_control|, and ΔD = D_cgi − D_e.
+    specificity = (cgi_bundle or {}).get("specificity_contrast") or {}
+    spec_rows = [
+        {
+            "outcome": label,
+            "exposure": r.get("exposure"),
+            "kind": r.get("kind"),
+            "primary": r.get("primary"),
+            "control": r.get("control"),
+            **{
+                k: _f(r.get(k))
+                for k in (
+                    "beta_target_cgi",
+                    "beta_control_cgi",
+                    "beta_target_exposure",
+                    "beta_control_exposure",
+                    "d_cgi",
+                    "d_exposure",
+                    "delta_d",
+                    "ci_low",
+                    "ci_high",
+                    "p_value",
+                    "p_value_holm",
+                )
+            },
+            "n": r.get("n"),
+            **spatial_columns(r.get("spatial_adjustment")),
+        }
+        for r in specificity.get("rows") or []
+    ]
+    _emit_csv(f"specificity_contrast{sfx}.csv", spec_rows)
+
+    # ── outer_splits.csv + outer_summary.csv ────────────────────
+    outer = (cgi_bundle or {}).get("outer_splits") or {}
+    if outer.get("splits"):
+        _emit_csv(f"outer_splits{sfx}.csv", outer["splits"])
+        _emit_csv(f"outer_summary{sfx}.csv", outer.get("summary") or [])
+
+    # ── raw_effects.csv + exposure_scales.csv ───────────────────
+    raw = (cgi_bundle or {}).get("raw_effects")
+    raw_effect_rows = raw_rows(raw)
+    exposure_scales = outer.get("distributions") or [
+        {"split": 0, "seed": (cgi_bundle or {}).get("split_seed"), **r}
+        for r in distribution_rows(raw)
+    ]
+    _emit_csv(f"raw_effects{sfx}.csv", raw_effect_rows)
+    _emit_csv(f"exposure_scales{sfx}.csv", exposure_scales if raw_effect_rows else [])
+
+    # ── weighted.csv ────────────────────────────────────────────
+    weighted = (cgi_bundle or {}).get("weighted")
+    weighted_table = weighted_rows(weighted)
+    _emit_csv(f"weighted{sfx}.csv", weighted_table)
+
+    # ── spatial_plus.csv ────────────────────────────────────────
+    plus = (cgi_bundle or {}).get("spatial_plus")
+    plus_table = [
+        {"split": 0, "seed": (cgi_bundle or {}).get("split_seed"), **r}
+        for r in spatial_plus_table(plus)
+    ]
+    _emit_csv(f"spatial_plus{sfx}.csv", plus_table)
+
+    # ── scale_selection.csv + effective_bandwidth.csv ───────────
+    selection = (cgi_bundle or {}).get("scale_selection") or {}
+    _emit_csv(f"scale_selection{sfx}.csv", selection.get("rows") or [])
+    bandwidth = (cgi_bundle or {}).get("effective_bandwidth") or []
+    _emit_csv(f"effective_bandwidth{sfx}.csv", bandwidth)
+
+    # ── null_outer.csv + null_summary.csv + null_variogram.csv ──
+    null = (cgi_bundle or {}).get("outer_null") or {}
+    if null.get("rows"):
+        _emit_csv(f"null_outer{sfx}.csv", null["rows"])
+        _emit_csv(f"null_summary{sfx}.csv", null.get("summary") or [])
+        _emit_csv(f"null_variogram{sfx}.csv", null.get("variogram") or [])
 
     # ── results_summary.json (master manifest) ──────────────────
     studies_manifest: dict[str, dict] = {}
@@ -779,8 +903,26 @@ def _write_fusion_outputs(
         # guarantee it spent.
         "config_hash": (cgi_bundle or {}).get("config_hash"),
         "test_reads": (cgi_bundle or {}).get("test_reads"),
+        # The smooth's settings and selections; absent without spatial
+        # adjustment, so an unadjusted run's summary is unchanged.
+        **(
+            {"spatial_smoothing": cgi_bundle["spatial_smoothing"]}
+            if (cgi_bundle or {}).get("spatial_smoothing")
+            else {}
+        ),
+        **(
+            {"spatial_tuning": cgi_bundle["spatial_tuning"]}
+            if (cgi_bundle or {}).get("spatial_tuning")
+            else {}
+        ),
         "studies": studies_manifest,
         "cgi_vs_standalone_aic_bic": aic_bic,
+        "cgi_vs_standalone_paired": (
+            (cgi_bundle or {}).get("cgi_vs_standalone_paired_family") or []
+        ),
+        "comparison_channel": (
+            (cgi_bundle or {}).get("cgi_vs_standalone_paired") or {}
+        ).get("standalone_channel"),
         "covariate_impact": cov_summary,
         "decline_terms": (cgi_bundle or {}).get("decline_terms"),
         # Carried in the manifest, not only in their CSVs: the results panel
@@ -798,8 +940,56 @@ def _write_fusion_outputs(
             (cgi_bundle or {}).get("cgi_vs_comparator_paired") or []
         ),
         "covariate_missing": (cgi_bundle or {}).get("covariate_missing"),
+        "split_seed": (cgi_bundle or {}).get("split_seed"),
         "spatial_split": (cgi_bundle or {}).get("spatial_split"),
+        "outer_splits": (cgi_bundle or {}).get("outer_splits"),
     }
+    if raw_effect_rows:
+        manifest["raw_effects"] = {"rows": raw_effect_rows, "scales": exposure_scales}
+    if weighted:
+        manifest["weighted"] = {
+            k: weighted.get(k)
+            for k in ("weight_column", "n_test", "n_eff", "n_dropped", "skipped")
+            if k in weighted
+        } | {"rows": weighted_table}
+    if selection:
+        manifest["scale_selection"] = {
+            "criterion": selection.get("criterion"),
+            "summary": selection.get("summary"),
+        }
+    if bandwidth:
+        manifest["effective_bandwidth"] = bandwidth
+    if plus:
+        manifest["spatial_plus"] = {
+            k: plus.get(k)
+            for k in (
+                "skipped",
+                "label",
+                "criterion",
+                "checks",
+                "n",
+                "k",
+                "n_groups",
+                "group_sizes",
+                "knots",
+                "groups_rule",
+                "lambda_fixed_in_resamples",
+                "n_boot",
+                "slopes",
+                "d",
+                "delta_d",
+                "paired",
+                "warnings",
+            )
+            if k in plus
+        }
+    if null:
+        manifest["outer_null"] = {
+            k: null.get(k)
+            for k in ("kinds", "runs", "workers", "groups", "stop", "decisions")
+        } | {"complete": null.get("complete"), "summary": null.get("summary")}
+    if (cgi_bundle or {}).get("specificity_contrast") is not None:
+        manifest["specificity_contrast"] = cgi_bundle["specificity_contrast"]
     _emit_json(f"results_summary{sfx}.json", manifest)
 
     # ── aic_bic.json + collinearity.json (standalone copies) ────
@@ -868,30 +1058,60 @@ def write_entity_table(engine: Any, composite_df: pd.DataFrame, stem: str) -> st
     return path
 
 
-def _log_stage_timing(ledger: StageLedger, log: Any) -> None:
-    """Log where the run spent its wall clock, longest stage first.
+def stage_timing_rows(ledger: StageLedger, sampler: Any = None) -> list[dict]:
+    """Every timed stage, longest first: ``key``, ``label``, ``seconds``,
+    ``share`` of the summed stage time, and ``peak_gb``, the largest memory
+    the job's process tree held during the stage (``None`` without a
+    :class:`parallel.MemorySampler`)."""
+    out = []
+    for key, label, secs, share in ledger.timing_report():
+        stage = ledger.get(key)
+        peak = None
+        if sampler is not None and stage is not None:
+            b = sampler.peak(stage.started_at, stage.ended_at)
+            peak = round(b / 1e9, 3) if b else None
+        out.append(
+            {
+                "key": key,
+                "label": label,
+                "seconds": round(float(secs), 3),
+                "share": round(float(share), 4),
+                "peak_gb": peak,
+            }
+        )
+    return out
+
+
+def _log_stage_timing(ledger: StageLedger, log: Any, sampler: Any = None) -> None:
+    """Log where the run spent its wall clock and memory, longest stage first.
 
     Written at the end of a run so tuning decisions rest on this machine's own
     numbers: stage costs shift with core count, disk speed, and how much of the
     greenery cache was reusable, so a breakdown measured elsewhere does not
-    transfer.
+    transfer. With a sampler each stage also shows the peak memory of the
+    job's process tree (commit charge on Windows) and the run its overall peak.
     """
-    rows = ledger.timing_report()
+    rows = stage_timing_rows(ledger, sampler)
     if not rows:
         return
-    total = sum(r[2] for r in rows)
+    total = sum(r["seconds"] for r in rows)
     log("INFO", "====== STAGE WALL-CLOCK BREAKDOWN ======")
     log(
         "INFO",
         f"  accounted {total / 60:.1f} min across {len(rows)} timed stage(s) "
         f"on {os.cpu_count() or '?'} logical core(s).",
     )
-    for key, label, secs, share in rows:
-        if share < 0.005 and secs < 30:
+    if sampler is not None and sampler.peak():
+        peak_gb = sampler.peak() / 1e9
+        log("INFO", f"  peak memory of the job's processes: {peak_gb:.2f} GB")
+    for r in rows:
+        if r["share"] < 0.005 and r["seconds"] < 30:
             continue
+        peak = "" if r["peak_gb"] is None else f"  peak {r['peak_gb']:6.2f} GB"
         log(
             "INFO",
-            f"  {share * 100:5.1f}%  {secs / 60:8.1f} min  {label} ({key})",
+            f"  {r['share'] * 100:5.1f}%  {r['seconds'] / 60:8.1f} min{peak}  "
+            f"{r['label']} ({r['key']})",
         )
 
 
@@ -904,6 +1124,10 @@ def _build_fusion_ledger(
     mixedlm_postscore: bool = False,
     negative_control_retune: bool = False,
     comparators: bool = False,
+    weighted: bool = False,
+    outer_splits: bool = False,
+    outer_null: bool = False,
+    spatial_plus: bool = False,
 ) -> StageLedger:
     """Fresh ledger covering every (outcome, step) pair in run order.
 
@@ -921,7 +1145,10 @@ def _build_fusion_ledger(
     spec too but score with OLS so they skip the post-score step).
     ``negative_control_retune`` appends one re-tune stage per outcome, after
     its standalones, where the runner performs it; ``comparators`` one stage
-    for the comparator exposures, between the two.
+    for the comparator exposures, between the two; ``weighted`` one for the
+    weighted estimates; ``spatial_plus`` one for the Spatial+ estimates;
+    ``outer_splits`` one stage for the repeated held-out splits, and
+    ``outer_null`` one for their null calibration, last.
     """
     standalones = list(standalone_channels or [])
     steps: list[tuple[str, str]] = []
@@ -975,6 +1202,38 @@ def _build_fusion_ledger(
                     f"[{label}] {rt_label}" if multi else rt_label,
                 )
             )
+        if weighted:
+            w_key_raw, w_label = _FUSION_WEIGHTED_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, w_key_raw, multi=multi),
+                    f"[{label}] {w_label}" if multi else w_label,
+                )
+            )
+        if spatial_plus:
+            sp_key_raw, sp_label = _FUSION_SPATIAL_PLUS_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, sp_key_raw, multi=multi),
+                    f"[{label}] {sp_label}" if multi else sp_label,
+                )
+            )
+        if outer_splits:
+            os_key_raw, os_label = _FUSION_OUTER_SPLITS_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, os_key_raw, multi=multi),
+                    f"[{label}] {os_label}" if multi else os_label,
+                )
+            )
+        if outer_null:
+            on_key_raw, on_label = _FUSION_OUTER_NULL_STAGE
+            steps.append(
+                (
+                    _fusion_stage_key(label, on_key_raw, multi=multi),
+                    f"[{label}] {on_label}" if multi else on_label,
+                )
+            )
     return StageLedger.from_steps(steps)
 
 
@@ -1025,6 +1284,8 @@ def _posterior_summary(params: dict) -> dict:
         "weight_width_ratio": post.get("weight_width_ratio"),
         "rhat_max": post.get("rhat_max"),
         "ess_min": post.get("ess_min"),
+        "warm_start": post.get("warm_start"),
+        "spatial_tuning": g("__spatial_tuning__"),
         "divergences": post.get("divergences"),
         "converged": post.get("converged"),
         # The grid axes the posterior estimated rather than the sweep picked.
@@ -1071,7 +1332,9 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
     """``+1`` / ``-1`` sign of the greenery↔outcome relationship on the test set.
 
     Distance correlation is unsigned, so the report needs a separate direction
-    indicator. Returns ``+1`` (neutral) on any failure.
+    indicator. It conditions on what the held-out score did: the covariates
+    and, in a spatially adjusted run, the score's spatial smooth. Returns
+    ``+1`` (neutral) on any failure.
     """
     from .. import mixed_effects_scoring as _me
     from .. import objective_scoring as _scoring
@@ -1102,7 +1365,7 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
                 include_time_fixed=engine._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
-                spatial_method=engine.spatial_adjust_method,
+                spatial_method=engine._scoring_spatial_method,
                 target=spec.association_target,
             )
             return 1 if float(coef) >= 0 else -1
@@ -1111,7 +1374,9 @@ def _direction_sign(engine: Any, params: dict, metric: str) -> int:
                 target,
                 pred,
                 cov,
-                residualize_method=getattr(engine, "residualize_method", "linear"),
+                spatial_basis=res.get("spatial_basis"),
+                spatial_method=getattr(engine, "_scoring_spatial_method", "none"),
+                **getattr(engine, "_residualize_options", {}),
             )
         )
     except Exception:
@@ -1162,7 +1427,8 @@ def _exposure_splits(
     (``evaluate_on_test`` and its bootstrap CI) and its p-value from the
     held-out permutation test, as the CGI's headline does; ``train_val`` and
     ``all`` are the descriptive ``evaluate_effects`` slices. ``beta`` is the
-    covariate-adjusted slope in SD units (``compute_partial_slopes``).
+    covariate-adjusted slope in SD units (``compute_partial_slopes``), with its
+    ``spatial_adjustment`` record when the run is spatially adjusted.
     """
     out: dict[str, dict] = {}
     for split in _SPLITS:
@@ -1178,6 +1444,8 @@ def _exposure_splits(
             "beta_ci_low": s.get("ci_low"),
             "beta_ci_high": s.get("ci_high"),
         }
+        if s.get("spatial_adjustment") is not None:
+            row["spatial_adjustment"] = s["spatial_adjustment"]
         if split == "test" and test_results:
             ci = test_results.get("test_ci") or {}
             row["score"] = test_results.get("test_score")
@@ -1300,7 +1568,190 @@ def _comparator_family(comparators: dict[str, dict]) -> list[dict]:
             r["p_value_holm"] = None
             r["family_size"] = len(primary)
             r["descriptive"] = True
+    for r in rows:
+        r["verdict"] = paired_verdict(r)
     return rows
+
+
+# ────────────────────────────────────────────────────────────────────
+# Specificity contrast
+# ────────────────────────────────────────────────────────────────────
+
+
+def specificity_exposures(
+    comparators: list[str],
+    primary: list[str],
+    channel: str | None,
+    channel_params: dict | None,
+) -> dict[str, dict]:
+    """The exposures the CGI's specificity is contrasted with.
+
+    Each of ``comparators`` (``kind`` comparator, ``primary`` when it is one of
+    ``primary``, or when none is) and the comparison ``channel`` with its own
+    params (``kind`` channel), as ``{name: {kind, primary, channel, params}}``,
+    where ``channel`` is the engine's active-channel name for the exposure. A
+    channel named like a comparator is keyed ``channel:<name>``.
+    """
+    from ..fusion import comparator_mode
+
+    primary_set = set(primary or comparators)
+    out: dict[str, dict] = {
+        c: {
+            "kind": "comparator",
+            "primary": c in primary_set,
+            "channel": comparator_mode(c),
+            "params": {"comparator": c},
+        }
+        for c in comparators
+    }
+    if channel is not None and channel_params is not None:
+        key = channel if channel not in out else f"channel:{channel}"
+        out[key] = {
+            "kind": "channel",
+            "primary": None,
+            "channel": channel,
+            "params": dict(channel_params),
+        }
+    return out
+
+
+def _specificity_report(
+    engine: Any,
+    cgi_params: dict,
+    exposures: dict[str, dict],
+    n_boot: int,
+    *,
+    label: str,
+    log: Any,
+) -> dict | None:
+    """The CGI's specificity contrast with ``exposures``, Holm-corrected.
+
+    Runs ``engine.compute_specificity_contrast`` on
+    :func:`specificity_exposures`' entries. Each row gains ``kind`` and
+    ``primary``; per control, the primary comparators' rows form one Holm
+    family (``p_value_holm``, ``None`` on the other rows), as the paired
+    CGI − comparator rows do. ``exposure_info`` records each exposure's kind
+    and primary flag. ``log=None`` keeps it quiet. A failure is logged and
+    gives ``None``.
+    """
+    from .. import JobCancelled
+    from .. import statistical_testing as _stats
+
+    try:
+        report = engine.compute_specificity_contrast(
+            cgi_params,
+            {k: (v["channel"], v["params"]) for k, v in exposures.items()},
+            n_boot=int(n_boot),
+            seed=42,
+        )
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        if log is not None:
+            log("WARN", f"[{label}] Specificity contrast failed: {exc}")
+        return None
+    if not report or report.get("skipped"):
+        return report
+    report["exposure_info"] = {
+        k: {"kind": v["kind"], "primary": v["primary"]} for k, v in exposures.items()
+    }
+    rows = report["rows"]
+    for r in rows:
+        info = report["exposure_info"].get(r["exposure"]) or {}
+        r["kind"], r["primary"] = info.get("kind"), info.get("primary")
+        r["p_value_holm"] = None
+    for control in report["controls"]:
+        family = [
+            r
+            for r in rows
+            if r["control"] == control and r["kind"] == "comparator" and r["primary"]
+        ]
+        holm = _stats.holm_bonferroni([r["p_value"] for r in family])
+        for r, hp in zip(family, holm, strict=True):
+            r["p_value_holm"] = None if hp != hp else float(hp)
+    for r in rows if log is not None else []:
+        ci = f"[{_fmt_num(r['ci_low'], '+.4f')}, {_fmt_num(r['ci_high'], '+.4f')}]"
+        holm = r["p_value_holm"]
+        spatial = spatial_label(r.get("spatial_adjustment"))
+        log(
+            "OK",
+            f"[{label}] Specificity vs `{r['exposure']}` on '{r['control']}': "
+            f"D_cgi={_fmt_num(r['d_cgi'], '+.4f')}, "
+            f"D_e={_fmt_num(r['d_exposure'], '+.4f')}, "
+            f"ΔD={_fmt_num(r['delta_d'], '+.4f')} {ci}, "
+            f"p={_fmt_num(r['p_value'], '.3g')}"
+            + (f", Holm p={_fmt_num(holm, '.3g')}" if holm is not None else "")
+            + f" (n={r['n']}"
+            + (f", {spatial}" if spatial else "")
+            + ").",
+        )
+    return report
+
+
+def _fmt_num(value: Any, spec: str) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return format(v, spec) if np.isfinite(v) else "n/a"
+
+
+# Readings of a paired CGI-vs-exposure row, in the order the checks run.
+PAIRED_VERDICTS = ("CGI better", "standalone better", "no difference", "no inference")
+
+
+def paired_verdict(row: dict, alpha: float = 0.05) -> str:
+    """Held-out reading of one paired CGI-vs-exposure row.
+
+    ``CGI better`` when the Holm p-value (the raw one when there is no Holm
+    correction) of the one-sided test CGI > exposure is below ``alpha``;
+    ``standalone better`` when the whole interval lies below zero; ``no
+    difference`` otherwise, and ``no inference`` when the held-out rows gave
+    no p-value.
+    """
+    p = row.get("p_value_holm")
+    if p is None:
+        p = row.get("p_value")
+    if p is None or not np.isfinite(float(p)):
+        return "no inference"
+    diff = row.get("observed_diff")
+    if float(p) < alpha and diff is not None and float(diff) > 0:
+        return "CGI better"
+    upper = row.get("upper")
+    if upper is not None and np.isfinite(float(upper)) and float(upper) < 0:
+        return "standalone better"
+    return "no difference"
+
+
+def comparison_channel(
+    standalones_bundle: dict, channels: list[str], metric: str
+) -> tuple[str | None, dict[str, float]]:
+    """The single channel the CGI is compared against, and its scores.
+
+    The channel whose standalone scores best on the train+val pool (the
+    ``train`` subset score), direction-aware, so the test rows the comparison
+    is then read on never choose it. Returns ``(None, {})`` when no channel in
+    ``channels`` has a finite pool score.
+    """
+    from .. import mixed_effects_scoring as _me
+    from .. import objective_scoring as _scoring
+
+    higher_is_better = (
+        metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
+    )
+    scores: dict[str, float] = {}
+    for ch in channels:
+        b = standalones_bundle.get(ch)
+        if not b:
+            continue
+        ts = ((b.get("subset_scores") or {}).get("train") or {}).get("score")
+        if ts is None or not np.isfinite(float(ts)):
+            continue
+        scores[ch] = float(ts)
+    if not scores:
+        return None, {}
+    sign = 1.0 if higher_is_better else -1.0
+    return max(scores, key=lambda ch: sign * scores[ch]), scores
 
 
 def _compare_cgi_vs_standalone(
@@ -1312,14 +1763,14 @@ def _compare_cgi_vs_standalone(
     longitudinal: bool,
     log,
 ) -> dict | None:
-    """AIC/BIC verdict: is CGI justified over the best single standalone channel?
+    """In-sample AIC/BIC: do the other channels earn their keep over one?
 
-    The best standalone is the channel with the strongest whole-data (``all``)
-    score (direction-aware). The full and reduced (best-channel) models are fit
-    on the whole dataset's per-entity channel design built at the CGI winning
-    aggregation params, so the verdict is on the same ``all`` slice as the
-    paired objective comparison. Returns ``None`` when no standalone qualifies
-    or the design / fit fails.
+    The reduced model's channel is :func:`comparison_channel`, chosen on the
+    train+val pool. The full and reduced (that channel) models are fit on the
+    whole dataset's per-entity channel design built at the CGI winning
+    aggregation params, so both are in-sample statistics, secondary to the
+    held-out paired test. Returns ``None`` when no standalone qualifies or the
+    design / fit fails.
 
     The channel names come from the design rather than from a fixed list: a
     two-channel study's design has two columns, and an index taken against the
@@ -1335,22 +1786,9 @@ def _compare_cgi_vs_standalone(
         return None
 
     chans = list(design["channel_names"])
-    higher_is_better = (
-        metric in _scoring.HIGHER_IS_BETTER or metric in _me.HIGHER_IS_BETTER
-    )
-    scored: list[tuple[str, float]] = []
-    for ch in chans:
-        b = standalones_bundle.get(ch)
-        if not b:
-            continue
-        ss = (b.get("subset_scores") or {}).get("all") or {}
-        ts = ss.get("score")
-        if ts is None or not np.isfinite(float(ts)):
-            continue
-        scored.append((ch, float(ts)))
-    if not scored:
+    best_ch, pool_scores = comparison_channel(standalones_bundle, chans, metric)
+    if best_ch is None:
         return None
-    best_ch = max(scored, key=lambda kv: kv[1] if higher_is_better else -kv[1])[0]
     best_idx = chans.index(best_ch)
 
     X = design["channels"]
@@ -1367,7 +1805,7 @@ def _compare_cgi_vs_standalone(
         # converge — taking the CGI-vs-standalone verdict down with it.
         panel_metric = metric in _me.MIXEDLM_METRICS
         if longitudinal and panel_metric and design.get("entity_id") is not None:
-            return _me.compare_models_aic_bic_mixedlm(
+            out = _me.compare_models_aic_bic_mixedlm(
                 target,
                 X,
                 chans,
@@ -1376,12 +1814,17 @@ def _compare_cgi_vs_standalone(
                 design["years_since_baseline"],
                 covariates=cov,
             )
-        return _scoring.compare_models_aic_bic(
-            target, X, chans, best_idx, covariates=cov
-        )
+        else:
+            out = _scoring.compare_models_aic_bic(
+                target, X, chans, best_idx, covariates=cov
+            )
     except Exception as exc:
         log("WARN", f"AIC/BIC comparison failed: {exc}")
         return None
+    out["in_sample"] = True
+    out["best_channel_selected_on"] = "train_val"
+    out["train_val_scores"] = pool_scores
+    return out
 
 
 def _jsonsafe_results(obj, _depth: int = 0):

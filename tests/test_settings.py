@@ -67,6 +67,21 @@ class EngineConstantTests(unittest.TestCase):
         self.assertEqual(settings.RADIUS_PRIORS, bayesian_index.RADIUS_PRIORS)
         self.assertEqual(settings.EXPOSURE_KERNELS, exposure.KERNELS)
         self.assertEqual(settings.CATEGORICAL_MISSING, fusion.CATEGORICAL_MISSING)
+        self.assertEqual(settings.SPATIAL_SPLIT_MODES, fusion.SPATIAL_SPLIT_MODES)
+        self.assertEqual(settings.SPATIAL_ADJUST_METHODS, fusion.SPATIAL_ADJUST_METHODS)
+        self.assertEqual(settings.SPATIAL_ADJUST_SELECTS, fusion.SPATIAL_ADJUST_SELECTS)
+        self.assertEqual(settings.SPATIAL_TUNE_METHODS, fusion.SPATIAL_TUNE_METHODS)
+        self.assertEqual(settings.SPATIAL_TUNE_SELECTS, fusion.SPATIAL_TUNE_SELECTS)
+        self.assertEqual(
+            settings.SPATIAL_SELECT_CONTROLS, fusion.SPATIAL_SELECT_CONTROLS
+        )
+        from geofuse.jobs import outer_splits
+
+        self.assertEqual(settings.OUTER_COMPARATORS, outer_splits.OUTER_COMPARATORS)
+        self.assertEqual(settings.OUTER_REPORTS, outer_splits.OUTER_REPORTS)
+        from geofuse import null_outcomes
+
+        self.assertEqual(settings.NULL_KINDS, null_outcomes.NULL_KINDS)
         from geofuse import pdcor
 
         self.assertEqual(settings.PDCOR_CACHE_N, pdcor.MAX_CACHE_N)

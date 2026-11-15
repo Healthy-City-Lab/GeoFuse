@@ -1,7 +1,6 @@
 """Sample a raster at vector features (points with optional buffer, polygons).
 
-Promoted out of the fusion engine's ``_apply_circular_buffer_aggregation`` so
-the NDVI engine — and any future consumer — can attach raster values to
+Lets the NDVI engine — and any other consumer — attach raster values to
 arbitrary input features without depending on fusion's internals.
 
 Output shape: the input GeoDataFrame plus one numeric column (default name

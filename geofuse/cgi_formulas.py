@@ -430,13 +430,16 @@ def _generic_weighted(chans: tuple[str, ...]):
     def compute(params: dict, components: ComponentDict) -> np.ndarray:
         raw = [np.asarray(components[c]) for c in chans]
         dt = np.result_type(*[a.dtype for a in raw], np.float32)
-        arrs = [standardised_channel(a, params, c, dt) for a, c in zip(raw, chans)]
+        arrs = [
+            standardised_channel(a, params, c, dt)
+            for a, c in zip(raw, chans, strict=True)
+        ]
         w = [float(params.get(_weight_key(c), 0)) for c in chans]
         total = sum(w)
         if total <= 0:
             return np.full_like(arrs[0], np.nan, dtype=dt)
         out = np.zeros_like(arrs[0], dtype=dt)
-        for wi, a in zip(w, arrs):
+        for wi, a in zip(w, arrs, strict=True):
             out = out + dt.type(wi / total) * a.astype(dt, copy=False)
         return out
 
@@ -453,7 +456,10 @@ def _generic_synergy(chans: tuple[str, ...]):
     def compute(params: dict, components: ComponentDict) -> np.ndarray:
         raw = [np.asarray(components[c]) for c in chans]
         dt = np.result_type(*[a.dtype for a in raw], np.float32)
-        arrs = [percentile_channel(a, params, c, dt) for a, c in zip(raw, chans)]
+        arrs = [
+            percentile_channel(a, params, c, dt)
+            for a, c in zip(raw, chans, strict=True)
+        ]
         wm = [float(params.get(f"w_{c}", 0)) for c in chans]
         wi = [float(params.get(k, 0)) for k in inter_keys]
         total = sum(wm) + sum(wi)
@@ -461,9 +467,9 @@ def _generic_synergy(chans: tuple[str, ...]):
             return np.full_like(arrs[0], np.nan, dtype=dt)
         inv = dt.type(1.0 / total)
         out = np.zeros_like(arrs[0], dtype=dt)
-        for w, c, a in zip(wm, chans, arrs):
+        for w, c, a in zip(wm, chans, arrs, strict=True):
             out = out + dt.type(w) * a ** float(params.get(f"{c}_power", 1.0))
-        for w, (i, j) in zip(wi, pairs):
+        for w, (i, j) in zip(wi, pairs, strict=True):
             out = out + dt.type(w) * arrs[i] * arrs[j]
         return inv * out
 

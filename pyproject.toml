@@ -16,7 +16,6 @@ dependencies = [
     "dcor",
     "earthengine-api",
     "filelock",
-    "fiona",
     "folium",
     "geopandas",
     "jax",
@@ -44,7 +43,6 @@ dependencies = [
     "textual",
     "torch",
     "torchvision",
-    "tqdm",
 ]
 
 [project.optional-dependencies]
@@ -77,7 +75,6 @@ extend-exclude = '''
   | \.venv
   | build
   | dist
-  | geofuse/dl_core
 )/
 '''
 
@@ -86,7 +83,6 @@ profile = "black"
 line_length = 88
 skip_gitignore = true
 known_first_party = ["geofuse"]
-skip = ["geofuse/dl_core"]
 
 [tool.ruff]
 line-length = 88
@@ -97,7 +93,6 @@ exclude = [
     "__pycache__",
     "build",
     "dist",
-    "geofuse/dl_core",
     "geofuse.egg-info",
 ]
 
@@ -106,7 +101,8 @@ select = [
     "E",    # pycodestyle errors
     "W",    # pycodestyle warnings
     "F",    # pyflakes
-    "I",    # isort
+    # No "I": import order belongs to isort ([tool.isort]), whose black
+    # profile groups `as` imports differently from Ruff's port of it.
     "B",    # flake8-bugbear
     "C4",   # flake8-comprehensions
     "UP",   # pyupgrade

@@ -83,7 +83,7 @@ class PanoCache:
         self._mem_loaded = False
 
     # ────────────────────────────────────────────────────────────
-    # Preload — bulk-load every row into the overlay in one SELECT.
+    # Preload: bulk-load every row into the overlay in one SELECT
     # ────────────────────────────────────────────────────────────
 
     def preload(self) -> int:

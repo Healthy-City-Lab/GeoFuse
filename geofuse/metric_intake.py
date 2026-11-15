@@ -110,14 +110,11 @@ class LongitudinalMetricSources:
         self._open: dict[tuple[str, str], Any] = {}
         self._identity_cache: dict[str, str] = {}
 
-    # ------------------------------------------------------------------ info
+    # ── Info ────────────────────────────────────────────────────
 
     @property
     def channels(self) -> list[str]:
         return list(self._paths)
-
-    def keys_for(self, channel: str) -> list[str]:
-        return list(self._paths.get(channel, {}))
 
     def has_channel(self, channel: str) -> bool:
         return channel in self._paths
@@ -144,7 +141,7 @@ class LongitudinalMetricSources:
             self._identity_cache[path] = cached
         return cached
 
-    # ------------------------------------------------------------- retrieval
+    # ── Retrieval ───────────────────────────────────────────────
 
     def get(self, channel: str, key: str) -> Any:
         """The source for ``(channel, key)``, loading it if not already held."""
@@ -162,7 +159,7 @@ class LongitudinalMetricSources:
         """Sources for one temporal key across *channels*."""
         return {ch: self.get(ch, key) for ch in channels}
 
-    # --------------------------------------------------------------- release
+    # ── Release ─────────────────────────────────────────────────
 
     def release(self) -> None:
         """Drop every source currently held, closing raster file handles.

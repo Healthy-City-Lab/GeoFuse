@@ -149,11 +149,12 @@ RESIDUALIZE_IGNORED: frozenset[str] = frozenset(
     {"partial_distance_corr", "mutual_info", "quartile_contrast"}
 )
 
-# Spatial-confounding adjustment methods. ``none`` reproduces the plain
-# covariate-residualized score. ``ks_aic`` (Keller & Szpiro) and ``spatial_plus``
-# (df-Spatial+) fold a coordinate smooth into the residualization — see
-# :func:`score` and :mod:`geofuse.spatial_basis`.
-SPATIAL_METHODS: frozenset[str] = frozenset({"none", "ks_aic", "spatial_plus"})
+# Spatial-confounding adjustment of a score. ``none`` reproduces the plain
+# covariate-residualized score; ``basis`` folds an unpenalized coordinate basis
+# into the residualization on both sides — see :func:`score` and
+# :mod:`geofuse.spatial_basis`. How the basis size was chosen does not change
+# how a score uses it.
+SPATIAL_METHODS: frozenset[str] = frozenset({"none", "basis"})
 
 # Worst score returned when the inputs are degenerate (all-NaN, constant, < 3
 # rows).
@@ -198,10 +199,11 @@ def _residualize(y: np.ndarray, X: np.ndarray | None) -> np.ndarray:
     return y - Xc @ beta
 
 
-# Columns with at most this many distinct values are treated as discrete
-# (dummies / ordinal codes) and left un-splined.
-_SPLINE_MIN_UNIQUE: int = 7
-_SPLINE_DF: int = 4
+#: Columns with fewer distinct values than this are treated as discrete
+#: (dummies / ordinal codes) and left un-splined.
+SPLINE_MIN_UNIQUE: int = 7
+#: Natural-cubic-spline df of each continuous covariate under ``spline``.
+SPLINE_DF: int = 4
 
 # Bases held per scored subset, and the lock that keeps the trim safe while
 # trials run in parallel.
@@ -210,15 +212,21 @@ _SPLINE_CACHE_LOCK = threading.Lock()
 
 
 def _expand_covariate_basis(
-    X: np.ndarray | None, method: str, cache: dict | None = None
+    X: np.ndarray | None,
+    method: str,
+    cache: dict | None = None,
+    *,
+    spline_df: int = SPLINE_DF,
+    spline_min_unique: int = SPLINE_MIN_UNIQUE,
 ) -> np.ndarray | None:
     """Optionally expand continuous covariate columns into a spline basis.
 
     ``method="linear"`` (or a degenerate input) returns ``X`` unchanged. With
-    ``method="spline"`` each near-continuous column is replaced by a
-    natural-cubic-spline basis so the later OLS residualization removes
-    nonlinear covariate effects; discrete columns (dummies, coarse codes) pass
-    through as-is. Falls back to the raw column on any expansion error.
+    ``method="spline"`` each column with at least ``spline_min_unique``
+    distinct values is replaced by a ``spline_df``-column natural-cubic-spline
+    basis so the later OLS residualization removes nonlinear covariate effects;
+    discrete columns (dummies, coarse codes) pass through as-is. Falls back to
+    the raw column on any expansion error.
 
     ``cache`` (optional dict) memoizes the expanded basis on a content
     fingerprint of ``X`` — per Optuna trial the covariate matrix is fixed per
@@ -232,7 +240,7 @@ def _expand_covariate_basis(
         # same values in a different order must not hit another subset's basis.
         _x = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
         _h = hashlib.blake2b(digest_size=16)
-        _h.update(repr(_x.shape).encode())
+        _h.update(repr((_x.shape, int(spline_df), int(spline_min_unique))).encode())
         _h.update(_x.tobytes())
         cache_key = _h.digest()
         hit = cache.get(cache_key)
@@ -245,14 +253,14 @@ def _expand_covariate_basis(
     cols: list[np.ndarray] = []
     for j in range(X.shape[1]):
         col = X[:, j]
-        if np.unique(col[np.isfinite(col)]).size < _SPLINE_MIN_UNIQUE:
+        if np.unique(col[np.isfinite(col)]).size < int(spline_min_unique):
             cols.append(col.reshape(-1, 1))
             continue
         try:
             basis = np.asarray(
                 dmatrix(
                     "cr(x, df=df) - 1",
-                    {"x": col, "df": _SPLINE_DF},
+                    {"x": col, "df": int(spline_df)},
                     return_type="dataframe",
                 ),
                 dtype=np.float64,
@@ -287,16 +295,14 @@ def _spatial_designs(
     """Control designs to residualize the (target, cgi) sides on, per method.
 
     * ``none`` / no basis → both sides get the covariates.
-    * ``ks_aic`` → both sides get ``[covariates, spatial_basis]`` (symmetric
-      partial association of cgi in ``target ~ cgi + covariates + smooth``).
-    * ``spatial_plus`` → target gets ``[covariates, spatial_basis]``; cgi gets the
-      spatial smooth only (the exposure is residualized on the smooth).
+    * ``basis`` → both sides get ``[covariates, spatial_basis]``: the partial
+      association of cgi in ``target ~ cgi + covariates + smooth``
+      (Frisch–Waugh needs the full design on both sides), whichever model
+      selected the basis size.
     """
     if spatial_basis is None or method == "none":
         return cov, cov
     both = _stack(cov, spatial_basis)
-    if method == "spatial_plus":
-        return both, spatial_basis
     return both, both
 
 
@@ -328,6 +334,24 @@ def _ols_r2(y: np.ndarray, X: np.ndarray | None) -> float:
     beta, *_ = np.linalg.lstsq(Xc, y, rcond=None)
     yhat = Xc @ beta
     return 1.0 - float(((y - yhat) ** 2).sum()) / ss_tot
+
+
+def _r2_over_smooth(
+    t: np.ndarray, c: np.ndarray, cov: np.ndarray | None, sb: np.ndarray
+) -> float:
+    """Incremental R² of ``c`` over ``[1, cov, smooth]``, by one projection.
+
+    Frisch–Waugh: the drop in residual sum of squares when ``c`` joins the
+    controls is ``(r_tᵀ r_c)² / r_cᵀ r_c`` with ``r`` the residuals on the
+    controls, which :class:`resampling.BlockDesign` forms cluster by cluster
+    instead of two ``lstsq`` fits over every smooth column.
+    """
+    from .resampling import BlockDesign, incremental_r2, weighted_sst
+
+    W = np.ones((1, len(t)))
+    M = BlockDesign(len(t), cov, sb).cross(np.column_stack([t, c]), W)
+    s = float(incremental_r2(M, weighted_sst(t, W), weighted_sst(c, W))[0])
+    return 0.0 if np.isnan(s) else s
 
 
 def _minmax01(v: np.ndarray) -> np.ndarray:
@@ -447,6 +471,8 @@ def relationship_sign(
     spatial_basis: np.ndarray | None = None,
     spatial_method: str = "none",
     residualize_method: str = "linear",
+    spline_df: int = SPLINE_DF,
+    spline_min_unique: int = SPLINE_MIN_UNIQUE,
 ) -> int:
     """Sign (``+1`` / ``-1``) of the greenery↔outcome relationship.
 
@@ -474,6 +500,8 @@ def relationship_sign(
         cov_use = _expand_covariate_basis(
             np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])]),
             residualize_method,
+            spline_df=spline_df,
+            spline_min_unique=spline_min_unique,
         )
     else:
         cov_use = None
@@ -543,6 +571,8 @@ def score(
     residualize_method: str = "linear",
     pdcor_cache: dict | None = None,
     spline_cache: dict | None = None,
+    spline_df: int = SPLINE_DF,
+    spline_min_unique: int = SPLINE_MIN_UNIQUE,
 ) -> float | tuple[float, float]:
     """Score CGI's predictive power for ``target``, controlling for ``covariates``.
 
@@ -555,14 +585,16 @@ def score(
 
     ``spatial_basis`` is an optional already-df-selected coordinate smooth (the
     output of :func:`geofuse.spatial_basis.select_df_aic`). With ``spatial_method``
-    ``ks_aic`` it joins the covariates on both sides; with ``spatial_plus`` the
-    exposure is residualized on the smooth only. ``spatial_method="none"`` (or a
+    ``basis`` it joins the covariates on both sides, whichever model selected
+    its size. ``spatial_method="none"`` (or a
     missing basis) reproduces the plain covariate-residualized score. The smooth
     is ignored by ``mutual_info`` (like covariates).
 
     ``residualize_method`` (``"linear"`` / ``"spline"``) sets the covariate basis
-    for the residualizing metrics. ``partial_distance_corr`` conditions on the
-    controls intrinsically and ``mutual_info`` ignores them, so both ignore it.
+    for the residualizing metrics, with ``spline_df`` / ``spline_min_unique``
+    as in :func:`_expand_covariate_basis`. ``partial_distance_corr`` conditions
+    on the controls intrinsically and ``mutual_info`` ignores them, so both
+    ignore it.
 
     ``pdcor_cache`` / ``spline_cache`` are optional engine-owned caches for the
     inputs that stay constant across many calls on one scored subset: the
@@ -631,7 +663,10 @@ def score(
         # Covariate basis for the residualizing metrics (spline-expanded when
         # asked). Deliberately below the pdcor branch — that metric (and
         # mutual_info, whose cov is already None here) never consumes it.
-        cov_res = _expand_covariate_basis(cov, residualize_method, spline_cache)
+        spline = {"spline_df": spline_df, "spline_min_unique": spline_min_unique}
+        cov_res = _expand_covariate_basis(
+            cov, residualize_method, spline_cache, **spline
+        )
 
         if metric == "distance_corr":
             x_t, x_c = _spatial_designs(cov_res, sb, spatial_method)
@@ -650,6 +685,7 @@ def score(
                     np.column_stack([rankdata(cov[:, j]) for j in range(cov.shape[1])]),
                     residualize_method,
                     spline_cache,
+                    **spline,
                 )
             else:
                 cov_use = None
@@ -675,6 +711,9 @@ def score(
             # a large negative number that measures the scale gap and nothing
             # about the association. Both forms agree when the two happen to
             # share a scale; only this one is meaningful when they do not.
+            if sb is not None:
+                s = _r2_over_smooth(t, c, cov_res, sb)
+                return (s, 1.0) if return_pvalue else s
             ctrl = _stack(cov_res, sb)
             X_red = ctrl
             X_full = c.reshape(-1, 1) if ctrl is None else np.column_stack([ctrl, c])

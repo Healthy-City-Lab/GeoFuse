@@ -29,8 +29,12 @@ class Setting:
     """One setting: its type, default, allowed values and a one-line help.
 
     ``kind`` is ``bool``, ``int``, ``float``, ``choice``, ``multichoice``,
-    ``text`` or ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables
-    or ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
+    ``intlist`` (whole numbers within ``lo`` .. ``hi``, given as a list or as
+    comma-separated text, stored sorted without repeats, or in the order given
+    when ``ordered``), ``text``, ``floatmap`` (positive numbers by name, given
+    as a table or as ``"name=value, name=value"`` text, stored as a table) or
+    ``chains`` (NDVI aggregation chains: ``{name, steps}`` tables or
+    ``"name: op, op"`` lines, stored as tables). A ``None`` default marks
     an optional setting whose absence has a meaning of its own (given in
     ``help``). ``auto_zero`` marks a number whose 0 means "work it out" and is
     stored as ``None``, the way the tabs read a 0 in those fields. ``step``
@@ -44,6 +48,7 @@ class Setting:
     hi: float | None = None
     step: int | None = None
     auto_zero: bool = False
+    ordered: bool = False
     help: str = ""
 
     def check(self, key: str, value: Any) -> Any:
@@ -65,7 +70,7 @@ class Setting:
                 )
             return value
         if self.kind == "multichoice":
-            if not isinstance(value, list) or not value:
+            if not isinstance(value, list) or (not value and self.default != []):
                 raise SettingError(f"'{key}' must be a non-empty list.")
             bad = [v for v in value if v not in self.choices]
             if bad:
@@ -73,16 +78,65 @@ class Setting:
                     f"'{key}' may only contain {list(self.choices)}, not {bad}."
                 )
             return [c for c in self.choices if c in value]
+        if self.kind == "intlist":
+            return self._int_list(key, value)
         if self.kind == "text":
             if not isinstance(value, str):
                 raise SettingError(f"'{key}' must be text, not {value!r}.")
             return value
+        if self.kind == "floatmap":
+            return self._float_map(key, value)
         if self.kind == "chains":
             try:
                 return check_chains(value)
             except ChainError as exc:
                 raise SettingError(f"'{key}': {exc}") from None
         raise AssertionError(self.kind)
+
+    def _int_list(self, key: str, value: Any) -> list[int]:
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.replace(";", ",").split(",")]
+            try:
+                value = [int(p) for p in parts if p]
+            except ValueError:
+                raise SettingError(
+                    f"'{key}' must be whole numbers separated by commas, "
+                    f"not {value!r}."
+                ) from None
+        if not isinstance(value, list | tuple) or not value:
+            raise SettingError(f"'{key}' must be a non-empty list of whole numbers.")
+        whole = Setting("int", 0, lo=self.lo, hi=self.hi)
+        numbers = [whole._number(key, v) for v in value]
+        if self.ordered:
+            return list(dict.fromkeys(numbers))
+        return sorted(set(numbers))
+
+    def _float_map(self, key: str, value: Any) -> dict[str, float]:
+        if isinstance(value, str):
+            pairs = {}
+            for part in value.replace(";", ",").split(","):
+                if not part.strip():
+                    continue
+                name, sep, number = part.partition("=")
+                try:
+                    pairs[name.strip()] = float(number)
+                except ValueError:
+                    sep = ""
+                if not sep or not name.strip():
+                    raise SettingError(
+                        f"'{key}' must read name=value, name=value, not {value!r}."
+                    ) from None
+            value = pairs
+        if not isinstance(value, Mapping) or not value:
+            raise SettingError(f"'{key}' must be a table of names and numbers.")
+        positive = Setting("float", 0.0, lo=0.0, hi=self.hi)
+        out = {}
+        for name, number in value.items():
+            v = positive._number(f"{key}.{name}", number)
+            if v <= 0:
+                raise SettingError(f"'{key}.{name}' must be above 0, not {v}.")
+            out[str(name)] = v
+        return out
 
     def _number(self, key: str, value: Any) -> int | float | None:
         whole = self.kind == "int"
@@ -120,7 +174,7 @@ def _choice(default, choices, help: str = "") -> Setting:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Choice lists (each equals an engine constant; see the module docstring)
+# Choice lists (each equals an engine constant; see the docstring)
 # ────────────────────────────────────────────────────────────────────
 
 #: ``geofuse.ndvi.TEMPORAL_REDUCERS``.
@@ -175,8 +229,40 @@ BINARY_ONLY_METRICS = frozenset(
 ASSOCIATION_TARGETS = ("level", "decline_overall", "decline_average", "decline_change")
 #: How each trial's mixed-model variance components are estimated.
 SEARCH_SCORING_METHODS = ("mom_em3", "mom_em1", "mom", "exact")
-#: Spatial-confounding adjustments of the fusion objective.
-SPATIAL_ADJUST_METHODS = ("none", "ks_aic", "spatial_plus")
+#: ``geofuse.fusion.SPATIAL_ADJUST_METHODS``: no adjustment, an unpenalized
+#: thin-plate basis in the outcome model, or Spatial+ (penalized smooths).
+SPATIAL_ADJUST_METHODS = ("none", "basis", "spatial_plus")
+#: ``geofuse.fusion.SPATIAL_ADJUST_SELECTS``: how a ``basis`` adjustment sets
+#: its size; the first is the default.
+SPATIAL_ADJUST_SELECTS = ("df_outcome_ic", "df_exposure_ic", "fixed_scale", "scale_ic")
+#: ``geofuse.fusion.SPATIAL_TUNE_METHODS``.
+SPATIAL_TUNE_METHODS = ("basis", "spatial_plus_inputs")
+#: ``geofuse.fusion.SPATIAL_TUNE_SELECTS``.
+SPATIAL_TUNE_SELECTS = ("fixed_scale", "scale_ic")
+#: ``geofuse.spatial_plus.CRITERIA``.
+SPATIAL_PLUS_CRITERIA = ("gcv", "reml")
+#: ``geofuse.spatial_scale_selection.DEFAULT_SCALES_M``.
+SPATIAL_SELECT_SCALES_M = (50000, 30000, 20000, 15000, 10000, 7000, 5000, 4000, 3000)
+#: ``geofuse.fusion.SPATIAL_SELECT_CONTROLS``.
+SPATIAL_SELECT_CONTROLS = ("target", "own")
+#: Spellings of ``spatial_adjust_method`` from before the methods were named
+#: by what they compute; see :func:`spatial_method_pair`.
+LEGACY_SPATIAL_METHODS = ("ks_aic",)
+#: Settings that act only under the ``basis`` adjustment. A run file that sets
+#: one of them together with ``spatial_plus`` is refused, as ``spatial_plus``
+#: used to name a basis adjustment.
+BASIS_ONLY_SETTINGS = (
+    "spatial_adjust_df",
+    "spatial_adjust_max_df",
+    "spatial_adjust_scale_m",
+    "spatial_paired_smooth",
+)
+#: ``geofuse.spatial_basis.DEFAULT_DF_CANDIDATES``.
+SPATIAL_DF_CANDIDATES = (0, 1, 2, 3, 4, 6, 8, 11, 15, 20)
+#: ``geofuse.spatial_basis.CRITERIA``.
+SPATIAL_CRITERIA = ("aic", "bic")
+#: ``geofuse.fusion.SPATIAL_PAIRED_SMOOTHS``.
+SPATIAL_PAIRED_SMOOTHS = ("own", "cgi", "outcome", "max")
 #: ``geofuse.pdcor.MAX_CACHE_N``: above it ``partial_distance_corr`` leaves its
 #: shared-matrix fast path.
 PDCOR_CACHE_N = 6_000
@@ -187,6 +273,14 @@ PDCOR_BYTES_PER_N2 = 66 * 8
 QUADRATIC_METRICS = frozenset({"partial_distance_corr"})
 #: ``geofuse.fusion.CATEGORICAL_MISSING``.
 CATEGORICAL_MISSING = ("drop", "indicator")
+#: ``geofuse.fusion.SPATIAL_SPLIT_MODES``.
+SPATIAL_SPLIT_MODES = ("stripe", "random")
+#: ``geofuse.jobs.outer_splits.OUTER_COMPARATORS``.
+OUTER_COMPARATORS = ("primary", "all")
+#: ``geofuse.jobs.outer_splits.OUTER_REPORTS``.
+OUTER_REPORTS = ("full", "decision")
+#: ``geofuse.null_outcomes.NULL_KINDS``.
+NULL_KINDS = ("spatial", "free", "both")
 
 # ────────────────────────────────────────────────────────────────────
 # NDVI
@@ -309,9 +403,65 @@ FUSION: dict[str, Setting] = {
         False, "Run partial_distance_corr even where it may not fit in memory."
     ),
     "test_size": Setting("float", 0.25, lo=0.1, hi=0.5, help="Held-out test fraction."),
+    "split_seed": _int(42, 0, 2**31 - 1, "Seed of the held-out test split."),
+    "outer_splits": _int(
+        1, 1, 100, "Held-out splits, each tuned anew; seeds split_seed + k."
+    ),
+    "outer_comparators": _choice(
+        "primary", OUTER_COMPARATORS, "Comparators scored on every held-out split."
+    ),
+    "outer_report": _choice(
+        "full",
+        OUTER_REPORTS,
+        "What the later held-out splits report: every interval and p-value, or "
+        "only the estimates the across-split decisions read.",
+    ),
+    "outer_null_runs": _int(
+        0,
+        0,
+        10_000,
+        "Null outcomes run through the whole held-out decision rule; 0 = none.",
+    ),
+    "outer_null_kind": _choice(
+        "spatial",
+        NULL_KINDS,
+        "Null outcomes: spatially structured, freely permuted, or each.",
+    ),
+    "outer_null_group": Setting(
+        "text",
+        None,
+        help="Column whose area means the spatial null permutes; unset = the "
+        "smooth's spatial clusters.",
+    ),
+    "outer_null_stop_after": _int(
+        None,
+        1,
+        10_000,
+        "Sequential rule: decide after this many nulls; 0 = run all.",
+        auto_zero=True,
+    ),
+    "outer_null_stop_low": _int(
+        None, 0, 10_000, "Stop as not inflated at or below this many rejections."
+    ),
+    "outer_null_stop_high": _int(
+        None, 1, 10_000, "Stop as inflated at or above this many rejections."
+    ),
+    "outer_null_workers": _int(
+        None,
+        1,
+        256,
+        "Null outcomes run at once; 0 = up to 4, sized on cores and memory.",
+        auto_zero=True,
+    ),
     "n_bins": _int(5, 3, 10, "Quantile bins of the stratified split."),
     "residualize_method": _choice(
         "linear", ("linear", "spline"), "How covariates are partialled out."
+    ),
+    "residualize_spline_df": _int(
+        4, 3, 20, "Spline df of each continuous covariate (spline residualizing)."
+    ),
+    "residualize_spline_min_unique": _int(
+        7, 2, 1000, "Covariates with fewer distinct values enter linearly."
     ),
     "categorical_missing": _choice(
         "drop",
@@ -328,6 +478,25 @@ FUSION: dict[str, Setting] = {
         hi=10.0,
         auto_zero=True,
         help="Greenery increment of the per-IQR effect; 0 = from the composite.",
+    ),
+    "weight_column": Setting(
+        "text",
+        None,
+        help="Target column of sampling weights; the reports add weighted "
+        "estimates next to the unweighted ones.",
+    ),
+    "weight_search": _bool(
+        False,
+        "Also weight the search itself (a weighted likelihood); linear form only.",
+    ),
+    "fixed_iqr": Setting(
+        "floatmap",
+        None,
+        help="Per-IQR increment by exposure (cgi, a channel, a comparator), "
+        "e.g. ndvi=0.1; unset = each exposure's train+val IQR.",
+    ),
+    "exposure_response_spline_df": _int(
+        4, 3, 20, "Spline df of the exposure-response curve and linearity test."
     ),
     "multi_objective_requested": _bool(False, "Several outcomes as one joint run."),
     # ── Discovery ───────────────────────────────────────────────
@@ -360,8 +529,26 @@ FUSION: dict[str, Setting] = {
     "posterior_draws": _int(800, 100, 4000, "Posterior draws per chain."),
     "posterior_warmup": _int(None, 100, 4000, "Warm-up draws; none = as many."),
     "posterior_chains": _int(4, 1, 8, "Posterior chains."),
+    "synergy_warm_start": _bool(
+        True, "Start a synergy posterior from a short linear fit."
+    ),
+    "outer_warm_start": _bool(
+        True, "Start each later held-out split's posteriors from the previous fit."
+    ),
+    "outer_posterior_draws": _int(
+        None, 100, 4000, "Posterior draws of the later held-out splits; none = all."
+    ),
+    "outer_posterior_warmup": _int(
+        None, 100, 4000, "Their warm-up draws; none = as many as their draws."
+    ),
+    "outer_posterior_chains": _int(
+        None, 1, 8, "Their posterior chains; none = as the first split."
+    ),
     "negative_control_retune": _bool(
         False, "Also re-tune on each negative control and compare."
+    ),
+    "specificity_contrast": _bool(
+        False, "Paired test: is the CGI more specific than each other exposure."
     ),
     "report_ci_bootstrap": _int(
         None, 100, 100000, "Test-CI bootstrap; none = 2,000 or 10,000 by metric."
@@ -392,12 +579,127 @@ FUSION: dict[str, Setting] = {
     "spatial_block_size_m": Setting(
         "float", None, lo=0.0, auto_zero=True, help="Block edge (m); 0 = automatic."
     ),
-    "spatial_adjust_method": _choice(
-        "none", SPATIAL_ADJUST_METHODS, "Spatial-confounding adjustment."
+    "spatial_split_mode": _choice(
+        "stripe", SPATIAL_SPLIT_MODES, "Test blocks: evenly striped, or at random."
     ),
-    "spatial_adjust_max_df": _int(10, 1, 50, "Largest spatial df per cluster."),
+    "spatial_adjust_method": _choice(
+        "none",
+        SPATIAL_ADJUST_METHODS,
+        "Spatial-confounding adjustment of the reported effects: an unpenalized "
+        "thin-plate basis in the outcome model, or Spatial+ (penalized smooths).",
+    ),
+    "spatial_adjust_select": _choice(
+        SPATIAL_ADJUST_SELECTS[0],
+        SPATIAL_ADJUST_SELECTS,
+        "How the basis size is set: df by AIC/BIC of the outcome model without "
+        "the exposure, df by AIC/BIC of the exposure model, a fixed pattern "
+        "scale, or the scale by AIC/BIC of the outcome model.",
+    ),
+    "spatial_tune_method": _choice(
+        SPATIAL_TUNE_METHODS[0],
+        SPATIAL_TUNE_METHODS,
+        "Tuning within areas: the basis at spatial_tune_scale_m joins the "
+        "search's covariates, or every search input is residualized on its own "
+        "penalized smooth (Spatial+ step 1).",
+    ),
+    "spatial_tune_select": _choice(
+        SPATIAL_TUNE_SELECTS[0],
+        SPATIAL_TUNE_SELECTS,
+        "Tuning scale: spatial_tune_scale_m, or chosen per split by AIC/BIC of "
+        "the outcome model.",
+    ),
+    "spatial_plus_groups_column": Setting(
+        "text",
+        None,
+        help="Target column whose values are the Spatial+ groups (a site); unset "
+        "= gap clusters.",
+    ),
+    "spatial_plus_k": _int(
+        300, 10, 2000, "Spatial+ basis size per group (knots); at most n − 4."
+    ),
+    "spatial_plus_criterion": _choice(
+        "gcv", SPATIAL_PLUS_CRITERIA, "Criterion that picks the Spatial+ penalties."
+    ),
+    "spatial_plus_checks": Setting(
+        "multichoice",
+        [],
+        SPATIAL_PLUS_CRITERIA,
+        help="Criteria also run as checks; their rows are marked check.",
+    ),
+    "spatial_plus_step1_covariates": _bool(
+        False, "Spatial+ step 1 adjusts the exposure for the covariates too."
+    ),
+    "spatial_select_scales_m": Setting(
+        "intlist",
+        list(SPATIAL_SELECT_SCALES_M),
+        lo=100,
+        hi=1_000_000,
+        ordered=True,
+        help="Candidate pattern scales (m) of the scale selection, besides no "
+        "smooth.",
+    ),
+    "spatial_select_criterion": _choice(
+        "bic", SPATIAL_CRITERIA, "Criterion of the scale selection."
+    ),
+    "spatial_select_controls": _choice(
+        "target",
+        SPATIAL_SELECT_CONTROLS,
+        "Negative controls use the target's selected scale, or select their own.",
+    ),
+    "spatial_adjust_df": Setting(
+        "intlist",
+        list(SPATIAL_DF_CANDIDATES),
+        lo=0,
+        hi=50,
+        help="Spatial df per cluster the criterion compares (0 = linear trends).",
+    ),
+    "spatial_adjust_max_df": _int(
+        None,
+        1,
+        50,
+        "Older form of spatial_adjust_df: compare every df 0..N; 0 = unset.",
+        auto_zero=True,
+    ),
+    "spatial_adjust_criterion": _choice(
+        "aic", SPATIAL_CRITERIA, "Criterion that picks the spatial df."
+    ),
     "spatial_adjust_eps_m": Setting(
         "float", None, lo=0.0, auto_zero=True, help="Cluster gap (m); 0 = automatic."
+    ),
+    "spatial_adjust_neighbours": _int(
+        10, 1, 100, "Neighbours that link points into one cluster (gap automatic)."
+    ),
+    "spatial_adjust_knots_min": _int(35, 3, 2000, "Fewest knots per cluster."),
+    "spatial_adjust_knots_max": _int(150, 3, 2000, "Most knots per cluster."),
+    "spatial_paired_smooth": _choice(
+        "own",
+        SPATIAL_PAIRED_SMOOTHS,
+        "Paired tests when the exposure model picks the df: each exposure's "
+        "own basis, the CGI's, the outcome's, or the larger df.",
+    ),
+    "spatial_adjust_scale_m": Setting(
+        "intlist",
+        None,
+        lo=100,
+        hi=1_000_000,
+        ordered=True,
+        help="Smooth by pattern scale (m) instead of df; the first is primary, "
+        "the others are reported for the slopes. Unset = df.",
+    ),
+    "spatial_adjust_min_component": _int(
+        None,
+        1,
+        10_000,
+        "Smaller clusters join their nearest larger one; 0 = 30 with a scale, "
+        "none with df.",
+        auto_zero=True,
+    ),
+    "spatial_tune_scale_m": _int(
+        None,
+        100,
+        1_000_000,
+        "Tune within areas of this size (m): the basis at this scale joins "
+        "the search's covariates. Unset = tune on all variation.",
     ),
     # ── Longitudinal (mixed-effects) ────────────────────────────
     "association_target": _choice(
@@ -485,11 +787,172 @@ def check(engine: str, values: Mapping[str, Any]) -> dict[str, Any]:
     """
     schema = SCHEMAS[engine]
     out: dict[str, Any] = {}
-    for key, value in expand_shorthands(engine, values).items():
+    values = expand_shorthands(engine, values)
+    if engine == "fusion" and values.get("spatial_adjust_method") in (
+        LEGACY_SPATIAL_METHODS
+    ):
+        values["spatial_adjust_method"], values["spatial_adjust_select"] = (
+            spatial_method_pair(
+                values["spatial_adjust_method"],
+                None,
+                scales=values.get("spatial_adjust_scale_m"),
+                tune_scale=values.get("spatial_tune_scale_m"),
+            )
+        )
+    for key, value in values.items():
         if key not in schema:
             raise SettingError(f"Unknown {engine.upper()} setting '{key}'.")
         out[key] = schema[key].check(key, value)
     lo, hi = "season_start_month", "season_end_month"
     if engine == "ndvi" and lo in out and hi in out and out[lo] > out[hi]:
         raise SettingError(f"'{lo}' must be on or before '{hi}'.")
+    if engine == "fusion":
+        _check_spatial(out)
+        _check_outer_null(out)
+        _check_weights(out)
     return out
+
+
+def _check_weights(out: Mapping[str, Any]) -> None:
+    """Refuse a weighted search without weights or with the synergy form."""
+    if not out.get("weight_search"):
+        return
+    if "weight_column" in out and not out["weight_column"]:
+        raise SettingError("'weight_search' needs a 'weight_column'.")
+    if out.get("index_form", "linear") != "linear":
+        raise SettingError(
+            "'weight_search' fits the linear form only; set 'index_form' to "
+            "'linear'."
+        )
+
+
+def _check_outer_null(out: Mapping[str, Any]) -> None:
+    """Refuse null outcomes without repeated splits, and a sequential rule
+    that is incomplete or cannot decide."""
+    if out.get("outer_null_runs") and out.get("outer_splits", 2) < 2:
+        raise SettingError(
+            "'outer_null_runs' calibrates the decision across held-out splits; "
+            "set 'outer_splits' to 2 or more."
+        )
+    after = out.get("outer_null_stop_after")
+    low, high = out.get("outer_null_stop_low"), out.get("outer_null_stop_high")
+    if (low is not None or high is not None) and not after:
+        raise SettingError(
+            "'outer_null_stop_low' / '_high' need 'outer_null_stop_after'."
+        )
+    if after and low is None and high is None:
+        raise SettingError(
+            "'outer_null_stop_after' needs 'outer_null_stop_low' or '_high'."
+        )
+    if low is not None and high is not None and low >= high:
+        raise SettingError("'outer_null_stop_low' must be below '_high'.")
+    if after and high is not None and high > after:
+        raise SettingError("'outer_null_stop_high' must not exceed '_after'.")
+
+
+def spatial_method_pair(
+    method: str | None,
+    select: str | None,
+    *,
+    scales: Any = None,
+    tune_scale: Any = None,
+) -> tuple[str, str | None]:
+    """``(spatial_adjust_method, spatial_adjust_select)`` with the older
+    spellings mapped to what they computed.
+
+    ``ks_aic`` was the basis whose df the outcome model picks
+    (``df_outcome_ic``). A ``spatial_plus`` recorded before the select
+    setting existed (``select`` is ``None``) was the basis whose df the
+    exposure model picks (``df_exposure_ic``; unpenalized, so equal to the
+    basis adjustment). Either one given a pattern scale (``scales`` or
+    ``tune_scale``) was the fixed-scale basis. A ``basis`` without a select
+    gets ``fixed_scale`` with a scale and ``df_outcome_ic`` without; the
+    select of ``none`` and ``spatial_plus`` is ``None``.
+    """
+    method = str(method or "none").lower()
+    scaled = bool(scales) or bool(tune_scale)
+    if method == "ks_aic" or (method == "spatial_plus" and select is None):
+        if scaled:
+            return "basis", "fixed_scale"
+        return "basis", ("df_outcome_ic" if method == "ks_aic" else "df_exposure_ic")
+    if method == "basis":
+        if select is None:
+            select = "fixed_scale" if scaled else SPATIAL_ADJUST_SELECTS[0]
+        return method, str(select)
+    return method, None
+
+
+def _check_spatial(out: Mapping[str, Any]) -> None:
+    """Refuse a df list given twice, knots that run backwards, a df the knots
+    cannot hold, a basis size rule that does not match the scale settings, and
+    tuning settings the method cannot serve."""
+    # A partial table (a preset, a test) is checked only on what it sets.
+    method = out.get("spatial_adjust_method")
+    select = out.get("spatial_adjust_select", SPATIAL_ADJUST_SELECTS[0])
+    if method == "basis":
+        scaled = bool(out.get("spatial_adjust_scale_m")) or bool(
+            out.get("spatial_tune_scale_m")
+        )
+        if select.startswith("df_") and out.get("spatial_adjust_scale_m"):
+            raise SettingError(
+                f"'spatial_adjust_scale_m' defines the basis by a scale; set "
+                f"'spatial_adjust_select' to 'fixed_scale', not {select!r}."
+            )
+        if select.startswith("df_") and out.get("spatial_tune_scale_m"):
+            raise SettingError(
+                "A run tuned within areas reports at a scale; set "
+                "'spatial_adjust_select' to 'fixed_scale' or 'scale_ic'."
+            )
+        if select == "fixed_scale" and not scaled:
+            raise SettingError(
+                "'spatial_adjust_select' 'fixed_scale' needs "
+                "'spatial_adjust_scale_m'."
+            )
+    tune_method = out.get("spatial_tune_method", SPATIAL_TUNE_METHODS[0])
+    tune_by_basis = tune_method == "basis" and (
+        bool(out.get("spatial_tune_scale_m"))
+        or out.get("spatial_tune_select") == "scale_ic"
+    )
+    if tune_by_basis and method not in (None, "basis"):
+        raise SettingError(
+            "Tuning within areas by a basis needs 'spatial_adjust_method' 'basis'."
+        )
+    if tune_method == "spatial_plus_inputs":
+        if method not in (None, "spatial_plus"):
+            raise SettingError(
+                "'spatial_tune_method' 'spatial_plus_inputs' needs "
+                "'spatial_adjust_method' 'spatial_plus'."
+            )
+        if out.get("index_form", "linear") not in ("linear",):
+            raise SettingError(
+                "'spatial_plus_inputs' tunes the linear form only (synergy terms "
+                "need positive inputs); set 'index_form' to 'linear'."
+            )
+    dfs = spatial_df_candidates(out)
+    lo, hi = "spatial_adjust_knots_min", "spatial_adjust_knots_max"
+    if lo in out and hi in out and out[lo] > out[hi]:
+        raise SettingError(f"'{lo}' must not exceed '{hi}'.")
+    if hi in out and max(dfs) > out[hi]:
+        raise SettingError(
+            f"The largest spatial df ({max(dfs)}) exceeds '{hi}' ({out[hi]}); a "
+            "cluster has at most that many radial functions."
+        )
+
+
+def spatial_df_candidates(values: Mapping[str, Any]) -> list[int]:
+    """The df list a fusion job compares: ``spatial_adjust_max_df`` N as
+    ``0 … N`` when given (the older form), else ``spatial_adjust_df``.
+
+    Raises :class:`SettingError` when both are set and the list is not its
+    default (a merged settings table cannot tell a default list from a given
+    one).
+    """
+    legacy = values.get("spatial_adjust_max_df")
+    listed = values.get("spatial_adjust_df")
+    if legacy is None:
+        return list(listed if listed is not None else SPATIAL_DF_CANDIDATES)
+    if listed is not None and list(listed) != list(SPATIAL_DF_CANDIDATES):
+        raise SettingError(
+            "Give 'spatial_adjust_df' or the older 'spatial_adjust_max_df', not both."
+        )
+    return list(range(0, int(legacy) + 1))

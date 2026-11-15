@@ -1,7 +1,5 @@
 import contextlib
-import importlib
 import os
-import sys
 import threading
 
 import numpy as np
@@ -12,6 +10,7 @@ import torch
 from PIL import Image
 from torchvision import transforms as T
 
+from . import segmentation_net
 from .logger import get_logger
 
 _log = get_logger("GVI")
@@ -46,14 +45,7 @@ def get_best_device(preferred_device=None):
         return torch.device("cpu")
 
 
-# ────────────────────────────────────────────────────────────────────
-# PATH CONFIGURATION
-# ────────────────────────────────────────────────────────────────────
 current_dir = os.path.dirname(os.path.abspath(__file__))
-dl_core_path = os.path.join(current_dir, "dl_core")
-
-if dl_core_path not in sys.path:
-    sys.path.append(dl_core_path)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -76,7 +68,6 @@ _MAX_GRAPHS = 4
 class DeepLabSegmenter:
     def __init__(
         self,
-        model_name=None,
         num_classes=19,
         ckpt_path=None,
         device="cuda",
@@ -85,7 +76,6 @@ class DeepLabSegmenter:
     ):
         """
         Args:
-            model_name (str): Optional. If None, it is auto-detected from weights.
             ckpt_path (str): Path to the .pth file.
             device (str): 'cuda', 'mps', or 'cpu'. Auto-selects best available if not valid.
             precision (str): 'fp16' or 'fp32' (see ``PRECISIONS``).
@@ -121,43 +111,12 @@ class DeepLabSegmenter:
         )
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
-        # 3. AUTO-DETECT BACKBONE
-        if model_name is None:
-            model_name = self._detect_backbone(state_dict)
-            _log("INFO", f"Auto-detected architecture: {model_name}")
-
-        # 4. Initialize Network Architecture
-        try:
-            network_module = importlib.import_module("network")
-            # Dynamically instantiate the class (e.g., deeplabv3plus_resnet101).
-            # The checkpoint holds the whole network, so the ImageNet backbone
-            # weights would only be downloaded to be overwritten.
-            self.model = network_module.modeling.__dict__[model_name](
-                num_classes=num_classes, output_stride=16, pretrained_backbone=False
-            )
-        except KeyError:
-            _log("ERROR", f"Model '{model_name}' is not defined in network.modeling.")
-            print(
-                "Available models usually include: deeplabv3plus_resnet101, deeplabv3plus_mobilenet"
-            )
-            raise
-        except Exception as e:
-            print(f"[FATAL] Could not load network module from: {dl_core_path}")
-            raise ImportError(f"DeepLab Import Failed: {e}") from e
-
-        # 5. Load Weights
-        try:
-            # strict=False tolerates benign extras (e.g. aux classifiers), but on
-            # its own it will also happily leave the network at its *random*
-            # initialisation if the checkpoint keys don't match the architecture
-            # — which silently produces plausible-looking garbage masks. So
-            # inspect what actually loaded and fail loudly on a real mismatch.
-            incompatible = self.model.load_state_dict(state_dict, strict=False)
-        except RuntimeError as e:
-            print(
-                "[FATAL] Weight Mismatch. You might need to specify num_classes manually."
-            )
-            raise e
+        # 3. Network: DeepLabV3+ on the ResNet the checkpoint was trained on.
+        # strict=False tolerates benign extras (an auxiliary classifier); a
+        # checkpoint for another architecture leaves weights missing, which
+        # is refused below rather than run at random initialisation.
+        self.model = segmentation_net.build(state_dict, num_classes=num_classes)
+        incompatible = self.model.load_state_dict(state_dict, strict=False)
 
         missing = list(incompatible.missing_keys)
         unexpected = list(incompatible.unexpected_keys)
@@ -178,7 +137,7 @@ class DeepLabSegmenter:
         # for this architecture; running on would emit meaningless segmentations.
         if len(missing) > 0.05 * max(n_expected, 1):
             raise RuntimeError(
-                f"Checkpoint does not match '{model_name}': {len(missing)} of "
+                f"Checkpoint does not match the network: {len(missing)} of "
                 f"{n_expected} weights missing. Refusing to run with a "
                 f"partially-random model."
             )
@@ -186,11 +145,7 @@ class DeepLabSegmenter:
         self.model.to(self.device)
         self.model.eval()
 
-        # TODO: MULTI_GPU_INFERENCE - Add DataParallel wrapper for multi-GPU batch inference
-        # if torch.cuda.device_count() > 1:
-        #     self.model = torch.nn.DataParallel(self.model)
-
-        # 6. Setup Transforms
+        # 4. Setup Transforms
         # No Resize here: callers normalise the panorama to one fixed size
         # first (``_SEGMENT_WIDTH`` in gvi.py).
         self.transform = T.Compose(
@@ -199,38 +154,6 @@ class DeepLabSegmenter:
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
-
-    def _detect_backbone(self, state_dict):
-        """
-        Analyzes weight shapes to distinguish ResNet101 vs MobileNet vs Xception.
-        """
-        # We look at the first convolution of the ASPP module (classifier)
-        # Key: classifier.aspp.convs.0.0.weight
-        # Shape: [256, INPUT_CHANNELS, 1, 1]
-
-        aspp_key = "classifier.aspp.convs.0.0.weight"
-
-        if aspp_key in state_dict:
-            input_channels = state_dict[aspp_key].shape[1]
-
-            if input_channels == 2048:
-                # 2048 channels = ResNet50/101 or Xception
-                # To distinguish, check for ResNet specific keys
-                if any("layer4" in k for k in state_dict.keys()):
-                    return "deeplabv3plus_resnet101"
-                else:
-                    return "deeplabv3plus_xception"
-
-            elif input_channels == 320:
-                # 320 channels = MobileNetV2
-                return "deeplabv3plus_mobilenet"
-
-            elif input_channels == 512:
-                return "deeplabv3plus_resnet18"  # Rare but possible
-
-        # Fallback default if detection fails
-        _log("WARN", "Could not auto-detect backbone. Defaulting to ResNet101.")
-        return "deeplabv3plus_resnet101"
 
     #: Cityscapes class indices this engine measures. Kept as named constants
     #: so the metric definition lives in one place instead of bare literals.

@@ -1,4 +1,4 @@
-"""Trials run in parallel for every metric, so scoring must be thread-safe.
+"""Scoring runs on several threads at once, so it must be thread-safe.
 
 Two engine-owned scoring caches used to make that unsafe: the partial-distance
 side cache and the spline-basis cache both evicted by walking their own
@@ -18,8 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import numpy as np  # noqa: E402
 
-from geofuse import mixed_effects_scoring, objective_scoring, pdcor  # noqa: E402
-from geofuse.fusion import MetricFusionEngine  # noqa: E402
+from geofuse import objective_scoring, pdcor  # noqa: E402
 
 
 def _subsets(n_subsets, n_rows, n_cov, seed=0):
@@ -140,48 +139,6 @@ class TestScoreIsConcurrencyInvariant(unittest.TestCase):
                     atol=0,
                     err_msg=metric,
                 )
-
-
-class TestSearchParallelismGate(unittest.TestCase):
-    """Every metric parallelises except the one where threading measured slower."""
-
-    def _engine(self, longitudinal, metric_workers=8):
-        engine = MetricFusionEngine.__new__(MetricFusionEngine)
-        # ``is_longitudinal`` is derived from the spec, so set the spec.
-        engine.longitudinal_spec = object() if longitudinal else None
-        engine._search_workers = metric_workers
-        engine.search_scoring_method = "mom_em3"
-        engine.spatial_adjust_method = "none"
-        return engine
-
-    def test_cross_sectional_metrics_all_parallelise(self):
-        engine = self._engine(False)
-        for metric in ("r2", "partial_distance_corr", "spearman", "nrmse"):
-            self.assertEqual(engine._search_n_jobs(metric), 8, metric)
-
-    def test_longitudinal_non_mixedlm_metrics_parallelise(self):
-        engine = self._engine(True)
-        for metric in ("r2", "partial_distance_corr", "spearman", "nrmse"):
-            self.assertEqual(engine._search_n_jobs(metric), 8, metric)
-
-    def test_fast_mixedlm_metrics_parallelise(self):
-        engine = self._engine(True)
-        for metric in sorted(mixed_effects_scoring.FAST_SEARCH_METRICS):
-            self.assertEqual(engine._search_n_jobs(metric), 8, metric)
-
-    def test_exact_mixedlm_refits_stay_sequential(self):
-        engine = self._engine(True)
-        exact = set(mixed_effects_scoring.MIXEDLM_METRICS) - set(
-            mixed_effects_scoring.FAST_SEARCH_METRICS
-        )
-        self.assertTrue(exact)
-        for metric in sorted(exact):
-            self.assertEqual(engine._search_n_jobs(metric), 1, metric)
-
-    def test_a_spatial_adjustment_no_longer_forces_sequential(self):
-        engine = self._engine(True)
-        engine.spatial_adjust_method = "ks_aic"
-        self.assertEqual(engine._search_n_jobs("r2"), 8)
 
 
 if __name__ == "__main__":

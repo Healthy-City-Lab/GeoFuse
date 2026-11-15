@@ -111,7 +111,7 @@ section[data-testid="stSidebar"] [data-testid="stProgress"] > div {
 	border-right: 1px solid rgba(49, 51, 63, 0.18);
 }
 
-/* --- Tab strip ------------------------------------------------------ */
+/* ── Tab strip ─────────────────────────────────────────────────── */
 /* The strip stays inside stTabs where React renders it and is pinned to the
    top of the content column, sharing the band with the toolbar's
    Deploy/overflow controls. Relocating the node into the toolbar detaches it
@@ -156,7 +156,7 @@ div[data-testid="stTabs"] {
 	padding-left: 0.9rem !important;
 }
 
-/* --- Sidebar toggle living inside the toolbar ----------------------- */
+/* ── Sidebar toggle living inside the toolbar ──────────────────── */
 /* The JS observer moves this element into stToolbar's left slot, just
    before the brand label. Until then it stays hidden so it can't briefly
    flash anywhere else on the page on initial render. The icon swaps

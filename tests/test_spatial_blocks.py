@@ -10,7 +10,10 @@ from the occupied extent. Pinned here:
 - one uniform region keeps exactly the blocks the bounding-box rule gave;
 - an explicit block size keeps its meaning;
 - a split whose blocks miss the asked test share, or are too few, says so and
-  records the blocking it used.
+  records the blocking it used;
+- the stripe lets a seed choose among only ~1 / test share test sets, while
+  randomly drawn blocks give another test set for nearly every seed, each close
+  to the asked share.
 """
 
 import os
@@ -84,6 +87,52 @@ class TestAutomaticBlockSize(unittest.TestCase):
         self.assertEqual((info["block_size_m"], info["rule"]), (5_000.0, "given"))
 
 
+class TestRandomTestBlocks(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        blocks, _info = assign_spatial_blocks(_clusters(), target_blocks=200)
+        cls.blocks = blocks
+        cls.ids, cls.sizes = np.unique(blocks, return_counts=True)
+
+    def _share(self, test) -> float:
+        return float(np.isin(self.blocks, list(test)).mean())
+
+    def test_the_stripe_offers_a_seed_only_a_few_test_sets(self):
+        sets = {
+            frozenset(
+                fusion_helpers.stripe_to_test_blocks(
+                    self.ids, 0.25, np.random.default_rng(seed)
+                )
+            )
+            for seed in range(10)
+        }
+        self.assertLessEqual(len(sets), 4)
+
+    def test_random_blocks_give_another_test_set_per_seed(self):
+        sets = []
+        for seed in range(10):
+            test = fusion_helpers.random_test_blocks(
+                self.ids, self.sizes, 0.25, np.random.default_rng(seed)
+            )
+            self.assertLess(abs(self._share(test) - 0.25), 0.05)
+            sets.append(frozenset(test))
+        self.assertGreaterEqual(len(set(sets)), 9)
+
+    def test_both_sides_keep_a_block(self):
+        rng = np.random.default_rng(0)
+        ids = np.array([3, 8])
+        self.assertEqual(
+            len(fusion_helpers.random_test_blocks(ids, [1, 1], 0.9, rng)), 1
+        )
+        self.assertEqual(
+            len(fusion_helpers.random_test_blocks(ids, [1, 1], 0.01, rng)), 1
+        )
+
+    def test_another_mode_is_refused(self):
+        with self.assertRaises(ValueError):
+            fusion.MetricFusionEngine.split_data(object(), spatial_split_mode="grid")
+
+
 class TestSplitReportsItsBlocks(unittest.TestCase):
     def test_too_few_blocks_are_reported_and_recorded(self):
         from test_fusion_run import _write_study
@@ -130,6 +179,7 @@ class TestSplitReportsItsBlocks(unittest.TestCase):
         self.assertAlmostEqual(report["test_share"], n_test / n_all)
         warnings = [c.args[1] for c in log.call_args_list if c.args[0] == "WARN"]
         self.assertTrue(any("occupied blocks" in m for m in warnings), warnings)
+        self.assertEqual((report["mode"], report["seed"]), ("stripe", 42))
 
 
 if __name__ == "__main__":

@@ -44,7 +44,6 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 
 # Mixed-effects scoring metric names. Kept here (not in the scorer module) so
@@ -73,9 +72,8 @@ CROSS_SECTIONAL_METRICS: tuple[str, ...] = (
     "mutual_info",
     "quartile_contrast",
     # Binary outcome, single measurement per entity: plain logistic regression.
-    # A year-keyed cross-sectional study with a dichotomous outcome is exactly
-    # the design of the published CLSA greenspace papers, so it has to be
-    # expressible without dragging in the panel machinery.
+    # A year-keyed cross-sectional study with a dichotomous outcome is a common
+    # cohort design, so it has to be expressible without the panel machinery.
     "logit_tstat",
     "logit_coef",
 )
@@ -641,22 +639,3 @@ def _project_columns(
     out = out.rename(columns={spec.entity_id_col: "entity_id"})
     out = gpd.GeoDataFrame(out, geometry="geometry", crs=frame.crs)
     return out
-
-
-def channel_files_per_entity(
-    spec: LongitudinalSpec, long_frame: gpd.GeoDataFrame, channel: str
-) -> np.ndarray:
-    """Return an array of length ``len(long_frame)`` giving each row's file path.
-
-    Used by the pre-aggregation cache's wave-aware fingerprinting: the file
-    assigned to ``(channel, row.wave)`` is the source for that row's
-    aggregation. The runner uses this to resolve which channel-fingerprint
-    each cache row belongs to.
-    """
-    if channel not in GREENERY_CHANNELS:
-        raise ValueError(
-            f"Unknown channel {channel!r}; expected one of {GREENERY_CHANNELS}."
-        )
-    per_wave = spec.greenery_files.get(channel, {})
-    waves = long_frame["wave"].astype(str).to_numpy()
-    return np.array([per_wave.get(w, "") for w in waves], dtype=object)

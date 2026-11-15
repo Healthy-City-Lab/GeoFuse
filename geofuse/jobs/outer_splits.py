@@ -1,0 +1,1341 @@
+"""Repeated held-out evaluation: the whole tuning redone on other test splits.
+
+One held-out split can decide a weak association: equally valid test sets give
+held-out scores several-fold apart. With ``outer_splits = K`` the fusion runner
+keeps its first split (seed ``split_seed``) and repeats split → tuning →
+held-out scoring for seeds ``split_seed + 1 … split_seed + K − 1``. Each split
+gets its own sweep and posterior (no reproducibility, gain or null loops: those
+stay on the first split), the comparison channel chosen on that split's
+train+val rows, the paired differences and the negative-control slopes.
+
+:func:`split_rows` turns one split's results into rows of
+``(quantity, exposure)``; :func:`summarise` reads the K rows of each quantity
+as a spread (median, 2.5 / 97.5 %, min / max), the share of splits where the
+per-split result holds, and a Nadeau–Bengio corrected resampled t
+(:func:`geofuse.statistical_testing.corrected_resampled_t`), since the splits
+share data and their p-values cannot be combined naively. The held-out score
+is unsigned for several objectives (``r2`` is an incremental R²), so it is
+summarised but not tested; the signed slope ``held_out_beta`` carries the
+across-split test of the association.
+
+With the specificity contrast on, every split also compares the CGI's
+specificity with the comparators it scores and its own comparison channel
+(:func:`specificity_rows`): rows carry a ``control`` column, are summarised per
+``(quantity, exposure, control)``, and ``specificity_difference`` is tested
+one-sided (ΔD > 0, the CGI more specific).
+
+Each split's CGI posterior is reported too (:func:`posterior_rows`): R50 and
+R90 per channel, the weight of every term, β and the chosen form. They are
+fitted on that split's train+val rows, so they are summarised as a spread,
+with the share of splits in which each term carries the largest weight, and
+not tested.
+
+With spatial adjustment on, every slope (the held-out β, the negative-control
+β, each exposure's β and ΔD) is adjusted for that split's spatial smooth, and
+its row carries ``spatial_method`` and the selected df (:func:`spatial_columns`).
+A smooth defined by a list of scales reports these slopes at every listed scale
+and unadjusted (:func:`scale_rows`), each row naming its ``spatial_scale_m``;
+the first scale's rows are the primary ones.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+
+# Quantities, in report order, and the alternative each is tested against.
+QUANTITIES: dict[str, str | None] = {
+    "held_out_score": None,
+    "held_out_beta": "two-sided",
+    "cgi_minus_channel": "greater",
+    "cgi_minus_comparator": "greater",
+    "negative_control_beta": "two-sided",
+    "negative_control_d": "greater",
+    "exposure_beta": "two-sided",
+    "exposure_negative_control_beta": "two-sided",
+    "specificity_difference": "greater",
+    "held_out_per_iqr": "two-sided",
+    "held_out_per_p5_p95": "two-sided",
+    "exposure_per_iqr": "two-sided",
+    "exposure_per_p5_p95": "two-sided",
+    "exposure_negative_control_per_iqr": "two-sided",
+    "exposure_negative_control_per_p5_p95": "two-sided",
+    "held_out_per_sd0": "two-sided",
+    "exposure_per_sd0": "two-sided",
+    "exposure_negative_control_per_sd0": "two-sided",
+    "posterior_beta": None,
+    "posterior_weight": None,
+    "posterior_r50": None,
+    "posterior_r90": None,
+}
+
+# Posterior quantities: summarised only, with no share holding.
+POSTERIOR_QUANTITIES = frozenset(q for q in QUANTITIES if q.startswith("posterior_"))
+
+OUTER_COMPARATORS = ("primary", "all")
+
+#: What each later split reports: ``full`` every per-split interval and
+#: p-value; ``decision`` only the point estimates the across-split decisions
+#: read (no bootstrap or permutation on the split).
+OUTER_REPORTS = ("full", "decision")
+
+
+_ALPHA = 0.05
+
+
+def finite_or_none(value) -> float | None:
+    """``float(value)`` when it is a finite number, else ``None`` (so a table
+    prints a blank, not "nan")."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) else None
+
+
+_f = finite_or_none
+
+
+def _slope_p(slope: dict) -> float | None:
+    """Two-sided p-value of a :func:`negative_controls.partial_slope` row."""
+    from scipy import stats
+
+    t, df = _f(slope.get("t")), _f(slope.get("df"))
+    if t is None or df is None or df <= 0:
+        return None
+    return float(2 * stats.t.sf(abs(t), df))
+
+
+def spatial_columns(record: dict | None) -> dict:
+    """A ``spatial_adjustment`` record as flat columns: ``spatial_method``,
+    one ``spatial_df…`` per smooth, as text (``"none"`` where no smooth was
+    used, so a table column never mixes numbers with blanks), and
+    ``spatial_at_cap``. The criterion profile (``ic``) stays in the results
+    bundle. Empty without a record."""
+    out = {}
+    for key, value in (record or {}).items():
+        if isinstance(value, dict | list):
+            continue
+        if key.startswith("df"):
+            value = "none" if value is None else str(value)
+        elif key == "scale_m":
+            value = scale_text(value)
+        out[f"spatial_{key}"] = value
+    # A selected scale's rows group together across splits; the scale each
+    # split chose is kept beside them.
+    if (record or {}).get("selected"):
+        out["spatial_selected_scale_m"] = scale_text(record.get("scale_m"))
+        out["spatial_scale_m"] = "selected"
+    return out
+
+
+def scale_text(scale: float | None) -> str:
+    """A pattern scale as table text: metres without a trailing ``.0``, and
+    ``"none"`` for the unadjusted rows."""
+    return "none" if scale is None else f"{float(scale):g}"
+
+
+def method_name(record: dict | None) -> str | None:
+    """The adjustment's short name: ``"basis fixed_scale"``, ``"spatial_plus
+    gcv"``; a record from before the methods were renamed keeps its own."""
+    if not record or not record.get("method"):
+        return None
+    method = str(record["method"])
+    detail = record.get("select") or record.get("criterion")
+    return f"{method} {detail}" if detail else method
+
+
+def method_label(record: dict | None) -> str | None:
+    """What the adjustment computed, with its reference
+    (:data:`geofuse.fusion.SPATIAL_LABELS`); the short name for a record
+    without one."""
+    from geofuse.fusion import SPATIAL_LABELS
+
+    if not record or not record.get("method"):
+        return None
+    if record["method"] == "basis" and record.get("select") in SPATIAL_LABELS:
+        return SPATIAL_LABELS[record["select"]]
+    return SPATIAL_LABELS.get(str(record["method"]), method_name(record))
+
+
+def spatial_label(record: dict | None) -> str | None:
+    """A ``spatial_adjustment`` record as text: ``"basis df_exposure_ic df
+    3"``, ``"basis df_outcome_ic df target 2, control none"``, ``"basis
+    fixed_scale at 5 km"``; ``None`` without a record."""
+    if not record:
+        return None
+    name = method_name(record)
+    if record.get("scale_m") is not None:
+        return f"{name} at {float(record['scale_m']) / 1000:g} km"
+    dfs = [
+        ("" if key == "df" else f"{key[3:]} ") + ("none" if v is None else str(v))
+        for key, v in record.items()
+        if key.startswith("df")
+    ]
+    return f"{name} df {', '.join(dfs)}"
+
+
+def _row(quantity: str, exposure: str, spatial: dict | None = None, **values) -> dict:
+    return {
+        "quantity": quantity,
+        "exposure": exposure,
+        "estimate": _f(values.get("estimate")),
+        "ci_low": _f(values.get("ci_low")),
+        "ci_high": _f(values.get("ci_high")),
+        "p_value": _f(values.get("p_value")),
+        **spatial_columns(spatial),
+    }
+
+
+def split_info(engine: Any) -> dict:
+    """Test rows, blocks and share of the engine's current split."""
+    key = "polygon_id"
+    test, pool = engine.test_data, engine.train_val_data
+    n_test = int(test[key].nunique()) if key in test.columns else int(len(test))
+    n_pool = int(pool[key].nunique()) if key in pool.columns else int(len(pool))
+    report = getattr(engine, "_spatial_split_report", None) or {}
+    return {
+        "n_test": n_test,
+        "n_train_val": n_pool,
+        "test_share": n_test / max(n_test + n_pool, 1),
+        "test_blocks": report.get("test_blocks"),
+    }
+
+
+def split_rows(
+    *,
+    effects_test: dict | None,
+    slope_test: dict | None,
+    channel_paired: dict | None,
+    comparator_paired: list[dict],
+    negative_controls: dict | None,
+    posterior: dict | None = None,
+    specificity: dict | None = None,
+    raw: dict | None = None,
+    raw_keep: "set[str] | None" = None,
+    weighted: dict | None = None,
+) -> list[dict]:
+    """One split's quantities as ``(quantity, exposure)`` rows.
+
+    ``effects_test`` is ``evaluate_effects(...)["test"]``, ``slope_test``
+    ``compute_partial_slopes(...)["test"]``, ``channel_paired`` the paired row
+    against the channel chosen on the split's train+val rows,
+    ``comparator_paired`` the paired rows of the comparators scored on every
+    split (:func:`scored_comparators`), ``negative_controls`` the
+    :meth:`compute_negative_controls` report, ``posterior`` the CGI's
+    ``_posterior_summary`` (:func:`posterior_rows`), ``specificity`` the
+    specificity-contrast report (:func:`specificity_rows`), ``raw`` the
+    raw-unit slopes of the exposures in ``raw_keep`` (:func:`raw_rows`),
+    ``weighted`` the weighted report of the same exposures
+    (:func:`weighted_rows`).
+    """
+    rows: list[dict] = []
+    if effects_test:
+        rows.append(
+            _row(
+                "held_out_score",
+                "cgi",
+                estimate=effects_test.get("score"),
+                ci_low=effects_test.get("lower"),
+                ci_high=effects_test.get("upper"),
+                p_value=effects_test.get("p_value"),
+            )
+        )
+    if slope_test:
+        rows.append(
+            _row(
+                "held_out_beta",
+                "cgi",
+                slope_test.get("spatial_adjustment"),
+                estimate=slope_test.get("beta"),
+                ci_low=slope_test.get("ci_low"),
+                ci_high=slope_test.get("ci_high"),
+                p_value=_slope_p(slope_test),
+            )
+        )
+    if channel_paired:
+        rows.append(
+            _row(
+                "cgi_minus_channel",
+                str(channel_paired.get("standalone_channel")),
+                channel_paired.get("spatial_adjustment"),
+                estimate=channel_paired.get("observed_diff"),
+                ci_low=channel_paired.get("lower"),
+                ci_high=channel_paired.get("upper"),
+                p_value=channel_paired.get("p_value"),
+            )
+        )
+    for r in comparator_paired:
+        rows.append(
+            _row(
+                "cgi_minus_comparator",
+                str(r.get("comparator")),
+                r.get("spatial_adjustment"),
+                estimate=r.get("observed_diff"),
+                ci_low=r.get("lower"),
+                ci_high=r.get("upper"),
+                p_value=r.get("p_value"),
+            )
+        )
+    test = ((negative_controls or {}).get("splits") or {}).get("test") or {}
+    for name, block in (test.get("controls") or {}).items():
+        rows.append(
+            _row(
+                "negative_control_beta",
+                str(name),
+                block.get("spatial_adjustment"),
+                estimate=block.get("beta"),
+                ci_low=block.get("ci_low"),
+                ci_high=block.get("ci_high"),
+                p_value=_slope_p(block),
+            )
+        )
+    rows += specificity_rows(specificity)
+    rows += raw_rows(raw, raw_keep)
+    rows += weighted_rows(weighted, raw_keep)
+    rows += posterior_rows(posterior)
+    return rows
+
+
+def scale_rows(
+    engine: Any,
+    params: dict,
+    scales: "list[float | None]",
+    *,
+    n_boot: int,
+    exposures: dict | None = None,
+    label: str = "",
+    raw_exposures: dict | None = None,
+    raw_keep: "set[str] | None" = None,
+    fixed_iqr: "dict[str, float] | None" = None,
+) -> list[dict]:
+    """The slope-type rows of the current split at other pattern scales.
+
+    For each of ``scales`` (``None`` = without a spatial smooth) the held-out
+    β, the negative-control β and, with ``exposures``, the specificity rows are
+    computed again inside :meth:`MetricFusionEngine.spatial_scale`, with the
+    same bootstrap budget, and tagged ``spatial_scale_m``. With
+    ``raw_exposures`` (``{name: (active channel, params)}``) the raw-unit rows
+    of :func:`raw_rows` are too, per IQR, per p5–p95 range and per SD0, so a
+    slope reads in one exposure unit along the ladder.
+    """
+    from .fusion_outputs import _specificity_report
+
+    rows: list[dict] = []
+    for scale in scales:
+        with engine.spatial_scale(scale):
+            slopes = engine.compute_partial_slopes(params)
+            controls = engine.compute_negative_controls(params, n_boot=int(n_boot))
+            raw = None
+            if raw_exposures is not None:
+                raw = engine.compute_raw_effects(
+                    params, raw_exposures, fixed_iqr=fixed_iqr
+                )
+            contrast = None
+            if exposures:
+                contrast = _specificity_report(
+                    engine,
+                    params,
+                    exposures,
+                    int(n_boot),
+                    label=label,
+                    log=lambda level, msg: None,
+                )
+        for r in split_rows(
+            effects_test=None,
+            slope_test=(slopes or {}).get("test"),
+            channel_paired=None,
+            comparator_paired=[],
+            negative_controls=controls,
+            specificity=contrast,
+            raw=raw,
+            raw_keep=raw_keep,
+        ):
+            r["spatial_scale_m"] = scale_text(scale)
+            rows.append(r)
+    return rows
+
+
+def spatial_plus_rows(
+    report: dict | None, keep: "set[str] | None" = None
+) -> list[dict]:
+    """A :meth:`MetricFusionEngine.compute_spatial_plus` report as split rows.
+
+    Every row carries ``spatial_method = "spatial_plus"``, its
+    ``spatial_criterion`` and ``spatial_check``. Slopes per SD0, per IQR and
+    per p5–p95 range: ``held_out_per_*`` for the CGI on the target,
+    ``exposure_per_*`` for every other exposure, and
+    ``exposure_negative_control_per_*`` per exposure and control. ``D`` of the
+    CGI is ``negative_control_d``; ``D_cgi − D_e`` is ``specificity_difference``
+    (with ``control`` and ``kind``); the CGI's ΔR² minus an exposure's on the
+    target is ``cgi_minus_channel`` or ``cgi_minus_comparator``. ``keep``
+    limits the exposures other than the CGI.
+    """
+    if not report or report.get("skipped"):
+        return []
+
+    def kept(name: str) -> bool:
+        return name == "cgi" or keep is None or name in keep
+
+    def tags(r: dict) -> dict:
+        return {
+            "spatial_method": "spatial_plus",
+            "spatial_criterion": r["criterion"],
+            "spatial_check": bool(r["check"]),
+        }
+
+    rows: list[dict] = []
+    for r in report.get("slopes") or []:
+        if not kept(r["exposure"]):
+            continue
+        for unit in ("per_sd0", "per_iqr", "per_p5_p95"):
+            value = r.get(unit)
+            if not value:
+                continue
+            if r["role"] == "target":
+                prefix = "held_out_" if r["exposure"] == "cgi" else "exposure_"
+                quantity = prefix + unit
+                extra = {} if r["exposure"] == "cgi" else {"kind": r["kind"]}
+            else:
+                quantity = f"exposure_negative_control_{unit}"
+                extra = {"control": r["outcome"], "kind": r["kind"]}
+            rows.append(
+                {
+                    "quantity": quantity,
+                    "exposure": str(r["exposure"]),
+                    "estimate": _f(value.get("estimate")),
+                    "ci_low": _f(value.get("ci_low")),
+                    "ci_high": _f(value.get("ci_high")),
+                    "p_value": _f(value.get("p_value")),
+                    **extra,
+                    **tags(r),
+                }
+            )
+    for key, quantity in (
+        ("d", "negative_control_d"),
+        ("delta_d", "specificity_difference"),
+    ):
+        for r in report.get(key) or []:
+            if key == "d" and r["exposure"] != "cgi":
+                continue
+            if not kept(r["exposure"]):
+                continue
+            rows.append(
+                {
+                    "quantity": quantity,
+                    "exposure": str(r["exposure"]),
+                    "estimate": _f(r.get("estimate")),
+                    "ci_low": _f(r.get("ci_low")),
+                    "ci_high": _f(r.get("ci_high")),
+                    "p_value": _f(r.get("p_value")),
+                    "control": r["control"],
+                    "kind": r["kind"],
+                    **tags(r),
+                }
+            )
+    for r in report.get("paired") or []:
+        if not kept(r["exposure"]):
+            continue
+        quantity = (
+            "cgi_minus_comparator" if r["kind"] == "comparator" else "cgi_minus_channel"
+        )
+        rows.append(
+            {
+                "quantity": quantity,
+                "exposure": str(r["exposure"]),
+                "estimate": _f(r.get("estimate")),
+                "ci_low": _f(r.get("ci_low")),
+                "ci_high": _f(r.get("ci_high")),
+                "p_value": _f(r.get("p_value")),
+                **tags(r),
+            }
+        )
+    return rows
+
+
+def spatial_plus_table(report: dict | None) -> list[dict]:
+    """``spatial_plus.csv``: one row per criterion, exposure, outcome and
+    group of every step-2 fit (its slope per SD0, interval and p, the group's
+    knots, λ and edf), then the step-1 fits (no outcome)."""
+    if not report or report.get("skipped"):
+        return []
+    slopes = {
+        (r["criterion"], r["exposure"], r["outcome"]): r
+        for r in report.get("slopes") or []
+    }
+    out = []
+    for g in report.get("groups") or []:
+        s = slopes.get((g["criterion"], g["exposure"], g["outcome"])) or {}
+        sd0 = s.get("per_sd0") or {}
+        out.append(
+            {
+                "criterion": g["criterion"],
+                "check": g["check"],
+                "step": g["step"],
+                "exposure": g["exposure"],
+                "outcome": g["outcome"],
+                "group": g["group"],
+                "n": g["n"],
+                "knots": g["knots"],
+                "lambda": g["lambda"],
+                "edf": g["edf"],
+                "criterion_value": g["criterion_value"],
+                "beta": s.get("estimate"),
+                "se_vp": s.get("se_vp"),
+                "se_ve": s.get("se_ve"),
+                "p_value": s.get("p_value"),
+                "per_sd0": sd0.get("estimate"),
+                "per_sd0_ci_low": sd0.get("ci_low"),
+                "per_sd0_ci_high": sd0.get("ci_high"),
+                "total_edf": s.get("edf"),
+            }
+        )
+    return out
+
+
+def raw_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
+    """One split's raw-unit slopes (:meth:`compute_raw_effects`) as rows.
+
+    The CGI's slope on the target per IQR and per p5–p95 range is
+    ``held_out_per_iqr`` / ``held_out_per_p5_p95``; every other exposure's is
+    ``exposure_per_iqr`` / ``exposure_per_p5_p95``; every exposure's slope on
+    each control (the CGI's too) is ``exposure_negative_control_per_iqr`` /
+    ``_per_p5_p95``, with the control named. A spatially adjusted run adds the
+    same three per SD0 (``…_per_sd0``, with ``sd0`` and ``outcome_sd``). Rows
+    carry ``control``, ``kind`` (``cgi``, ``channel``, ``comparator``),
+    ``scale`` (the exposure range the contrast is per) and ``n``. ``keep``
+    limits the exposures (the CGI is always kept).
+    """
+    if not report:
+        return []
+    rows: list[dict] = []
+    for name, block in (report.get("exposures") or {}).items():
+        if keep is not None and name != "cgi" and name not in keep:
+            continue
+        cgi = name == "cgi"
+        for contrast in ("per_iqr", "per_p5_p95", "per_sd0"):
+            target = (block.get("target") or {}).get(contrast)
+            if target is None and contrast == "per_sd0":
+                continue
+            target = target or {}
+            quantity = f"held_out_{contrast}" if cgi else f"exposure_{contrast}"
+            on_control = f"exposure_negative_control_{contrast}"
+            pairs = [(quantity, None, target)] + [
+                (on_control, control, c.get(contrast) or {})
+                for control, c in (block.get("controls") or {}).items()
+            ]
+            for q, control, r in pairs:
+                row = _row(
+                    q,
+                    name,
+                    r.get("spatial_adjustment"),
+                    estimate=r.get("estimate"),
+                    ci_low=r.get("ci_low"),
+                    ci_high=r.get("ci_high"),
+                    p_value=_slope_p(r),
+                )
+                row["control"] = control
+                row["kind"] = block.get("kind")
+                row["scale"] = _f(r.get("scale"))
+                row["n"] = r.get("n")
+                if contrast == "per_sd0":
+                    row["sd0"] = _f(r.get("sd0"))
+                    row["outcome_sd"] = _f(r.get("outcome_sd"))
+                rows.append(row)
+    return rows
+
+
+def _weighted_row(
+    quantity: str,
+    exposure: str,
+    res: dict | None,
+    *,
+    control: str | None = None,
+    kind: str | None = None,
+    est: str = "beta",
+    lo: str = "ci_low",
+    hi: str = "ci_high",
+    p: float | None = None,
+    scale: float | None = None,
+) -> dict:
+    """One weighted estimate as a split row, ``weighting = "weighted"``."""
+    res = res or {}
+    row = _row(
+        quantity,
+        exposure,
+        res.get("spatial_adjustment"),
+        estimate=res.get(est),
+        ci_low=res.get(lo),
+        ci_high=res.get(hi),
+        p_value=p,
+    )
+    row.update(
+        control=control,
+        kind=kind,
+        weighting="weighted",
+        n=res.get("n"),
+        n_eff=_f(res.get("n_eff")),
+        n_dropped=res.get("n_dropped"),
+    )
+    if scale is not None:
+        row["scale"] = _f(scale)
+    return row
+
+
+def weighted_rows(report: dict | None, keep: "set[str] | None" = None) -> list[dict]:
+    """One split's weighted report (:meth:`compute_weighted_report`) as rows.
+
+    The same quantities as the unweighted rows, each tagged ``weighting =
+    "weighted"`` with its ``n``, Kish ``n_eff`` and ``n_dropped`` (rows left
+    out for a missing or non-positive weight): ``held_out_score`` (``r2``
+    only), ``held_out_beta``, ``negative_control_beta`` and
+    ``negative_control_d`` (``D = |β target| − |β control|``, tested
+    one-sided) per control, ``cgi_minus_channel`` / ``cgi_minus_comparator``,
+    the raw-unit rows of :func:`raw_rows`, and with the specificity contrast
+    ``exposure_beta``, ``exposure_negative_control_beta`` and
+    ``specificity_difference``. ``keep`` limits the other exposures.
+    """
+    if not report or report.get("skipped"):
+        return []
+    kinds = report.get("kinds") or {}
+    slopes = report.get("slopes") or {}
+    cgi = slopes.get("cgi") or {}
+    rows: list[dict] = []
+
+    def kept(name: str) -> bool:
+        return name == "cgi" or keep is None or name in keep
+
+    if report.get("score"):
+        rows.append(
+            _weighted_row("held_out_score", "cgi", report["score"], est="estimate")
+        )
+    if cgi.get("target"):
+        target = cgi["target"]
+        rows.append(_weighted_row("held_out_beta", "cgi", target, p=_slope_p(target)))
+    for control, res in (cgi.get("controls") or {}).items():
+        rows.append(
+            _weighted_row("negative_control_beta", control, res, p=_slope_p(res))
+        )
+    for control, res in (report.get("d") or {}).items():
+        rows.append(
+            _weighted_row(
+                "negative_control_d",
+                control,
+                res,
+                est="estimate",
+                p=res.get("p_value"),
+            )
+        )
+    for name, res in (report.get("paired") or {}).items():
+        if not kept(name):
+            continue
+        channel = res.get("kind") == "channel"
+        rows.append(
+            _weighted_row(
+                "cgi_minus_channel" if channel else "cgi_minus_comparator",
+                name,
+                res,
+                kind=res.get("kind"),
+                est="estimate",
+                p=res.get("p_value"),
+            )
+        )
+    for name, per_control in (report.get("delta_d") or {}).items():
+        if not kept(name):
+            continue
+        block = slopes.get(name) or {}
+        kind = kinds.get(name)
+        target = block.get("target") or {}
+        rows.append(
+            _weighted_row("exposure_beta", name, target, kind=kind, p=_slope_p(target))
+        )
+        for control, res in (block.get("controls") or {}).items():
+            rows.append(
+                _weighted_row(
+                    "exposure_negative_control_beta",
+                    name,
+                    res,
+                    control=control,
+                    kind=kind,
+                    p=_slope_p(res),
+                )
+            )
+        for control, res in per_control.items():
+            rows.append(
+                _weighted_row(
+                    "specificity_difference",
+                    name,
+                    res,
+                    control=control,
+                    kind=kind,
+                    est="estimate",
+                    p=res.get("p_value"),
+                )
+            )
+    for name, block in (report.get("raw") or {}).items():
+        if not kept(name):
+            continue
+        for contrast in ("per_iqr", "per_p5_p95"):
+            quantity = (
+                f"held_out_{contrast}" if name == "cgi" else f"exposure_{contrast}"
+            )
+            on_control = f"exposure_negative_control_{contrast}"
+            pairs = [(quantity, None, (block.get("target") or {}).get(contrast))] + [
+                (on_control, control, c.get(contrast))
+                for control, c in (block.get("controls") or {}).items()
+            ]
+            for q, control, res in pairs:
+                if not res:
+                    continue
+                rows.append(
+                    _weighted_row(
+                        q,
+                        name,
+                        res,
+                        control=control,
+                        kind=kinds.get(name),
+                        est="estimate",
+                        lo="estimate_ci_low",
+                        hi="estimate_ci_high",
+                        p=_slope_p(res),
+                        scale=res.get("scale"),
+                    )
+                )
+    return rows
+
+
+def raw_scales(report: dict | None) -> dict:
+    """The ranges each exposure's raw-unit rows are per, ``{name: {"per_iqr":
+    …, "per_p5_p95": …}}``, so the weighted rows use the same ones."""
+    out = {}
+    for name, block in ((report or {}).get("exposures") or {}).items():
+        target = block.get("target") or {}
+        out[name] = {
+            k: target[k]["scale"]
+            for k in ("per_iqr", "per_p5_p95")
+            if (target.get(k) or {}).get("scale") is not None
+        }
+    return out
+
+
+def distribution_rows(report: dict | None) -> list[dict]:
+    """One split's exposure distributions on its train+val rows: one row per
+    exposure (``scale_iqr`` the range its per-IQR rows are per, with
+    ``iqr_source``), and one per composite layer (``layer``) at the cell the
+    CGI reads."""
+    if not report:
+        return []
+    keys = ("median", "q25", "q75", "iqr", "p5", "p95", "n")
+    rows = []
+    for name, block in (report.get("exposures") or {}).items():
+        dist = block.get("distribution") or {}
+        per_iqr = (block.get("target") or {}).get("per_iqr") or {}
+        rows.append(
+            {
+                "exposure": name,
+                "layer": None,
+                "kind": block.get("kind"),
+                **{k: dist.get(k) for k in keys},
+                "scale_iqr": _f(per_iqr.get("scale")),
+                "iqr_source": block.get("iqr_source"),
+            }
+        )
+    for layer, dist in (report.get("layers") or {}).items():
+        rows.append(
+            {
+                "exposure": "cgi",
+                "layer": layer,
+                "kind": "layer",
+                **{k: dist.get(k) for k in keys},
+                "scale_iqr": None,
+                "iqr_source": None,
+            }
+        )
+    return rows
+
+
+def specificity_rows(report: dict | None) -> list[dict]:
+    """One split's specificity contrast as rows with a ``control`` column.
+
+    ``report`` comes from ``fusion_outputs._specificity_report``. Per exposure
+    e: ``exposure_beta`` (its held-out slope on the target, no control),
+    ``exposure_negative_control_beta`` per control (its slope on the control)
+    and ``specificity_difference`` per control (ΔD = D_cgi − D_e with its
+    bootstrap interval and one-sided p). Every row carries ``kind`` and
+    ``primary``.
+    """
+    if not report or report.get("skipped"):
+        return []
+    info = report.get("exposure_info") or {}
+    rows: list[dict] = []
+
+    def add(quantity: str, exposure: str, control: str | None, **values) -> None:
+        row = _row(quantity, exposure, **values)
+        row["control"] = control
+        meta = info.get(exposure) or {}
+        row["kind"], row["primary"] = meta.get("kind"), meta.get("primary")
+        rows.append(row)
+
+    for name, slopes in (report.get("slopes") or {}).items():
+        target = slopes.get("target") or {}
+        add(
+            "exposure_beta",
+            name,
+            None,
+            spatial=target.get("spatial_adjustment"),
+            estimate=target.get("beta"),
+            ci_low=target.get("ci_low"),
+            ci_high=target.get("ci_high"),
+            p_value=_slope_p(target),
+        )
+        for control, block in (slopes.get("controls") or {}).items():
+            add(
+                "exposure_negative_control_beta",
+                name,
+                control,
+                spatial=block.get("spatial_adjustment"),
+                estimate=block.get("beta"),
+                ci_low=block.get("ci_low"),
+                ci_high=block.get("ci_high"),
+                p_value=_slope_p(block),
+            )
+    for r in report.get("rows") or []:
+        add(
+            "specificity_difference",
+            str(r.get("exposure")),
+            r.get("control"),
+            spatial=r.get("spatial_adjustment"),
+            estimate=r.get("delta_d"),
+            ci_low=r.get("ci_low"),
+            ci_high=r.get("ci_high"),
+            p_value=r.get("p_value"),
+        )
+    return rows
+
+
+def posterior_rows(summary: dict | None) -> list[dict]:
+    """One split's CGI posterior as ``posterior_*`` rows.
+
+    ``summary`` is ``_posterior_summary(params)``. ``posterior_beta`` for the
+    composite, ``posterior_weight`` for every term (the synergy form's pair
+    terms included), ``posterior_r50`` / ``posterior_r90`` for every channel
+    with a radius grid: the posterior mean and credible interval under the
+    names ``discovery.csv`` uses, each row carrying the split's ``form`` and
+    how its posterior started (``warm_start``: the fit it started from,
+    ``linear pre-fit`` or ``none``; ``warmup``; ``warm_fallback``, why it was
+    refitted cold). A search tuned within areas adds ``tune_scale_m`` and
+    ``tune_clusters``, the smooth built on that split's pool.
+    """
+    if not summary:
+        return []
+
+    def at(key: str, i: int):
+        values = summary.get(key) or []
+        return values[i] if i < len(values) else None
+
+    names = summary.get("weight_labels") or summary.get("channels") or []
+    labels = [str(x) for x in names]
+    rows: list[dict] = []
+    if _f(summary.get("beta_mean")) is not None:
+        rows.append(
+            _row(
+                "posterior_beta",
+                "cgi",
+                estimate=summary.get("beta_mean"),
+                ci_low=summary.get("beta_ci_low"),
+                ci_high=summary.get("beta_ci_high"),
+            )
+        )
+    for i, name in enumerate(labels):
+        rows.append(
+            _row(
+                "posterior_weight",
+                name,
+                estimate=at("weight_mean", i),
+                ci_low=at("weight_ci_low", i),
+                ci_high=at("weight_ci_high", i),
+            )
+        )
+    n_grid = len(summary.get("radius_profile") or [])
+    for quantity, key in (("posterior_r50", "r50"), ("posterior_r90", "r90")):
+        for i, name in enumerate(labels[:n_grid]):
+            if _f(at(f"{key}_mean", i)) is None:
+                continue
+            rows.append(
+                _row(
+                    quantity,
+                    name,
+                    estimate=at(f"{key}_mean", i),
+                    ci_low=at(f"{key}_ci_low", i),
+                    ci_high=at(f"{key}_ci_high", i),
+                )
+            )
+    warm = summary.get("warm_start") or {}
+    tuning = summary.get("spatial_tuning") or {}
+    for r in rows:
+        r["form"] = summary.get("form")
+        if tuning.get("method") == "spatial_plus_inputs":
+            r["tune_method"] = "spatial_plus_inputs"
+            r["tune_clusters"] = tuning.get("clusters")
+        elif tuning:
+            r["tune_scale_m"] = scale_text(tuning.get("scale_m"))
+            r["tune_clusters"] = tuning.get("clusters")
+        if warm:
+            r["warm_start"] = warm.get("source")
+            r["warmup"] = warm.get("warmup")
+            r["warm_fallback"] = warm.get("fallback") or ""
+    return rows
+
+
+def _holds(row: dict) -> bool | None:
+    """Whether one split's result holds: its p-value below 5 %, else an
+    interval that excludes zero. ``None`` when it has neither."""
+    if row.get("p_value") is not None:
+        return row["p_value"] < _ALPHA
+    lo, hi = row.get("ci_low"), row.get("ci_high")
+    if lo is None or hi is None:
+        return None
+    return lo > 0 or hi < 0
+
+
+def summarise(
+    rows: list[dict], primary_scale: "float | str | None" = None
+) -> list[dict]:
+    """Per ``(quantity, exposure)``: spread, share holding, corrected t.
+
+    ``rows`` carry ``split`` and ``test_share`` next to the :func:`split_rows`
+    fields. The corrected t uses the mean realised test share. The primary
+    comparators form one Holm family on the corrected p-value, as on a single
+    split; the comparison channel is one test. Rows with a ``control`` (the
+    specificity contrast) are summarised per ``(quantity, exposure, control)``,
+    and the primary comparators' ``specificity_difference`` entries form one
+    Holm family per control. Posterior quantities get the spread only; each
+    term's weight entry adds ``share_largest`` (the share of splits in which
+    that term has the largest weight) and the β entry ``forms`` (how often
+    each form was chosen). Spatially adjusted slopes carry ``spatial_method``.
+    Rows of a scale ladder are summarised per ``spatial_scale_m`` too; only
+    ``primary_scale``'s rows enter the Holm families (``"selected"`` for the
+    rows of a scale chosen per split).
+    """
+    from geofuse.statistical_testing import corrected_resampled_t, holm_bonferroni
+
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        key = (
+            r["quantity"],
+            r["exposure"],
+            r.get("control"),
+            r.get("spatial_scale_m"),
+            r.get("weighting"),
+            r.get("spatial_criterion"),
+        )
+        groups.setdefault(key, []).append(r)
+    order = list(QUANTITIES)
+    if primary_scale is None or isinstance(primary_scale, str):
+        primary = primary_scale
+    else:
+        primary = scale_text(primary_scale)
+
+    def scale_order(text: str | None) -> tuple:
+        if text is None or text == primary:
+            return (0, 0.0)
+        return (2, 0.0) if text == "none" else (1, -float(text))
+
+    out: list[dict] = []
+    for (quantity, exposure, control, scale, weighting, criterion), group in sorted(
+        groups.items(),
+        key=lambda kv: (
+            order.index(kv[0][0]),
+            kv[0][1],
+            kv[0][2] or "",
+            scale_order(kv[0][3]),
+            kv[0][4] or "",
+            kv[0][5] or "",
+        ),
+    ):
+        est = np.array(
+            [r["estimate"] for r in group if r["estimate"] is not None], dtype=float
+        )
+        held = [
+            h
+            for h in (_holds(r) for r in group)
+            if h is not None and quantity not in POSTERIOR_QUANTITIES
+        ]
+        shares = [r["test_share"] for r in group if r.get("test_share") is not None]
+        entry = {
+            "quantity": quantity,
+            "exposure": exposure,
+            "n_splits": len(group),
+            "median": float(np.median(est)) if est.size else None,
+            "q025": float(np.quantile(est, 0.025)) if est.size else None,
+            "q975": float(np.quantile(est, 0.975)) if est.size else None,
+            "min": float(est.min()) if est.size else None,
+            "max": float(est.max()) if est.size else None,
+            "share_holds": float(np.mean(held)) if held else None,
+            "corrected_t": None,
+            "corrected_p": None,
+            "corrected_p_holm": None,
+            "alternative": QUANTITIES.get(quantity),
+            "primary": group[0].get("primary"),
+        }
+        if "control" in group[0]:
+            entry["control"] = control
+            entry["kind"] = group[0].get("kind")
+        if "spatial_method" in group[0]:
+            entry["spatial_method"] = group[0]["spatial_method"]
+        if scale is not None:
+            entry["spatial_scale_m"] = scale
+        if weighting is not None:
+            entry["weighting"] = weighting
+        if criterion is not None:
+            entry["spatial_criterion"] = criterion
+            entry["spatial_check"] = bool(group[0].get("spatial_check"))
+        if entry["alternative"] and shares:
+            test = corrected_resampled_t(
+                est, float(np.mean(shares)), alternative=entry["alternative"]
+            )
+            entry["corrected_t"], entry["corrected_p"] = test["t"], test["p_value"]
+        out.append(entry)
+    families = []
+    for weighting, criterion in dict.fromkeys(
+        (e.get("weighting"), e.get("spatial_criterion")) for e in out
+    ):
+        ranked = [
+            e
+            for e in out
+            if e.get("spatial_scale_m") in (None, primary)
+            and e.get("weighting") == weighting
+            and e.get("spatial_criterion") == criterion
+        ]
+        families.append(
+            [
+                e
+                for e in ranked
+                if e["quantity"] == "cgi_minus_comparator"
+                and e.get("primary") is not False
+            ]
+        )
+        controls = dict.fromkeys(e.get("control") for e in ranked if "control" in e)
+        for control in controls:
+            families.append(
+                [
+                    e
+                    for e in ranked
+                    if e["quantity"] == "specificity_difference"
+                    and e.get("control") == control
+                    and e.get("kind") == "comparator"
+                    and e.get("primary") is not False
+                ]
+            )
+    for family in families:
+        holm = holm_bonferroni([e["corrected_p"] for e in family])
+        for e, hp in zip(family, holm, strict=True):
+            e["corrected_p_holm"] = None if hp != hp else float(hp)
+    _posterior_shares(rows, out)
+    return out
+
+
+def _posterior_shares(rows: list[dict], summary: list[dict]) -> None:
+    """``share_largest`` on each weight entry and ``forms`` on the β entry."""
+    weights: dict = {}
+    forms: dict = {}
+    for r in rows:
+        if r["quantity"] not in POSTERIOR_QUANTITIES:
+            continue
+        forms[r.get("split")] = r.get("form")
+        if r["quantity"] == "posterior_weight" and r["estimate"] is not None:
+            weights.setdefault(r.get("split"), []).append(r)
+    top = [max(g, key=lambda r: r["estimate"])["exposure"] for g in weights.values()]
+    counts: dict = {}
+    for form in forms.values():
+        counts[form] = counts.get(form, 0) + 1
+    for e in summary:
+        if e["quantity"] == "posterior_weight":
+            e["share_largest"] = top.count(e["exposure"]) / len(top) if top else None
+        elif e["quantity"] == "posterior_beta" and forms:
+            e["forms"] = ", ".join(
+                f"{form} {n}/{len(forms)}"
+                for form, n in sorted(counts.items(), key=lambda kv: -kv[1])
+            )
+
+
+def describe_posterior(summary: list[dict]) -> str:
+    """The posterior entries of a :func:`summarise` result as one line:
+    β with the forms chosen, each term's weight with its share largest, and
+    R50 / R90 per channel, each as median [min, max]."""
+
+    def spread(e: dict, spec: str, unit: str = "") -> str:
+        return (
+            f"{format(e['median'], spec)}{unit} "
+            f"[{format(e['min'], spec)}, {format(e['max'], spec)}]"
+        )
+
+    parts: list[str] = []
+    for e in summary:
+        if e["quantity"] not in POSTERIOR_QUANTITIES or e.get("median") is None:
+            continue
+        if e["quantity"] == "posterior_beta":
+            text = f"β {spread(e, '+.4f')}"
+            parts.append(text + (f" (forms {e['forms']})" if e.get("forms") else ""))
+        elif e["quantity"] == "posterior_weight":
+            share = e.get("share_largest")
+            parts.append(
+                f"weight {e['exposure']} {spread(e, '.3f')}"
+                + (f", largest in {share:.0%}" if share is not None else "")
+            )
+        else:
+            name = "R50" if e["quantity"] == "posterior_r50" else "R90"
+            parts.append(f"{name} {e['exposure']} {spread(e, '.0f', ' m')}")
+    return "; ".join(parts)
+
+
+def scored_comparators(columns: list[str], primary: list[str], mode: str) -> list[str]:
+    """The comparators scored on every split: all of them with ``mode ==
+    "all"``, else the primary ones (all of them when none is named primary).
+    The first split keeps the full set in its own report."""
+    if mode == "all" or not primary:
+        return list(columns)
+    return [c for c in columns if c in set(primary)]
+
+
+def repeat(
+    engine: Any,
+    *,
+    k_splits: int,
+    split_seed: int,
+    split_kwargs: dict,
+    fit_kwargs: dict,
+    metric: str,
+    standalones: list[str],
+    comparators: list[str],
+    comparators_primary: list[str],
+    outer_comparators: str,
+    n_effects_boot: int,
+    n_perm: int,
+    n_paired: int,
+    log: Any,
+    progress: Any = None,
+    cancelled: Any = None,
+    specificity: bool = False,
+    ladder: "list[float | None] | None" = None,
+    report: str = "full",
+    first: int = 1,
+    fixed_iqr: dict | None = None,
+    distributions: "list[dict] | None" = None,
+    scale_profiles: "list[dict] | None" = None,
+    bandwidths: "list[dict] | None" = None,
+) -> list[dict]:
+    """Splits ``first … k_splits − 1`` (seeds ``split_seed + k``) as rows.
+
+    Each split re-splits the engine with ``split_kwargs``, fits the CGI and
+    every standalone with ``fit_kwargs`` (the reproducibility, gain and null
+    loops off), picks the comparison channel on the split's train+val rows and
+    scores the paired differences, the comparators of
+    :func:`scored_comparators` and the negative controls, and reports the
+    split's CGI posterior (:func:`posterior_rows`). With ``specificity`` the
+    CGI's specificity is contrasted with those comparators and the split's
+    comparison channel (:func:`specificity_rows`). The caller restores the
+    first split. ``progress(k)`` is called before each split;
+    ``cancelled()`` stops between steps. ``ladder`` lists the other pattern
+    scales (and ``None``) whose slopes :func:`scale_rows` adds on every split.
+
+    ``report="decision"`` keeps what the across-split decisions read: the
+    held-out score as a point estimate (no bootstrap interval or permutation
+    p), every slope with its exact interval, and the paired differences and
+    specificity contrasts as point estimates (no bootstrap). The estimates,
+    and so every corrected t, are the ``full`` report's.
+
+    Every split also reports the raw-unit slopes of the CGI, every standalone
+    and the scored comparators (:func:`raw_rows`, ``fixed_iqr`` as in
+    :meth:`compute_raw_effects`); their exposure distributions are appended to
+    ``distributions`` when given (:func:`distribution_rows`). A basis run's
+    scale profile of each split is appended to ``scale_profiles`` and, in the
+    full report, its effective bandwidths to ``bandwidths``.
+    """
+    from ..fusion import comparator_mode
+    from .fusion_outputs import (
+        _posterior_summary,
+        _specificity_report,
+        comparison_channel,
+        specificity_exposures,
+    )
+
+    if report not in OUTER_REPORTS:
+        raise ValueError(f"report must be one of {OUTER_REPORTS}; got {report!r}.")
+    decision = report == "decision"
+    if decision:
+        n_effects_boot = n_perm = n_paired = 0
+    loops = {"reps": 0, "shuffles": 0, "gain_splits": 0, "null_runs": 0}
+    rows: list[dict] = []
+    for k in range(int(first), int(k_splits)):
+        if cancelled is not None and cancelled():
+            break
+        if progress is not None:
+            progress(k)
+        seed = int(split_seed) + k
+        engine._active_greenery_channel = "cgi"
+        engine._fit_label = f"split {k}"
+        engine.split_data(random_state=seed, **split_kwargs)
+        info = split_info(engine)
+        if scale_profiles is not None:
+            for r in getattr(engine, "_scale_profile", None) or []:
+                scale_profiles.append({"split": k, "seed": seed, **r})
+        if bandwidths is not None and not decision:
+            for r in engine.effective_bandwidths(seed=seed):
+                bandwidths.append({"split": k, "seed": seed, **r})
+        params = engine.fit_bayesian_index(metric=metric, **fit_kwargs, **loops)
+        if decision:
+            held = engine._score_data_subset(
+                data=engine.test_data, params=params, metric=metric
+            )
+            effects = {"test": {"score": held.get("score")}}
+        else:
+            effects = engine.evaluate_effects(
+                params, metric, n_bootstrap=int(n_effects_boot), n_perm=int(n_perm)
+            )
+        slopes = engine.compute_partial_slopes(params)
+
+        channel_paired = None
+        best, fits = None, {}
+        if standalones:
+            fits, pool = {}, {}
+            for ch in standalones:
+                engine._active_greenery_channel = ch
+                fits[ch] = engine.fit_bayesian_index(
+                    metric=metric, **fit_kwargs, **loops
+                )
+                score = engine._score_data_subset(
+                    data=engine.train_val_data, params=fits[ch], metric=metric
+                )
+                pool[ch] = {"subset_scores": {"train": score}}
+            engine._active_greenery_channel = "cgi"
+            best, _ = comparison_channel(pool, list(standalones), metric)
+            if best is not None:
+                channel_paired = engine.paired_objective_difference(
+                    params, fits[best], best, metric, n_bootstrap=int(n_paired)
+                )
+
+        comparator_paired: list[dict] = []
+        names = scored_comparators(comparators, comparators_primary, outer_comparators)
+        if not engine.is_panel:
+            for name in names:
+                r = engine.paired_objective_difference(
+                    params,
+                    {"comparator": name},
+                    comparator_mode(name),
+                    metric,
+                    n_bootstrap=int(n_paired),
+                )
+                if r:
+                    r["comparator"] = name
+                    comparator_paired.append(r)
+        engine._active_greenery_channel = "cgi"
+        controls = engine.compute_negative_controls(params, n_boot=int(n_paired))
+        contrast, exposures = None, None
+        if specificity:
+            exposures = specificity_exposures(
+                [] if engine.is_panel else names,
+                comparators_primary,
+                best,
+                fits.get(best),
+            )
+            contrast = _specificity_report(
+                engine,
+                params,
+                exposures,
+                int(n_paired),
+                label=f"split {k + 1}",
+                log=lambda level, msg: log(level, msg) if level == "WARN" else None,
+            )
+
+        raw_exposures = {ch: (ch, fit) for ch, fit in fits.items()}
+        if not engine.is_panel:
+            for name in names:
+                raw_exposures[name] = (comparator_mode(name), {"comparator": name})
+        raw = engine.compute_raw_effects(params, raw_exposures, fixed_iqr=fixed_iqr)
+        weighted = None
+        if getattr(engine, "weight_column", None):
+            weighted = engine.compute_weighted_report(
+                params,
+                metric,
+                raw_exposures,
+                channel=best,
+                comparators=[] if engine.is_panel else names,
+                specificity=specificity,
+                scales=raw_scales(raw),
+                n_boot_score=int(n_effects_boot),
+                n_boot=int(n_paired),
+            )
+        if distributions is not None:
+            for r in distribution_rows(raw):
+                distributions.append({"split": k, "seed": seed, **r})
+
+        primary = set(comparators_primary or comparators)
+        for r in split_rows(
+            effects_test=(effects or {}).get("test"),
+            slope_test=(slopes or {}).get("test"),
+            channel_paired=channel_paired,
+            comparator_paired=comparator_paired,
+            negative_controls=controls,
+            posterior=_posterior_summary(params),
+            specificity=contrast,
+            raw=raw,
+            weighted=weighted,
+        ):
+            r.update(split=k, seed=seed, **info)
+            if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
+                r["primary"] = r["exposure"] in primary
+            rows.append(r)
+        if getattr(engine, "spatial_adjust_method", "none") == "spatial_plus":
+            plus = engine.compute_spatial_plus(
+                params,
+                raw_exposures,
+                n_boot=int(n_paired),
+                seed=seed,
+                fixed_iqr=fixed_iqr,
+            )
+            if bandwidths is not None:
+                for r in (plus or {}).get("effective_bandwidth") or []:
+                    bandwidths.append({"split": k, "seed": seed, **r})
+            for r in spatial_plus_rows(plus):
+                r.update(split=k, seed=seed, **info)
+                if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == (
+                    "comparator"
+                ):
+                    r["primary"] = r["exposure"] in primary
+                rows.append(r)
+        if ladder:
+            for r in scale_rows(
+                engine,
+                params,
+                ladder,
+                n_boot=int(n_paired),
+                exposures=exposures,
+                label=f"split {k + 1}",
+                raw_exposures=raw_exposures,
+                fixed_iqr=fixed_iqr,
+            ):
+                r.update(split=k, seed=seed, **info)
+                if r.get("kind") == "comparator":
+                    r["primary"] = r["exposure"] in primary
+                rows.append(r)
+        log(
+            "OK",
+            f"Held-out split {k + 1}/{int(k_splits)} (seed {seed}): "
+            f"{info['n_test']} test entities ({info['test_share']:.1%}"
+            + (
+                f", {info['test_blocks']} blocks"
+                if info.get("test_blocks") is not None
+                else ""
+            )
+            + ")"
+            + (
+                f", CGI − {channel_paired.get('standalone_channel')} "
+                f"Δ={channel_paired.get('observed_diff')}"
+                if channel_paired
+                else ""
+            )
+            + ".",
+        )
+    return rows

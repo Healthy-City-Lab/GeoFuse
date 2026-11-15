@@ -698,6 +698,14 @@ def run_fusion_child(
         # the runner imports anything that might cache a logger closure.
         route_engine_logging_to_queue(job_id, event_queue)
 
+        # numpy has read the job's BLAS thread count; the pools this job
+        # starts pin their workers to one thread rather than inherit it.
+        import numpy  # noqa: F401
+
+        from geofuse.parallel import release_job_threads
+
+        release_job_threads()
+
         # One CPU device per posterior chain, requested before anything in this
         # process starts JAX, so the chains run in parallel.
         from geofuse.bayesian_index import reserve_host_devices

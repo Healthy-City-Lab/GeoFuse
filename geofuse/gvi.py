@@ -8,9 +8,14 @@ import aiohttp
 import geopandas as gpd
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
-# --- CONFIGURATION ---
+from . import streetview as gsv
+from .logger import get_logger
+from .vision import DeepLabSegmenter, get_best_device
+
+# ────────────────────────────────────────────────────────────────────
+# Configuration
+# ────────────────────────────────────────────────────────────────────
 Image.MAX_IMAGE_PIXELS = None
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
 
@@ -74,10 +79,6 @@ CITYSCAPES_PALETTE = [
     11,
     32,
 ] + [0, 0, 0] * 237
-
-from . import streetview as gsv
-from .logger import get_logger
-from .vision import DeepLabSegmenter, get_best_device
 
 _log = get_logger("GVI")
 
@@ -190,7 +191,9 @@ _EMPTY_CACHE_EVERY_N = 200
 # find the padding edges, never to sample colour, so a coarse step is safe.
 _SCAN_STEP = 4
 
-# ── Adaptive rate-limit handling ────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────
+# Adaptive rate-limit handling
+# ────────────────────────────────────────────────────────────────────
 # Google's endpoints are unofficial and throttle by IP with no published quota,
 # so the safe design is to *detect* push-back and back off rather than guess a
 # fixed rate. Backoff grows exponentially per consecutive throttle event and
@@ -300,6 +303,10 @@ class AdaptiveThrottle:
                     f"Rate limit easing — spacing now {self._delay:.2f}s",
                 )
 
+
+# ────────────────────────────────────────────────────────────────────
+# GVI engine
+# ────────────────────────────────────────────────────────────────────
 
 #: Where panoramas come from: the keyless scraper, or Google's keyed tile API.
 DOWNLOAD_MODES = ("package", "api")
@@ -1331,17 +1338,8 @@ class GVIEngine:
                     f"Pano cache preload failed: {type(e).__name__}: {e}",
                 )
 
-        _progress_cb = progress_callback
-        _close_pbar = False
-        if _progress_cb is None:
-            _pbar = tqdm(total=len(points_to_process), desc="GVI Analysis")
-
-            def _progress_cb(curr, total, _p=_pbar):
-                _p.update(1)
-
-            _close_pbar = True
-        else:
-            _progress_cb(start_index, total_points)
+        if progress_callback is not None:
+            progress_callback(start_index, total_points)
 
         _log("INFO", f"Processing {len(points_to_process)} points...")
 
@@ -1355,7 +1353,7 @@ class GVIEngine:
                 save_panos=save_panos,
                 save_masks=save_masks,
                 pano_cache=pano_cache,
-                progress_callback=_progress_cb,
+                progress_callback=progress_callback,
                 result_callback=result_callback,
                 cancel_callback=cancel_callback,
                 target_year=target_year,
@@ -1374,8 +1372,5 @@ class GVIEngine:
                 ),
             )
         )
-
-        if _close_pbar:
-            _pbar.close()
 
         return gpd.GeoDataFrame()

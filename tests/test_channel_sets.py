@@ -168,17 +168,17 @@ class TestEveryChannelResolvesItsAggregation(unittest.TestCase):
         e = _engine("weighted_average_gvi")
         e._preaggregation_done = False
         with self.assertRaises(RuntimeError) as caught:
-            e._aggregate_with_ring_cache(
-                None,
-                None,
-                300,
-                "mean",
-                50,
-                channel="gvi",
-                fold_idx=-1,
-                subset="test",
-            )
+            e._cached_channel_values(None, None, 300, "mean", 50, channel="gvi")
         self.assertIn("gvi", str(caught.exception))
+
+    def test_a_cell_the_cache_lacks_is_refused_for_a_source_channel_too(self):
+        """Every scored cell is on the cache's ladder; one that is not is an
+        error, not a slower path through the source layer."""
+        e = _engine("weighted_average_gvi")
+        e._preaggregation_done = False
+        with self.assertRaises(RuntimeError) as caught:
+            e._cached_channel_values(None, {}, 275, "mean", 50, channel="ndvi")
+        self.assertIn("not in the pre-aggregation cache", str(caught.exception))
 
 
 class TestTheCompositeIsBuiltFromThatSet(unittest.TestCase):

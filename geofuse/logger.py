@@ -27,12 +27,14 @@ Levels
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import queue
 import re
 import threading
 from collections import deque
+from collections.abc import Iterator
 from typing import IO
 
 _ANSI = {
@@ -147,6 +149,17 @@ def unbind_job_log_buffer() -> None:
     appending; :func:`drop_job_log_buffer` does the final close on purge.
     """
     _current_job.job_id = None
+
+
+@contextlib.contextmanager
+def muted() -> Iterator[None]:
+    """Drop this thread's ``log(...)`` calls for the duration of the block."""
+    job_id = getattr(_current_job, "job_id", None)
+    _current_job.job_id = None
+    try:
+        yield
+    finally:
+        _current_job.job_id = job_id
 
 
 def get_job_log_lines(job_id: str) -> list[str]:

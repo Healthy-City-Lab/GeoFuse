@@ -14,11 +14,11 @@ nothing is recomputed.
 from __future__ import annotations
 
 import json
-import math
 import shutil
 from pathlib import Path
 
 from geofuse.cli.commands import EXIT_OK, CliError, _state
+from geofuse.jobs.outer_splits import finite_or_none, method_label, spatial_label
 
 _CHANNELS = {"veg": "vegetation", "terrain": "terrain", "ndvi": "NDVI", "gvi": "GVI"}
 
@@ -70,17 +70,370 @@ def outcomes(payload: dict, wanted: str | None = None) -> list[tuple[str, dict]]
 # ────────────────────────────────────────────────────────────────────
 
 
-def _num(value) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
+_num = finite_or_none
 
 
 def _interval(block: dict, lo: str = "lower", hi: str = "upper") -> str:
     low, high = _num(block.get(lo)), _num(block.get(hi))
     return f"[{low:.4f}, {high:.4f}]" if low is not None and high is not None else ""
+
+
+def _difference(row: dict) -> str:
+    """``cgi − channel = diff`` when both held-out scores are there, else the
+    difference alone. A lower-is-better objective's difference is signed so
+    a positive value favours the CGI, so its scores are printed the other
+    way round."""
+    diff = _num(row.get("observed_diff"))
+    cgi, other = _num(row.get("cgi_score")), _num(row.get("standalone_score"))
+    if cgi is None or other is None:
+        return f"{diff:+.4f}"
+    if abs((other - cgi) - diff) < abs((cgi - other) - diff):
+        return f"{other:.4f} − {cgi:.4f} = {diff:+.4f} (lower is better)"
+    return f"{cgi:.4f} − {other:.4f} = {diff:+.4f}"
+
+
+def _outer_name(entry: dict) -> str:
+    quantity, exposure = entry.get("quantity"), entry.get("exposure")
+    name = _CHANNELS.get(exposure, exposure)
+    control = entry.get("control")
+    return {
+        "held_out_score": "Held-out score",
+        "held_out_beta": "β per SD",
+        "negative_control_beta": f"β {name}",
+        "exposure_beta": f"β per SD, {name}",
+        "exposure_negative_control_beta": f"β {name} on {control}",
+        "specificity_difference": f"ΔD vs {name}, {control}",
+        "negative_control_d": f"D {name}",
+        "held_out_per_iqr": "per IQR",
+        "held_out_per_p5_p95": "per p5–p95",
+        "exposure_per_iqr": f"per IQR, {name}",
+        "exposure_per_p5_p95": f"per p5–p95, {name}",
+        "exposure_negative_control_per_iqr": f"per IQR {name} on {control}",
+        "exposure_negative_control_per_p5_p95": f"per p5–p95 {name} on {control}",
+        "held_out_per_sd0": "per SD0",
+        "exposure_per_sd0": f"per SD0, {name}",
+        "exposure_negative_control_per_sd0": f"per SD0 {name} on {control}",
+    }.get(quantity, f"CGI − {name}")
+
+
+def _outer_lines(outer: dict) -> list[str]:
+    """The across-split summary: median [range], share holding, corrected p."""
+    summary = outer.get("summary") or []
+    if not summary:
+        return []
+    seeds = outer.get("seeds") or []
+    methods = [e["spatial_method"] for e in summary if e.get("spatial_method")]
+    # With several scales, each slope says which one it was adjusted at.
+    scales = {e.get("spatial_scale_m") for e in summary} - {None}
+
+    def ladder(e: dict) -> bool:
+        return len(scales) > 1 and e.get("spatial_scale_m") is not None
+
+    lines = [
+        f"  Across {outer.get('k')} held-out splits"
+        + (f" (seeds {seeds[0]}–{seeds[-1]})" if seeds else "")
+        + ": median [min, max], share of splits holding, corrected p"
+        + (f"; slopes adjusted for a {methods[0]} smooth" if methods else "")
+    ]
+    for e in summary:
+        median, lo, hi = (_num(e.get(k)) for k in ("median", "min", "max"))
+        if median is None or str(e.get("quantity")).startswith("posterior_"):
+            continue
+        share = _num(e.get("share_holds"))
+        p = _num(e.get("corrected_p_holm"))
+        p_text = f"Holm p={p:.3g}" if p is not None else ""
+        if p is None and _num(e.get("corrected_p")) is not None:
+            p_text = f"p={_num(e.get('corrected_p')):.3g}"
+        name = _outer_name(e) + (" (w)" if e.get("weighting") else "")
+        lines.append(
+            f"    {name:<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+            + (f"  holds {share:.0%}" if share is not None else "")
+            + (f"  {p_text}" if p_text else "")
+            + (f"  {_scale_name(e['spatial_scale_m'])}" if ladder(e) else "")
+        )
+    return lines + _posterior_lines(summary)
+
+
+def _raw_lines(raw: dict) -> list[str]:
+    """The first split's held-out change in outcome units per IQR and per
+    p5–p95 range of each exposure, and the composite's layers at its pick."""
+    exposures = (raw or {}).get("exposures") or {}
+    if not exposures:
+        return []
+    lines = [
+        "  Raw units        held-out change in the outcome per IQR | per p5–p95 "
+        "of each exposure (ranges on train+val)"
+    ]
+    for name, block in exposures.items():
+        target = block.get("target") or {}
+        parts = []
+        for key in ("per_iqr", "per_p5_p95"):
+            r = target.get(key) or {}
+            est, lo, hi = (_num(r.get(k)) for k in ("estimate", "ci_low", "ci_high"))
+            scale = _num(r.get("scale"))
+            if est is None or scale is None:
+                parts.append("—")
+                continue
+            parts.append(f"{est:+.4f} [{lo:+.4f}, {hi:+.4f}] per {scale:.4g}")
+        fixed = " (fixed IQR)" if block.get("iqr_source") == "fixed" else ""
+        label = "CGI" if name == "cgi" else _CHANNELS.get(name, name)
+        lines.append(f"    {label:<15}{parts[0]}{fixed} | {parts[1]}")
+    layers = (raw or {}).get("layers") or {}
+    if layers:
+        lines.append(
+            "    CGI layers     IQR at the pick: "
+            + ", ".join(
+                f"{_CHANNELS.get(ch, ch)} {_num(d.get('iqr')):.4g}"
+                for ch, d in layers.items()
+                if _num(d.get("iqr")) is not None
+            )
+        )
+    return lines
+
+
+def _weighted_lines(weighted: dict) -> list[str]:
+    """The first split's weighted estimates beside the unweighted ones: the
+    weights' Kish effective size and each weighted result."""
+    if not weighted:
+        return []
+    if weighted.get("skipped"):
+        return [f"  Weighted         skipped ({weighted['skipped']})"]
+    from geofuse.jobs.outer_splits import weighted_rows
+
+    lines = [
+        f"  Weighted         by '{weighted.get('weight_column')}' on the held-out "
+        f"rows: Kish n_eff {_num(weighted.get('n_eff')) or 0:,.0f} of "
+        f"{weighted.get('n_test')}, {weighted.get('n_dropped')} without a "
+        "usable weight"
+    ]
+    for r in weighted_rows(weighted):
+        est = _num(r.get("estimate"))
+        if est is None:
+            continue
+        lo, hi, p = (_num(r.get(k)) for k in ("ci_low", "ci_high", "p_value"))
+        lines.append(
+            f"    {_outer_name(r):<30}{est:+.4f}"
+            + (f" [{lo:+.4f}, {hi:+.4f}]" if lo is not None and hi is not None else "")
+            + (f"  p={p:.3g}" if p is not None else "")
+        )
+    return lines
+
+
+def _spatial_plus_lines(plus: dict) -> list[str]:
+    """The first split's Spatial+ slopes: the groups, then every exposure's
+    held-out slope per SD0 on the target per criterion (checks marked)."""
+    if not plus:
+        return []
+    if plus.get("skipped"):
+        return [f"  Spatial+         skipped ({plus['skipped']})"]
+    checks = ", ".join(plus.get("checks") or [])
+    lines = [
+        f"  Spatial+         {plus.get('n_groups')} groups on {plus.get('n')} "
+        f"held-out rows, k {plus.get('k')}, penalties by {plus.get('criterion')}"
+        + (f" (checks: {checks})" if checks else "")
+    ]
+    for r in plus.get("slopes") or []:
+        unit = r.get("per_sd0") or {}
+        est = _num(unit.get("estimate"))
+        if r.get("role") != "target" or est is None:
+            continue
+        lo, hi, p = (_num(unit.get(k)) for k in ("ci_low", "ci_high", "p_value"))
+        tag = f"{r['criterion']}, check" if r["check"] else r["criterion"]
+        name = f"{r['exposure']} ({tag})"
+        lines.append(
+            f"    {name:<30}{est:+.4f}"
+            + (f" [{lo:+.4f}, {hi:+.4f}]" if lo is not None and hi is not None else "")
+            + (f"  p={p:.3g}" if p is not None else "")
+            + f"  edf {_num(r.get('edf')) or 0:.1f}"
+        )
+    return lines
+
+
+def _null_lines(null: dict) -> list[str]:
+    """The decision's false-positive rate per null kind: hits / nulls with
+    the exact interval, the real outcome's calibrated p and the stopping
+    rule's decision; every other tested quantity on its own line."""
+    summary = null.get("summary") or []
+    if not summary:
+        return []
+    groups = (null.get("groups") or {}).get("source")
+    lines = [
+        "  Null calibration of the held-out decision"
+        + (f" (areas: {groups})" if groups else "")
+        + ": rejections at corrected p < 0.05, 95 % CI"
+    ]
+    for e in summary:
+        n, hits = e.get("finished") or 0, e.get("hits") or 0
+        lo, hi = _num(e.get("ci_low")), _num(e.get("ci_high"))
+        calibrated = _num(e.get("calibrated_p"))
+        lines.append(
+            f"    {e.get('null_kind'):<8}{_outer_name(e):<22}{hits}/{n}"
+            + (f" = {hits / n:.1%}" if n else "")
+            + (f" [{lo:.1%}, {hi:.1%}]" if lo is not None and hi is not None else "")
+            + (f"  calibrated p={calibrated:.3g}" if calibrated is not None else "")
+            + (f"  {e['decision']}" if e.get("decision") else "")
+        )
+    if null.get("complete") is False:
+        lines.append("    (not every null outcome finished)")
+    return lines
+
+
+def _scale_name(text: str) -> str:
+    """A ``spatial_scale_m`` cell as words: ``"at 5 km"`` or ``"unadjusted"``."""
+    if text == "none":
+        return "unadjusted"
+    return f"at {float(text) / 1000:g} km"
+
+
+def _specificity_lines(report: dict) -> list[str]:
+    """One "Specificity vs" block per exposure: per control, each exposure's
+    D = |β target| − |β control| and ΔD = D_cgi − D_e with its interval."""
+    rows = report.get("rows") or []
+    if not rows:
+        return []
+    lines: list[str] = []
+    for exposure in dict.fromkeys(r.get("exposure") for r in rows):
+        name = _CHANNELS.get(exposure, exposure)
+        kind = next(r.get("kind") for r in rows if r.get("exposure") == exposure)
+        lines.append(
+            f"  Specificity vs {name}"
+            + (" (comparison channel)" if kind == "channel" else "")
+            + ": held-out D = |β target| − |β control|, ΔD = D_cgi − D_e"
+        )
+        for r in rows:
+            if r.get("exposure") != exposure:
+                continue
+            values = [_num(r.get(k)) for k in ("d_cgi", "d_exposure", "delta_d")]
+            if None in values:
+                continue
+            d_cgi, d_e, delta = values
+            p = _num(r.get("p_value_holm"))
+            p_text = f"Holm p={p:.3g}" if p is not None else ""
+            if p is None and _num(r.get("p_value")) is not None:
+                p_text = f"p={_num(r.get('p_value')):.3g}"
+            spatial = spatial_label(r.get("spatial_adjustment"))
+            lines.append(
+                f"    {str(r.get('control')):<15}D_cgi {d_cgi:+.4f}  D_e {d_e:+.4f}  "
+                f"ΔD {delta:+.4f}  {_interval(r, 'ci_low', 'ci_high')}"
+                + (f"  {p_text}" if p_text else "")
+                + (f"  n={r['n']}" if r.get("n") else "")
+                + (f"  {spatial}" if spatial else "")
+            )
+    return lines
+
+
+def _plus_inputs_lines(tuning: dict) -> list[str]:
+    """A search tuned on Spatial+ residuals: its columns, groups, the outcome
+    smoother's edf and each channel's absorbed share."""
+    if tuning.get("method") != "spatial_plus_inputs":
+        return []
+    absorbed = ", ".join(
+        f"{ch} {share:.0%}"
+        for ch, share in (tuning.get("absorbed") or {}).items()
+        if share is not None
+    )
+    return [
+        f"  Tuned on         Spatial+ residuals of {tuning.get('columns')} "
+        f"search columns, {tuning.get('clusters')} groups, outcome smoother "
+        f"edf {_num(tuning.get('outcome_edf')) or 0:.1f}"
+        + (f"; variance absorbed {absorbed}" if absorbed else "")
+    ]
+
+
+def _spatial_lines(bundle: dict) -> list[str]:
+    """The run's spatial adjustment: the method, and whether the slopes carry
+    it (runs from before it reached them adjusted the scores only)."""
+    adjustment = (bundle.get("test_results") or {}).get("spatial_adjustment") or {}
+    if not adjustment.get("method"):
+        return _plus_inputs_lines(bundle.get("spatial_tuning") or {})
+    splits = (bundle.get("negative_controls") or {}).get("splits") or {}
+    target = (splits.get("test") or {}).get("target") or {}
+    reference = (bundle.get("comparator_reference") or {}).get("test") or {}
+    record = target.get("spatial_adjustment") or reference.get("spatial_adjustment")
+    outer = (bundle.get("outer_splits") or {}).get("splits") or []
+    line = f"  Spatial adjust   {method_label(adjustment)}: in the scores"
+    if record is not None or any("spatial_method" in r for r in outer):
+        line += ", slopes, negative controls and specificity"
+    if record is not None and record.get("scale_m") is not None:
+        line += f" (held-out β: {record.get('df')} smooth functions)"
+    elif record is not None:
+        df = record.get("df")
+        line += f" (held-out β: df {'none' if df is None else df})"
+    lines = [line]
+    smoothing = bundle.get("spatial_smoothing") or {}
+    if smoothing.get("scales_m"):
+        scales = [f"{float(v) / 1000:g} km" for v in smoothing["scales_m"]]
+        text = f"  Spatial scale    {scales[0]}"
+        if len(scales) > 1:
+            text += f" (slopes also at {', '.join(scales[1:])} and unadjusted)"
+        text += (
+            f"; {smoothing.get('clusters')} clusters split at "
+            f"{float(smoothing.get('eps_m') or 0) / 1000:g} km"
+        )
+        if smoothing.get("merged_components"):
+            text += (
+                f", {smoothing['merged_components']} smaller ones "
+                f"({smoothing.get('merged_entities')} entities) merged"
+            )
+        lines.append(text + "; paired tests share the smooth")
+    tuning = bundle.get("spatial_tuning") or {}
+    lines += _plus_inputs_lines(tuning)
+    if tuning.get("scale_m"):
+        absorbed = ", ".join(
+            f"{ch} {share:.0%}"
+            for ch, share in (tuning.get("absorbed") or {}).items()
+            if share is not None
+        )
+        lines.append(
+            f"  Tuned within     {float(tuning['scale_m']) / 1000:g} km areas; "
+            f"{tuning.get('clusters')} clusters, {tuning.get('columns')} smooth "
+            "columns" + (f"; variance absorbed {absorbed}" if absorbed else "")
+        )
+    if smoothing.get("candidates"):
+        text = (
+            f"  Spatial df       {smoothing.get('criterion', 'aic').upper()} over "
+            f"{', '.join(str(d) for d in smoothing['candidates'])}"
+        )
+        if smoothing.get("selections"):
+            text += (
+                f"; the largest won {smoothing.get('selections_at_cap', 0)} of "
+                f"{smoothing['selections']} selections"
+            )
+        if smoothing.get("paired_rule"):
+            text += f"; paired tests: {smoothing['paired_rule']}"
+        lines.append(text)
+    return lines
+
+
+def _posterior_lines(summary: list[dict]) -> list[str]:
+    """Each split's CGI posterior, across the splits: median [min, max]."""
+    rows = [
+        e
+        for e in summary
+        if str(e.get("quantity")).startswith("posterior_")
+        and _num(e.get("median")) is not None
+    ]
+    if not rows:
+        return []
+    lines = ["  Posterior on each split's train+val: median [min, max]"]
+    for e in rows:
+        median, lo, hi = (_num(e.get(k)) for k in ("median", "min", "max"))
+        name = _CHANNELS.get(e.get("exposure"), e.get("exposure"))
+        quantity = e["quantity"]
+        if quantity == "posterior_beta":
+            text = f"{'β':<22}{median:+.4f} [{lo:+.4f}, {hi:+.4f}]"
+            if e.get("forms"):
+                text += f"  forms {e['forms']}"
+        elif quantity == "posterior_weight":
+            text = f"{'Weight ' + name:<22}{median:.3f} [{lo:.3f}, {hi:.3f}]"
+            share = _num(e.get("share_largest"))
+            if share is not None:
+                text += f"  largest {share:.0%}"
+        else:
+            label = "R50 " if quantity == "posterior_r50" else "R90 "
+            text = f"{label + name:<22}{median:.0f} m [{lo:.0f}, {hi:.0f}]"
+        lines.append("    " + text)
+    return lines
 
 
 def resolve(value: str, artifacts: Path) -> Path:
@@ -142,6 +495,7 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
                 else "negative: more greenery, lower outcome"
             )
         )
+    lines += _spatial_lines(bundle)
 
     standalones = bundle.get("standalones") or {}
     for channel, sb in standalones.items():
@@ -153,6 +507,8 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
             lines.append(f"  {name + ' alone':<17}{score:.4f}  {ci}".rstrip())
     family = bundle.get("cgi_vs_standalone_paired_family") or []
     paired = family or [bundle.get("cgi_vs_standalone_paired") or {}]
+    if any(_num(d.get("observed_diff")) is not None for d in paired):
+        lines.append("  Held-out paired  CGI score − channel score = difference")
     for d in paired:
         diff = _num(d.get("observed_diff"))
         if diff is None:
@@ -163,7 +519,16 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
         if p is None and _num(d.get("p_value")) is not None:
             p_text = f"p={_num(d.get('p_value')):.3g}"
         lines.append(
-            f"  CGI − {name:<10} {diff:+.4f}  {_interval(d)}  {p_text}".rstrip()
+            f"  CGI − {name:<10} {_difference(d)}  {_interval(d)}  {p_text}".rstrip()
+        )
+    head = bundle.get("cgi_vs_standalone_paired") or {}
+    if head.get("verdict"):
+        name = _CHANNELS.get(
+            head.get("standalone_channel"), head.get("standalone_channel")
+        )
+        lines.append(
+            f"  Verdict          CGI vs {name} alone (chosen on train+val): "
+            f"{head['verdict']}"
         )
     comparators = bundle.get("comparators") or {}
     if comparators:
@@ -189,10 +554,16 @@ def summary(label: str, bundle: dict, artifacts: Path) -> list[str]:
     if aic.get("ok"):
         best = _CHANNELS.get(aic.get("best_channel"), aic.get("best_channel"))
         lines.append(
-            f"  AIC / BIC        CGI vs {best} alone: {aic.get('verdict')} "
-            f"(ΔAIC {_num(aic.get('delta_aic')):+.1f}, "
+            f"  AIC / BIC        in-sample, all channels vs {best} alone: "
+            f"{aic.get('verdict')} (ΔAIC {_num(aic.get('delta_aic')):+.1f}, "
             f"ΔBIC {_num(aic.get('delta_bic')):+.1f})"
         )
+    lines += _specificity_lines(bundle.get("specificity_contrast") or {})
+    lines += _raw_lines(bundle.get("raw_effects") or {})
+    lines += _weighted_lines(bundle.get("weighted") or {})
+    lines += _spatial_plus_lines(bundle.get("spatial_plus") or {})
+    lines += _outer_lines(bundle.get("outer_splits") or {})
+    lines += _null_lines(bundle.get("outer_null") or {})
 
     params = _params(bundle)
     weights = {
@@ -310,6 +681,7 @@ def cmd_export(args) -> int:
 
 
 def cmd_cgi_map(args) -> int:
+    # TODO: write the map once cgi_generator.generate is implemented.
     from geofuse import cgi_generator
 
     if not cgi_generator.AVAILABLE:

@@ -117,15 +117,27 @@ output_results/fusion/<YYYYMMDDTHHMMSS>__<short_job_id>/
     ├── discovery.csv                   the pick, weights + CrIs, gain per study
     ├── covariate_impact.csv            per-covariate effects
     ├── exposure_response.csv           per-IQR effect, quantile gradient, linearity test
+    ├── raw_effects.csv                 held-out change per IQR / p5–p95 of each exposure
+    ├── exposure_scales.csv             each exposure's distribution per split
+    ├── weighted.csv                    weighted held-out results, with weight_column
+    ├── spatial_plus.csv                Spatial+ fits per group, with spatial_plus
+    ├── scale_selection.csv             AIC-NE / BIC-NE per scale, every basis run
+    ├── effective_bandwidth.csv         distance each smooth removes, k̂
     ├── exposure_response_curve.csv     fitted curve, ready to plot
     ├── moderation.csv                  interaction test and simple slopes
     ├── negative_controls.csv           specificity check against control outcomes
     ├── negative_control_retune.csv     re-tune concordance, when requested
     ├── comparators.csv                 comparator exposures, when named
     ├── cgi_vs_comparator_paired.csv    CGI minus each comparator, when named
+    ├── specificity_contrast.csv        CGI vs other exposures per control, when on
+    ├── outer_splits.csv                every held-out split's results, outer_splits > 1 or several scales
+    ├── outer_summary.csv               their spread and corrected test, as outer_splits.csv
+    ├── null_outer.csv                  each null outcome's corrected tests, outer_null_runs > 0
+    ├── null_summary.csv                the decision's false-positive rate per null kind
+    ├── null_variogram.csv              outcome vs spatial surrogates per distance bin
     ├── decline_terms.csv               greenspace-by-time terms, longitudinal only
     ├── mixedlm_metrics*.csv            all four mixed-effects metrics, longitudinal only
-    ├── aic_bic.json                    CGI vs standalone verdict
+    ├── aic_bic.json                    in-sample AIC / BIC, all channels vs one
     ├── collinearity.json               VIF report, if requested
     └── standalone_<channel>/           per-standalone artifacts
 ```
@@ -142,15 +154,24 @@ tuned to, not because the effect generalises. Read `test` for the honest result
 and `all` only as a descriptive summary.
 
 **Effect tables test on the held-out rows.** In `exposure_response.csv`,
-`moderation.csv`, `decline_terms.csv` and `covariate_impact.csv`, and in the
-paired CGI-versus-channel difference, the estimates use every row and are
-descriptive; standard errors, intervals and p-values come from the held-out
-rows. `test_estimate` is the held-out estimate the interval belongs to,
-`test_n` the rows it rests on and `mde` the minimum detectable effect, 2.8
-held-out standard errors. Each CGI-versus-channel row's `lower`, `upper` and
-`p_value` come from the held-out bootstrap (on `inference_n` rows), and
-`p_value_holm` corrects that p-value across the channels; all four are empty
-when the held-out rows could not be scored.
+`moderation.csv`, `decline_terms.csv` and `covariate_impact.csv` the estimates
+use every row and are descriptive; standard errors, intervals and p-values
+come from the held-out rows. `test_estimate` is the held-out estimate the
+interval belongs to, `test_n` the rows it rests on and `mde` the minimum
+detectable effect, 2.8 held-out standard errors.
+
+**The CGI-versus-channel comparison is read on the held-out rows.** Each paired
+row (`cgi_vs_standalone_paired` in `results_summary.json`) reports the
+held-out difference `observed_diff`, both held-out scores (`cgi_score`,
+`standalone_score`, so the difference is the one between them), its bootstrap
+`lower` / `upper` / `p_value` on the same `n` rows, `p_value_holm` across the
+channels and a `verdict`: `CGI better` (Holm p below 0.05), `standalone
+better` (the interval lies below zero), `no difference` or `no inference`.
+The whole-data figures are descriptive and kept as `observed_diff_all`,
+`cgi_score_all`, `standalone_score_all` and `n_all`. The headline row,
+`comparison_channel`, is the channel whose standalone scores best on the
+train+val rows, so the test rows never choose the channel they judge. The
+headline values are empty when the held-out rows could not be scored.
 
 **`converged`** in each study's `discovery` block of `results_summary.json` is
 false when the posterior's largest R-hat exceeds 1.05; its weights, radii and
@@ -158,9 +179,91 @@ intervals are then not reliable, and the job log says so.
 
 **`spatial_split`** in `results_summary.json` records the spatial blocks the
 held-out split used: `block_size_m`, the `rule` that set it (`given`,
-`bounding box` or `occupied extent`), `occupied_blocks`, `test_blocks`, and
-the realised `test_share` next to the asked `test_size`. It is empty without
-spatial blocks.
+`bounding box` or `occupied extent`), the `mode` that chose the test blocks
+(`stripe` or `random`), the `seed`, `occupied_blocks`, `test_blocks`, and the
+realised `test_share` next to the asked `test_size`. It is empty without
+spatial blocks. `split_seed` records the seed of the held-out split; it is
+also in `run_config.json`.
+
+**`outer_splits.csv`** appears when the job setting `outer_splits` is above 1,
+or when `spatial_adjust_scale_m` lists several scales (see below).
+Split, tuning and held-out scoring were repeated on that many test splits,
+with seeds `split_seed`, `split_seed + 1`, …; split 0 is the run's own split.
+One row per split and result: `quantity` (`held_out_score`, `held_out_beta`
+— the covariate-adjusted slope per SD of the composite —, `cgi_minus_channel`
+against the channel chosen on that split's train+val rows,
+`cgi_minus_comparator`, `negative_control_beta`), the `exposure` it concerns,
+`estimate`, `ci_low`, `ci_high`, `p_value`, and the split's `seed`, `n_test`,
+`n_train_val`, `test_share` and `test_blocks`. The repeated splits run no
+reproducibility, gain or null-calibration loops, and score the primary
+comparators only unless `outer_comparators = "all"`. **`outer_summary.csv`**
+gives, per quantity and exposure, the `median`, `q025` / `q975`, `min` /
+`max`, `share_holds` (the share of splits whose p-value is below 0.05, or
+whose interval excludes zero) and `corrected_p`: the Nadeau–Bengio corrected
+resampled t-test across the splits, two-sided for slopes and one-sided (CGI
+better) for differences. The splits share data, so their own p-values are not
+combined. The held-out score is not tested, since it cannot be negative.
+`corrected_p_holm` corrects the primary comparators as a family. Both tables
+are also in `results_summary.json` under `outer_splits`.
+
+Each split also reports the composite's posterior, refitted on that split's
+train+val rows: `posterior_beta`, `posterior_weight` (one row per term, the
+synergy form's pair terms included), `posterior_r50` and `posterior_r90` (one
+row per channel), each with its posterior mean as `estimate`, its credible
+interval and the split's chosen `form`; split 0's rows are the values in
+`discovery.csv`. Each posterior row also says how its fit started:
+`warm_start` (the fit it started from, such as `split 0`, `linear pre-fit`, or
+`none`), `warmup` (its warm-up iterations) and `warm_fallback` (why a warm fit
+was redone from scratch, empty otherwise). A search tuned within areas adds
+`tune_scale_m` and `tune_clusters`, the smooth built on that split's train+val
+rows. Being in-sample fits, they are
+summarised (median, range) but not tested. In `outer_summary.csv` each `posterior_weight` entry adds
+`share_largest`, the share of splits in which that term has the largest weight,
+and the `posterior_beta` entry adds `forms`, how often each form was chosen.
+
+With the specificity contrast on (see `specificity_contrast.csv`), every split
+adds three quantities with a `control` column, empty on the other rows:
+`exposure_beta` (the other exposure's held-out slope on the target),
+`exposure_negative_control_beta` (its slope on the control) and
+`specificity_difference` (ΔD, the CGI's specificity minus the exposure's), with
+`kind` (`comparator` or `channel`) and `primary`. They are summarised per
+exposure and control; `specificity_difference` is tested one-sided (the CGI
+more specific), with `corrected_p_holm` over the primary comparators per
+control.
+
+With `outer_report = "decision"` the later splits keep only the estimates the
+across-split tests read: `held_out_score` is its point estimate, every slope
+keeps its exact interval, and the paired and specificity rows have no
+`ci_low`, `ci_high` or `p_value`. The medians and corrected tests in
+`outer_summary.csv` are the full report's; `share_holds` then reads the slopes
+only.
+
+**`null_outer.csv`** appears when `outer_null_runs` is above 0 (with
+`outer_splits` 2 or more). Each null outcome was run through the same search
+and the same held-out splits and seeds as the real outcome, in the decision
+report. One row per null and tested quantity: `null_kind` (`spatial` or
+`free`), `null` (1, 2, …), `quantity`, `exposure`, `control`, `median`,
+`corrected_t`, `corrected_p`, `hit` (corrected p below 0.05), `n_splits` and,
+for spatial nulls, `surrogate_k` (the neighbourhood size of the variogram
+match). **`null_summary.csv`** gives per null kind and quantity the
+`finished` nulls, `hits`, `rate` with its exact Clopper–Pearson `ci_low` /
+`ci_high`, `share_positive` (nulls whose median is above zero), the real
+outcome's `observed_corrected_p` and `calibrated_p` = (1 + nulls with a
+corrected p at or below it) / (1 + nulls), and on the `held_out_beta` row the
+sequential rule's `decision` (`stopped at 50: not inflated`, `stopped at 50:
+inflated` or `ran all`). A rule that stopped reports the nulls it decided on.
+**`null_variogram.csv`** lists per distance bin (`bin_low_m`, `bin_high_m`,
+`n_pairs`) the semivariogram of the outcome's deviations from its area means
+(`outcome`) next to the surrogates' `surrogate_median`, `surrogate_p05` and
+`surrogate_p95`. `results_summary.json` has the summary under `outer_null`
+with the kinds, the number of nulls, the workers, the areas (`groups`:
+`source` — `column <name>`, `gap clusters at <m> m` or
+`10-nearest-neighbour components`, with any merging of small clusters —,
+`n_groups`, `smallest`, `largest_share` and `n_missing`, the entities
+without a group value, grouped together), the rule and whether every
+null finished. Finished
+nulls are kept under `fusion_cache/outer_null/`, so a cancelled or repeated
+job continues from the next one.
 
 **`null_calibration`** in each study's `discovery` block of
 `results_summary.json` records the refits' `likelihood` (`cross_products` for
@@ -206,6 +309,13 @@ standalone score against the composite's gain and its p-value. Synergy
 interaction terms appear as their own rows with the grid columns blank, since
 an interaction has no spatial scale of its own.
 
+**`results_bundle.json` records where the run spent its time and memory**:
+`stage_timing` lists every timed stage, longest first, with its `seconds`,
+`share` of the summed stage time and `peak_gb`, the largest memory the job's
+processes held during it (the commit charge on Windows), and
+`peak_memory_gb` is the run's overall peak. The job log ends with the same
+breakdown.
+
 **`results_summary.json` records a `config_hash` and a `test_reads` count.** The
 hash identifies the configuration that produced the result, so a pre-registered
 analysis can be shown to be the one that ran. `test_reads` counts distinct
@@ -226,6 +336,110 @@ trend, and a Wald test for departure from linearity. A `modelled_event_level`
 row records which value of a binary outcome was treated as the event, which
 matters because a column coded `1=Yes, 2=No` inverts every odds ratio.
 
+**`raw_effects.csv`** gives, on the first split's held-out rows, the
+covariate-adjusted change in the outcome, in its own units, per
+interquartile range and per 5th–95th percentile range of each exposure: the
+CGI (`held_out_per_iqr`, `held_out_per_p5_p95`), every standalone and every
+comparator (`exposure_per_iqr`, `exposure_per_p5_p95`), and each
+exposure's change on every negative control
+(`exposure_negative_control_per_iqr`, `_per_p5_p95`, `control` named).
+Columns: `quantity`, `exposure`, `estimate`, `ci_low`, `ci_high`,
+`p_value` (exact OLS, the same test as the per-SD slope), `control`, `kind`
+(`cgi`, `channel`, `comparator`), `scale` (the exposure range the change
+is per) and `n`, plus the spatial columns when the slopes are adjusted.
+The ranges come from the train+val rows; the job setting `fixed_iqr`
+(`{ndvi = 0.1}`, or `ndvi=0.1` text) replaces an exposure's IQR, here and
+in `exposure_response.csv`. **`exposure_scales.csv`** lists, per split
+(`split`, `seed`) and exposure, the `median`, `q25`, `q75`, `iqr`, `p5`,
+`p95` and `n` on the train+val rows, the `scale_iqr` its per-IQR rows used
+and `iqr_source` (`train_val` or `fixed`), and for the CGI one row per
+layer (`layer`, `kind = layer`) at the cell the composite reads. Both are in
+`results_summary.json` under `raw_effects`. With several held-out splits
+the same quantities are rows of `outer_splits.csv` on every split, with a
+`scale` and an `n` column, and `outer_summary.csv` tests each two-sided
+across the splits.
+
+A spatially adjusted run adds the same three changes per SD0
+(`held_out_per_sd0`, `exposure_per_sd0`,
+`exposure_negative_control_per_sd0`). SD0 is the exposure's SD on those
+held-out rows after the covariates only, without the smooth, so the unit is
+the same at every pattern scale and unadjusted; `held_out_beta` is per SD of
+the exposure left after the smooth, a unit that shrinks as the smooth absorbs
+more. The rows carry `sd0` and `outcome_sd` (the outcome's residual SD given
+the covariates and the smooth), and their p-value is the per-SD slope's.
+
+**`spatial_plus.csv`** appears with `spatial_adjust_method = "spatial_plus"`
+(Spatial+ of Dupont, Wood & Augustin 2022, with one penalized thin-plate smooth
+per group). One row per criterion (`criterion`, `check` true for the
+`spatial_plus_checks` criteria), step (`exposure`: the exposure's spatial fit;
+`outcome`: the outcome model with the exposure's residual), exposure, outcome
+and group: the group's rows `n`, `knots`, smoothing parameter `lambda`, `edf`
+(trend plus smooth) and `criterion_value`; an `outcome` row adds the fit's
+slope `beta` per exposure unit, its Bayesian (`se_vp`, which the interval and
+`p_value` use) and frequentist (`se_ve`) standard errors, the slope per SD0
+with its interval, and the model's `total_edf`. The same report is in
+`results_summary.json` under `spatial_plus` (the slopes per SD0, IQR and
+p5–p95 range, D and ΔD per control, the paired ΔR², the groups and the rule
+that made them, and `lambda_fixed_in_resamples`: the bootstraps refit both
+steps with every penalty fixed at its full-sample value). On every held-out
+split `outer_splits.csv` gets Spatial+ rows beside the unadjusted ones, with
+`spatial_method = spatial_plus`, `spatial_criterion` and `spatial_check`:
+`held_out_per_sd0` / `_per_iqr` / `_per_p5_p95` (CGI on the target),
+`exposure_per_*`, `exposure_negative_control_per_*`, `negative_control_d`,
+`specificity_difference` (ΔD = D_cgi − D_e) and `cgi_minus_channel` /
+`cgi_minus_comparator` (the CGI's ΔR² minus the exposure's, from the drop in
+the penalized residual sum of squares at the outcome model's penalties).
+`outer_summary.csv` summarises them per criterion, with their own Holm
+families. The search and the standard rows stay unadjusted.
+
+**`scale_selection.csv`** appears in every `basis` run. One row per split,
+stage (`reporting`; `tuning` too with `spatial_tune_select = "scale_ic"`),
+outcome (the target and each negative control) and candidate (`scale_m`,
+empty for no smooth), from the outcome model without the exposure on the
+split's train+val rows: `n`, `columns` (smooth columns), `aic`, `bic`,
+`delta_aic`, `delta_bic` (from the outcome's best) and `chosen_aic` /
+`chosen_bic`. `results_summary.json` under `scale_selection` gives per stage
+and outcome the scale each criterion chose on each split, how often each
+scale won and the median choice (no smooth as 0 m). With
+`spatial_adjust_select = "scale_ic"` the rows of the chosen scale in
+`outer_splits.csv` read `spatial_scale_m = selected`, with the scale that split
+chose in `spatial_selected_scale_m`; `outer_summary.csv` groups them as one
+scale and its Holm families use them.
+
+**`effective_bandwidth.csv`** gives the distance over which each smooth
+removes variation (Keller & Szpiro 2020, §3.1): per split, row set (`test`,
+and `train_val` with a selected tuning scale) and smooth (each candidate scale
+of a basis run, or `spatial_plus`, the step-2 smoother of the CGI's target
+model), `k_ks` (the first zero crossing of the pointwise median of loess
+curves, span 0.1, of each sampled row's smoother weights against distance) and
+`k_rk` (the median over sampled rows of the first distance with a negative
+weight; Rainey & Keller 2024), with `n_sampled` (at most 1,000 rows) and
+`clusters`. Distances are taken within each row's cluster.
+
+**`weighted.csv`** appears with the job setting `weight_column`. It holds
+the first split's held-out results weighted by that column, in the
+`outer_splits.csv` row layout with `weighting = "weighted"`:
+`held_out_score` (the `r2` objective only), `held_out_beta`,
+`negative_control_beta` and `negative_control_d` (D = |β target| −
+|β control|, one-sided p of D > 0) per control, `cgi_minus_channel`,
+`cgi_minus_comparator`, the raw-unit rows, and with the specificity
+contrast `exposure_beta`, `exposure_negative_control_beta` and
+`specificity_difference`. Each row has `n`, `n_eff` (Kish, (Σw)² / Σw²)
+and `n_dropped` (rows left out for a missing or non-positive weight). The
+weights are normalised to mean 1 on the rows of each estimate; slopes
+carry a heteroscedasticity-robust (HC1) interval, the other results a
+bootstrap one whose resample counts are multiplied by the weights. The
+raw-unit rows are per the unweighted rows' ranges, so both read on one
+increment. With several held-out splits the same rows are in
+`outer_splits.csv` on every split, and `outer_summary.csv` summarises the
+weighted and unweighted rows apart (a `weighting` column), each with its
+own Holm families. `results_summary.json` has the rows and the weights'
+`n_eff` and `n_dropped` under `weighted`; `run_config.json` records
+`weight_column` and `weight_search`. With spatial adjustment each weighted
+slope uses the same smooth as its unweighted row. The job's "Weighted
+estimates" stage reads `failed` when the weighted report could not be
+computed (the run continues and `weighted` is empty).
+
 **`moderation.csv`** answers whether the effect differs between groups: one
 simple slope per moderator level, one row per interaction term, and a single
 joint p-value. Nominating a moderator does not adjust for it; add it as a
@@ -245,6 +459,26 @@ the same rows, so the composite's specificity can be read against a single
 channel's, and so do comparator exposures; `exposure` says which kind each
 `study` is (`cgi`, `standalone` or `comparator`).
 
+**`specificity_contrast.csv`** appears when the job setting
+`specificity_contrast` is on. It answers whether the composite is less
+non-specific than another exposure, which the separate rows above cannot
+show: two exposures' slopes on the same rows move together, so their
+intervals overlap even when the difference is clear. One row per exposure and
+control, on the held-out entities where the target, the control and both
+exposures are observed. The exposures are each primary comparator and the
+comparison channel (`kind`). The table gives the four signed slopes
+(`beta_target_cgi`, `beta_control_cgi`, `beta_target_exposure`,
+`beta_control_exposure`), each exposure's specificity `d_cgi` and
+`d_exposure` (|β target| − |β control|), and `delta_d` = `d_cgi` −
+`d_exposure`, positive when the composite is the more specific. `delta_d`
+comes with a paired bootstrap interval in which all four slopes are refitted
+on every resample, and a one-sided `p_value` for `delta_d` > 0.
+`p_value_holm` is corrected over the primary comparators, separately for each
+control. Each control is a separate check, with no correction across
+controls. When repeated splits score all comparators, so does this table. The
+same rows are in `results_summary.json` under `specificity_contrast`. With
+the setting off, nothing in the run's outputs changes.
+
 **`comparators.csv`** appears when comparator exposures were named: existing
 exposure columns of the target, scored untuned on the composite's own rows,
 split, covariates and objective. One row per exposure and split, the CGI first
@@ -253,12 +487,85 @@ on the same scale: `score` with its interval (`test` is the held-out headline,
 missing a comparator counts only against that comparator), `beta` (the
 covariate-adjusted slope in SD units, with its interval) and `primary`.
 **`cgi_vs_comparator_paired.csv`** holds the paired difference CGI − comparator
-in the objective's units (positive favours the CGI), estimated on every row
-with its interval and p-value from the held-out rows; `p_value_holm` is
+in the objective's units (positive favours the CGI), estimated with its
+interval and p-value on the held-out rows (the whole-data difference and
+scores are the `_all` columns), with a `verdict`; `p_value_holm` is
 Holm-corrected over the primary comparators only and is empty for the others,
 which are descriptive. Comparators are not scored for panels (several rows per
 entity). The same results are in `results_summary.json` under `comparators`,
 `comparator_reference` (the CGI's row) and `cgi_vs_comparator_paired`.
+
+**Spatially adjusted runs.** With `spatial_adjust_method = "basis"`, the
+slopes are adjusted for a coordinate basis as the scores are, built on the rows each one reports. That covers `beta` in
+`negative_controls.csv` and `comparators.csv` (and the objective scores in
+`negative_controls.csv`), the four slopes, D and ΔD in
+`specificity_contrast.csv`, and the slope rows of `outer_splits.csv` on every
+split. When the exposure model picks the df (`df_exposure_ic`), or a fixed
+scale sets the basis, each exposure's target and control slopes share one
+smooth; when the outcome model picks it (`df_outcome_ic`) the target and every
+control have their own. Each adjusted row carries `spatial_method` (`basis`),
+`spatial_select` (how its size was set) and the smooth's `spatial_df`: the
+number of radial functions per spatial cluster, `0` for the cluster levels
+and linear trends alone, and `none` when the criterion kept no smooth. In
+`specificity_contrast.csv` two smooths are in play, so a row has either
+`spatial_df_cgi` / `spatial_df_exposure` (exposure rule) or
+`spatial_df_target` / `spatial_df_control` (outcome rule). Runs made before
+the methods were renamed say `ks_aic` (now `basis` with `df_outcome_ic`) or
+`spatial_plus` (now `basis` with `df_exposure_ic`, or `fixed_scale` with a
+pattern scale). `outer_summary.csv` names the
+`spatial_method`, and `results_summary.json` keeps a `spatial_adjustment`
+record on each slope. A slope row also carries `spatial_at_cap`, true when the
+largest candidate size won (a larger smooth might fit better), and its record
+in `results_summary.json` adds `ic`, the criterion value of every size compared
+(`none` is no smooth). The paired rows (`cgi_vs_comparator_paired.csv`, the
+`cgi_minus_channel` / `cgi_minus_comparator` rows of `outer_splits.csv`, and
+`cgi_vs_standalone_paired` in `results_summary.json`) carry `spatial_rule`, the
+`spatial_paired_smooth` rule in force (`own`, `cgi`, `outcome` or `max`), with
+`spatial_df_cgi` and `spatial_df_exposure`, the sizes the two sides were scored
+with. `results_summary.json` holds the run's smoothing under
+`spatial_smoothing`: the candidate sizes, criterion, knots, neighbours and
+cluster gap, the paired rule, the clusters found on the first held-out split,
+and how many of the run's
+selections the largest size won (`selections`, `selections_at_cap`).
+Without spatial adjustment none of these columns or keys appear.
+
+With `spatial_adjust_scale_m` set, the smooth is defined by a pattern scale.
+Every adjusted row then carries `spatial_scale_m` (the scale in metres, as
+text), `spatial_df` (the smooth's number of columns), `spatial_absorbed`,
+the share of that exposure's variance on those rows the smooth absorbs (the
+R² of the exposure on the smooth), `spatial_absorbed_given_cov`, the share of
+its variance after the covariates that the smooth absorbs (1 − x′M[Z,S]x /
+x′M[Z]x), and `spatial_chance_share`, the share a smooth of that size absorbs
+from pure noise (its rank over the rows): the variation left is what the
+adjusted slope rests on, and an absorbed share near the chance share says the
+smooth found little structure. Paired rows have `spatial_rule` `shared`. With
+several scales the slope rows of `outer_splits.csv` (`held_out_beta`,
+`negative_control_beta`, the raw-unit rows per IQR, per p5–p95 range and per
+SD0, and with the specificity contrast `exposure_beta`,
+`exposure_negative_control_beta` and `specificity_difference`) repeat at every
+listed scale and once with `spatial_scale_m` `none`, unadjusted; the table is
+written even with one held-out split. Read a curve of the slope against the
+scale on the per-SD0 rows: a constant per-unit effect gives a flat per-SD0
+curve while `held_out_beta` falls by about √(1 − absorbed). `outer_summary.csv` summarises each
+scale separately, and only the first scale's entries enter the Holm families.
+`spatial_smoothing` in `results_summary.json` then holds `selection`
+(`fixed scale`), `scales_m`, `primary_scale_m`, the cluster gap `eps_m`,
+`min_component`, `clusters`, and under `per_scale` each scale's clusters (their
+entities, extent in metres and knots), the clusters merged into larger ones and
+their entities, and the number of radial functions. Without a scale, the same
+cluster list is recorded, with `chained` naming a cluster far wider or larger
+than the rest. Unless the search is tuned within areas the tuning never
+sees the smooth, and the exposure-response, moderation and AIC / BIC tables
+control for the covariates only: in a spatially adjusted run the rows of
+`exposure_response.csv`, `exposure_response_curve.csv`, `moderation.csv` and
+`covariate_impact.csv` carry `spatial_adjustment` `not applied`.
+
+With `spatial_tune_scale_m` set, `results_summary.json` and
+`results_bundle.json` hold `spatial_tuning`: the tuning scale `scale_m`, the
+cluster gap `eps_m`, `clusters`, `merged_components` and `merged_entities`,
+`radial_columns` and `columns` (the smooth's size), `rows` and `kept_rows`
+(the rows the search used), and `absorbed`, per channel the share of its
+variance the smooth absorbs, averaged over the channel's cells.
 
 **`negative_control_retune.csv`** appears when the job setting
 `negative_control_retune` is on. The CGI's sweep and posterior are re-run with

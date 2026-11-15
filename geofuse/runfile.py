@@ -469,6 +469,7 @@ def _resolve_step(
     depends = _strings(raw.get("depends_on") or [], "depends_on")
     if engine == "fusion":
         _fusion_metric(name, inputs["mode"], settings, explicit)
+        _spatial_plus_spelling(name, settings, explicit)
     preset_name = Path(preset).stem if preset and preset.endswith(".json") else preset
     return Step(
         engine=engine,
@@ -479,6 +480,28 @@ def _resolve_step(
         preset=preset_name,
         explicit=explicit,
         depends_on=depends,
+    )
+
+
+def _spatial_plus_spelling(name: str, settings: dict, explicit: set[str]) -> None:
+    """Refuse ``spatial_plus`` set together with a basis-only setting.
+
+    ``spatial_plus`` used to name the unpenalized basis adjustment; it now
+    names Spatial+ with penalized smooths, so a run file combining it with a
+    basis setting was most likely written for the old meaning.
+    """
+    if settings.get("spatial_adjust_method") != "spatial_plus":
+        return
+    given = [k for k in _settings.BASIS_ONLY_SETTINGS if k in explicit]
+    if not given:
+        return
+    select = "fixed_scale" if "spatial_adjust_scale_m" in given else "df_exposure_ic"
+    raise RunFileError(
+        f"[[fusion]] {name}: 'spatial_plus' now means Spatial+ with penalized "
+        f"smooths (Dupont et al. 2022), which {', '.join(repr(k) for k in given)} "
+        "do not act on. For the unpenalized basis adjustment these settings "
+        "belong to, write spatial_adjust_method = 'basis' and "
+        f"spatial_adjust_select = '{select}'."
     )
 
 

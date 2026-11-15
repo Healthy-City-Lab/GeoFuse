@@ -3,7 +3,8 @@
 A fusion run is found by job id or by its results folder (paths a GUI run
 recorded relative to its own folder are found again); the summary carries the
 held-out score and interval, direction, each channel alone, the paired
-difference, the AIC / BIC verdict and the weights; the per-entity table
+difference, the AIC / BIC verdict, the specificity contrast, the across-split
+summary with each split's posterior, and the weights; the per-entity table
 exports as GeoPackage, CSV (no geometry) or GeoJSON (WGS 84).
 """
 
@@ -45,17 +46,117 @@ def _bundle(artifacts: str) -> dict:
             {
                 "standalone_channel": "ndvi",
                 "observed_diff": -0.015,
+                "cgi_score": 0.047,
+                "standalone_score": 0.062,
                 "lower": -0.029,
                 "upper": 0.001,
                 "p_value_holm": 0.97,
+                "verdict": "no difference",
             }
         ],
+        "cgi_vs_standalone_paired": {
+            "standalone_channel": "ndvi",
+            "observed_diff": -0.015,
+            "verdict": "no difference",
+        },
         "cgi_vs_standalone_aic_bic": {
             "ok": True,
             "best_channel": "ndvi",
             "verdict": "not justified",
             "delta_aic": -2.3,
             "delta_bic": -15.6,
+        },
+        "outer_splits": {
+            "k": 10,
+            "seeds": [1, 10],
+            "summary": [
+                {
+                    "quantity": "held_out_beta",
+                    "exposure": "cgi",
+                    "median": 0.031,
+                    "min": 0.004,
+                    "max": 0.058,
+                    "share_holds": 0.7,
+                    "corrected_p": 0.012,
+                },
+                {
+                    "quantity": "cgi_minus_comparator",
+                    "exposure": "g13",
+                    "median": 0.0004,
+                    "min": -0.0011,
+                    "max": 0.0021,
+                    "share_holds": 0.1,
+                    "corrected_p": 0.31,
+                    "corrected_p_holm": 0.31,
+                },
+                {
+                    "quantity": "specificity_difference",
+                    "exposure": "g13",
+                    "control": "grip",
+                    "median": 0.012,
+                    "min": -0.004,
+                    "max": 0.03,
+                    "share_holds": 0.3,
+                    "corrected_p": 0.04,
+                    "corrected_p_holm": 0.04,
+                },
+                {
+                    "quantity": "posterior_beta",
+                    "exposure": "cgi",
+                    "median": 0.03,
+                    "min": 0.01,
+                    "max": 0.05,
+                    "forms": "linear 7/10, synergy 3/10",
+                },
+                {
+                    "quantity": "posterior_weight",
+                    "exposure": "ndvi",
+                    "median": 0.62,
+                    "min": 0.4,
+                    "max": 0.8,
+                    "share_largest": 0.7,
+                },
+                {
+                    "quantity": "posterior_r50",
+                    "exposure": "ndvi",
+                    "median": 520.0,
+                    "min": 400.0,
+                    "max": 700.0,
+                },
+            ],
+        },
+        "specificity_contrast": {
+            "controls": ["grip"],
+            "rows": [
+                {
+                    "exposure": "g13",
+                    "kind": "comparator",
+                    "primary": True,
+                    "control": "grip",
+                    "d_cgi": 0.018,
+                    "d_exposure": -0.048,
+                    "delta_d": 0.066,
+                    "ci_low": 0.012,
+                    "ci_high": 0.118,
+                    "p_value": 0.01,
+                    "p_value_holm": 0.01,
+                    "n": 400,
+                },
+                {
+                    "exposure": "ndvi",
+                    "kind": "channel",
+                    "primary": None,
+                    "control": "grip",
+                    "d_cgi": 0.018,
+                    "d_exposure": 0.011,
+                    "delta_d": 0.007,
+                    "ci_low": -0.02,
+                    "ci_high": 0.035,
+                    "p_value": 0.31,
+                    "p_value_holm": None,
+                    "n": 400,
+                },
+            ],
         },
         "averaged_params": {
             "ndvi_weight": 20,
@@ -107,13 +208,33 @@ class ResultsTests(_Case):
             "0.0610  [0.0460, 0.0890]  n=400  p=0.001",
             "negative: more greenery, lower outcome",
             "NDVI alone       0.0620",
-            "CGI − NDVI       -0.0150  [-0.0290, 0.0010]  Holm p=0.97",
-            "CGI vs NDVI alone: not justified (ΔAIC -2.3, ΔBIC -15.6)",
+            "Held-out paired  CGI score − channel score = difference",
+            "CGI − NDVI       0.0470 − 0.0620 = -0.0150  [-0.0290, 0.0010]  "
+            "Holm p=0.97",
+            "CGI vs NDVI alone (chosen on train+val): no difference",
+            "in-sample, all channels vs NDVI alone: not justified "
+            "(ΔAIC -2.3, ΔBIC -15.6)",
+            "Across 10 held-out splits (seeds 1–10)",
+            "β per SD              +0.0310 [+0.0040, +0.0580]  holds 70%  p=0.012",
+            "CGI − g13             +0.0004 [-0.0011, +0.0021]  holds 10%  Holm p=0.31",
+            "Specificity vs g13: held-out D = |β target| − |β control|, "
+            "ΔD = D_cgi − D_e",
+            "grip           D_cgi +0.0180  D_e -0.0480  ΔD +0.0660  "
+            "[0.0120, 0.1180]  Holm p=0.01  n=400",
+            "Specificity vs NDVI (comparison channel)",
+            "D_e +0.0110  ΔD +0.0070  [-0.0200, 0.0350]  p=0.31",
+            "ΔD vs g13, grip       +0.0120 [-0.0040, +0.0300]  holds 30%  Holm p=0.04",
+            "Posterior on each split's train+val: median [min, max]",
+            "β                     +0.0300 [+0.0100, +0.0500]  forms linear 7/10, "
+            "synergy 3/10",
+            "Weight NDVI           0.620 [0.400, 0.800]  largest 70%",
+            "R50 NDVI              520 m [400, 700]",
             "NDVI 20, GVI 80 (of 100)",
             "NDVI 700 m, GVI 400 m",
             os.path.join(self.artifacts, "study_results"),
         ):
             self.assertIn(part, out)
+        self.assertNotIn("+520.0000", out)
 
     def test_a_job_id_finds_its_bundle_and_unfinished_runs_say_so(self):
         state = StateDir(self.state_dir)

@@ -33,8 +33,10 @@ import rasterio
 from geofuse import JobCancelled
 from geofuse import bayesian_index as _bayesian_index
 from geofuse import cgi_formulas as _cgi_formulas
-from geofuse import metric_intake
+from geofuse import metric_intake, parallel
 from geofuse import pdcor as _pdcor_mod
+from geofuse import settings as _settings
+from geofuse import spatial_scale_selection as _scale_selection
 from geofuse.crs_utils import (
     default_geotiff_creation_options,
     raster_geographic_bounds,
@@ -46,6 +48,7 @@ from geofuse.jobs import (
     GVI_PROGRESS_MIN_SECONDS,
     ProgressThrottle,
 )
+from geofuse.jobs import outer_splits as _outer
 from geofuse.jobs.fusion_outputs import (
     _STANDALONE_CHANNEL_LABELS,
     _build_fusion_ledger,
@@ -60,7 +63,12 @@ from geofuse.jobs.fusion_outputs import (
     _log_stage_timing,
     _negative_control_report,
     _posterior_summary,
+    _specificity_report,
     _write_fusion_outputs,
+    comparison_channel,
+    paired_verdict,
+    specificity_exposures,
+    stage_timing_rows,
     write_entity_table,
 )
 from geofuse.jobs.stage_ledger import DONE, FAILED, RUNNING, SKIPPED
@@ -1180,12 +1188,15 @@ def _fmt_or_na(value: Any, spec: str) -> str:
     return format(fv, spec) if np.isfinite(fv) else "n/a"
 
 
-def _paired_family_headline(family: list[dict], best_channel: str | None) -> dict:
+def _paired_family_headline(family: list[dict], channel: str | None) -> dict | None:
     """Holm-correct the CGI-vs-standalone family in place and pick its headline.
 
     Each entry gains ``p_value_holm`` (``None`` where its own p-value is
-    missing) and ``family_size``. The headline is the AIC/BIC best channel's
-    entry, else the one with the largest observed difference.
+    missing), ``family_size`` and a held-out ``verdict``
+    (:func:`paired_verdict`). The headline is the entry for ``channel``, the
+    channel chosen on the train+val pool (:func:`comparison_channel`), so the
+    test rows never pick the channel they then judge; ``None`` when that
+    channel has no entry.
     """
     from .. import statistical_testing as _stats_mod
 
@@ -1193,14 +1204,384 @@ def _paired_family_headline(family: list[dict], best_channel: str | None) -> dic
     for d, hp in zip(family, holm, strict=True):
         d["p_value_holm"] = None if hp != hp else float(hp)
         d["family_size"] = len(family)
+        d["verdict"] = paired_verdict(d)
+    head = next((d for d in family if d.get("standalone_channel") == channel), None)
+    if head is not None:
+        head["selected_on"] = "train_val"
+    return head
 
-    def _diff(d: dict) -> float:
-        v = d.get("observed_diff")
-        return float(v) if v is not None and np.isfinite(v) else float("-inf")
 
-    return next(
-        (d for d in family if d.get("standalone_channel") == best_channel), None
-    ) or max(family, key=_diff)
+def _fixed_scale(fixed_iqr: dict | None, name: str, default: float | None):
+    """The per-IQR increment of exposure ``name``: its ``fixed_iqr`` entry,
+    else ``default`` (``exposure_iqr``)."""
+    value = (fixed_iqr or {}).get(name)
+    return default if value is None else float(value)
+
+
+def _raw_exposures(
+    engine: Any, standalones, standalones_bundle: dict, comparators_report: dict
+) -> dict:
+    """The exposures whose raw-unit slopes the first split reports next to the
+    CGI's: every standalone at its reported params and every scored
+    comparator (none for a panel)."""
+    from geofuse.fusion import comparator_mode
+
+    out = {}
+    for ch in standalones or []:
+        bundle = standalones_bundle.get(ch) or {}
+        params = bundle.get("averaged_params") or bundle.get("best_params")
+        if params:
+            out[ch] = (ch, params)
+    if not engine.is_panel:
+        for name in comparators_report or {}:
+            out[name] = (comparator_mode(name), {"comparator": name})
+    return out
+
+
+def _log_weighted(report: dict | None, label: str) -> None:
+    """One line on the weighted held-out estimates: the weights' Kish
+    effective size, the rows they left out and the weighted slope."""
+    if not report:
+        return
+    if report.get("skipped"):
+        reason = (
+            "need one row per entity"
+            if report["skipped"] == "longitudinal"
+            else f"found no column '{report.get('weight_column')}' in the target"
+        )
+        _log_fusion("WARN", f"[{label}] Weighted estimates {reason}; skipped.")
+        return
+    slope = ((report.get("slopes") or {}).get("cgi") or {}).get("target") or {}
+    _log_fusion(
+        "OK",
+        f"[{label}] Weighted by '{report.get('weight_column')}' on the held-out "
+        f"rows: Kish n_eff {_fmt_or_na(report.get('n_eff'), ',.0f')} of "
+        f"{report.get('n_test')}, {report.get('n_dropped')} without a usable "
+        f"weight; weighted β {_fmt_or_na(slope.get('beta'), '+.4f')} "
+        f"[{_fmt_or_na(slope.get('ci_low'), '+.4f')}, "
+        f"{_fmt_or_na(slope.get('ci_high'), '+.4f')}].",
+    )
+
+
+def _log_spatial_plus(report: dict, label: str) -> None:
+    """One line on the held-out Spatial+ slope of the CGI per criterion."""
+    for row in report.get("slopes") or []:
+        if row["exposure"] != "cgi" or row["role"] != "target":
+            continue
+        unit = row.get("per_sd0") or {}
+        _log_fusion(
+            "OK",
+            f"[{label}] Spatial+ ({row['criterion']}"
+            + (", check" if row["check"] else "")
+            + f", {report.get('n_groups')} groups): held-out slope per SD0 "
+            f"{_fmt_or_na(unit.get('estimate'), '+.4f')} "
+            f"[{_fmt_or_na(unit.get('ci_low'), '+.4f')}, "
+            f"{_fmt_or_na(unit.get('ci_high'), '+.4f')}], "
+            f"p {_fmt_or_na(row.get('p_value'), '.3g')}, edf "
+            f"{_fmt_or_na(row.get('edf'), '.1f')}.",
+        )
+
+
+def _run_outer_splits(
+    engine: Any,
+    *,
+    k_splits: int,
+    split_seed: int,
+    split_kwargs: dict,
+    fit_kwargs: dict,
+    headline_params: dict,
+    metric: str,
+    first_split: dict,
+    standalones: list[str],
+    comparators: list[str],
+    comparators_primary: list[str],
+    outer_comparators: str,
+    n_effects_boot: int,
+    n_perm: int,
+    n_paired: int,
+    stage_key: str,
+    stage: Any,
+    stage_progress: Any,
+    ctx: Any,
+    label: str,
+    specificity: bool = False,
+    specificity_exposures: dict | None = None,
+    ladder: "list[float | None] | None" = None,
+    primary_scale: float | None = None,
+    report: str = "full",
+    fixed_iqr: dict | None = None,
+    raw_exposures: dict | None = None,
+    scale_profiles: "list[dict] | None" = None,
+    bandwidths: "list[dict] | None" = None,
+) -> dict | None:
+    """The first split's results and ``k_splits − 1`` repeats, summarised.
+
+    The first split's rows come from the run's own reports (its comparators
+    reduced to the ones every split scores); the repeats from
+    :func:`geofuse.jobs.outer_splits.repeat`, which also redo the specificity
+    contrast when ``specificity`` is set. The engine is put back on the first
+    split afterwards. A failure is logged and the run continues. A cancel
+    during the stage ends the run as cancelled; fewer completed splits than
+    ``k_splits`` mark the stage failed with a WARN, and the report says
+    ``complete: False``. ``ladder`` lists the other pattern scales (and
+    ``None``) whose slopes every split, the first included, also reports
+    (:func:`geofuse.jobs.outer_splits.scale_rows`); the summary's Holm families
+    use ``primary_scale``'s rows. ``report`` is the repeats' report
+    (:data:`geofuse.jobs.outer_splits.OUTER_REPORTS`). Every split's exposure
+    distributions (the scales of its raw-unit rows) are listed under
+    ``distributions``. Returns ``{k, seeds, comparators, report, splits,
+    summary, distributions, complete}``.
+    """
+    stage(stage_key, RUNNING)
+    scored = set(
+        _outer.scored_comparators(comparators, comparators_primary, outer_comparators)
+    )
+    primary = set(comparators_primary or comparators)
+    distributions = [
+        {"split": 0, "seed": int(split_seed), **r}
+        for r in _outer.distribution_rows(first_split.get("raw"))
+        if r["exposure"] == "cgi" or r["exposure"] in set(standalones) | scored
+    ]
+    try:
+        rows = []
+        info = _outer.split_info(engine)
+        for r in _outer.split_rows(
+            effects_test=(first_split.get("effects") or {}).get("test"),
+            slope_test=engine.compute_partial_slopes(headline_params).get("test"),
+            channel_paired=first_split.get("channel_paired"),
+            comparator_paired=[
+                r
+                for r in first_split.get("comparator_paired") or []
+                if r.get("comparator") in scored
+            ],
+            negative_controls=first_split.get("negative_controls"),
+            posterior=first_split.get("posterior"),
+            specificity=first_split.get("specificity"),
+            raw=first_split.get("raw"),
+            raw_keep=set(standalones) | scored,
+            weighted=first_split.get("weighted"),
+        ) + _outer.spatial_plus_rows(
+            first_split.get("spatial_plus"), set(standalones) | scored
+        ):
+            r.update(split=0, seed=int(split_seed), **info)
+            if r["quantity"] == "cgi_minus_comparator" or r.get("kind") == "comparator":
+                r["primary"] = r["exposure"] in primary
+
+            rows.append(r)
+        if ladder:
+            for r in _outer.scale_rows(
+                engine,
+                headline_params,
+                ladder,
+                n_boot=n_paired,
+                exposures=specificity_exposures,
+                label=label,
+                raw_exposures=raw_exposures,
+                raw_keep=set(standalones) | scored,
+                fixed_iqr=fixed_iqr,
+            ):
+                r.update(split=0, seed=int(split_seed), **info)
+                if r.get("kind") == "comparator":
+                    r["primary"] = r["exposure"] in primary
+                rows.append(r)
+
+        def _progress(k: int) -> None:
+            stage_progress(stage_key, k / k_splits, f"split {k + 1:,}/{k_splits:,}")
+            ctx.progress(status_text=f"[{label}] Held-out split {k + 1}/{k_splits}...")
+
+        rows += _outer.repeat(
+            engine,
+            k_splits=k_splits,
+            split_seed=split_seed,
+            split_kwargs=split_kwargs,
+            fit_kwargs=fit_kwargs,
+            metric=metric,
+            standalones=standalones,
+            comparators=comparators,
+            comparators_primary=comparators_primary,
+            outer_comparators=outer_comparators,
+            n_effects_boot=n_effects_boot,
+            n_perm=n_perm,
+            n_paired=n_paired,
+            log=lambda level, msg: _log_fusion(level, f"[{label}] {msg}"),
+            progress=_progress,
+            cancelled=ctx.is_cancelled,
+            specificity=specificity,
+            ladder=ladder,
+            report=report,
+            fixed_iqr=fixed_iqr,
+            distributions=distributions,
+            scale_profiles=scale_profiles,
+            bandwidths=bandwidths,
+        )
+        if ctx.is_cancelled():
+            raise JobCancelled("Repeated held-out splits cancelled by user.")
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Repeated held-out splits failed: {exc}. The run continues "
+            "with the first split's results.",
+        )
+        stage(stage_key, FAILED, str(exc))
+        rows = None
+    finally:
+        engine._active_greenery_channel = "cgi"
+        engine._fit_label = "split 0"
+        engine.split_data(random_state=int(split_seed), **split_kwargs)
+        engine.best_params = dict(headline_params)
+    if rows is None:
+        return None
+    summary = _outer.summarise(rows, primary_scale=primary_scale)
+    for e in summary:
+        if e["quantity"] == "held_out_score":
+            continue
+        if e["quantity"] in _outer.POSTERIOR_QUANTITIES:
+            continue
+        _log_fusion(
+            "OK",
+            f"[{label}] Across {e['n_splits']} held-out splits, "
+            f"{e['quantity']} ({e['exposure']}"
+            + (f" / {e['control']}" if e.get("control") else "")
+            + (f", {e['spatial_method']}" if e.get("spatial_method") else "")
+            + (
+                f", scale {e['spatial_scale_m']}"
+                + (" m" if e["spatial_scale_m"] != "none" else "")
+                if e.get("spatial_scale_m")
+                else ""
+            )
+            + "): median "
+            f"{_fmt_or_na(e['median'], '.4f')} [{_fmt_or_na(e['min'], '.4f')}, "
+            f"{_fmt_or_na(e['max'], '.4f')}], holds in "
+            f"{_fmt_or_na(e['share_holds'], '.0%')}, corrected "
+            f"p={_fmt_or_na(e['corrected_p'], '.3g')}.",
+        )
+    posterior = _outer.describe_posterior(summary)
+    if posterior:
+        _log_fusion(
+            "OK", f"[{label}] Posterior across {int(k_splits)} splits: {posterior}."
+        )
+    completed = len({r.get("split") for r in rows})
+    if completed < int(k_splits):
+        message = (
+            f"only {completed} of {int(k_splits)} held-out splits produced results"
+        )
+        _log_fusion("WARN", f"[{label}] Repeated held-out splits: {message}.")
+        stage(stage_key, FAILED, message)
+    else:
+        stage(stage_key, DONE)
+    return {
+        "k": int(k_splits),
+        "seeds": [int(split_seed) + k for k in range(int(k_splits))],
+        "comparators": str(outer_comparators),
+        "report": str(report),
+        "splits": rows,
+        "summary": summary,
+        "distributions": distributions,
+        "complete": completed >= int(k_splits),
+    }
+
+
+def _run_outer_null(
+    engine: Any,
+    *,
+    fusion_df: Any,
+    n: int,
+    kind: str,
+    group_column: str | None,
+    stop: dict,
+    workers: int | None,
+    rule: dict,
+    split_kwargs: dict,
+    fit_kwargs: dict,
+    setup: dict,
+    resume_dir: str,
+    stage_key: str,
+    stage: Any,
+    stage_progress: Any,
+    ctx: Any,
+    label: str,
+    split_seed: int,
+    restore_split: dict,
+    headline_params: dict,
+    observed: list[dict],
+) -> dict | None:
+    """``n`` null outcomes through the repeated-split decision rule.
+
+    See :func:`geofuse.jobs.outer_null.run`. Refused with a WARN (the stage
+    skipped) for a panel, whose rows are not exchangeable entities, and when
+    ``group_column`` is not a column of the fusion frame. A failure is logged
+    and the run continues; a cancel ends it as cancelled. The engine is put
+    back on the first split afterwards. Returns the null report, or ``None``.
+    """
+    from . import outer_null as _null
+
+    stage(stage_key, RUNNING)
+    if engine.is_panel:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Null calibration needs one row per entity; a panel's "
+            "rows are not exchangeable, so it is skipped.",
+        )
+        stage(stage_key, SKIPPED, "panel target")
+        return None
+    if group_column and group_column not in fusion_df.columns:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Null calibration: the target has no column "
+            f"'{group_column}' to group the spatial null; skipped.",
+        )
+        stage(stage_key, SKIPPED, f"no column {group_column}")
+        return None
+
+    def _progress(done: int, total: int) -> None:
+        stage_progress(stage_key, done / max(total, 1), f"null {done:,}/{total:,}")
+        ctx.progress(status_text=f"[{label}] Null outcome {done}/{total}...")
+
+    report = None
+    try:
+        report = _null.run(
+            engine,
+            fusion_df=fusion_df,
+            n=int(n),
+            kind=str(kind),
+            group_column=group_column,
+            stop={k: v for k, v in stop.items() if v is not None},
+            seed=int(split_seed),
+            rule=rule,
+            split_kwargs=split_kwargs,
+            fit_kwargs=fit_kwargs,
+            observed=observed,
+            resume_dir=resume_dir,
+            setup=setup,
+            workers=workers,
+            log=lambda level, msg: _log_fusion(level, f"[{label}] {msg}"),
+            progress=_progress,
+            cancelled=ctx.is_cancelled,
+        )
+        if ctx.is_cancelled():
+            raise JobCancelled("Null calibration cancelled by user.")
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        _log_fusion(
+            "WARN",
+            f"[{label}] Null calibration failed: {exc}. The run continues "
+            "without it.",
+        )
+        stage(stage_key, FAILED, str(exc))
+        return None
+    finally:
+        engine._active_greenery_channel = "cgi"
+        engine._fit_label = "split 0"
+        engine.split_data(random_state=int(split_seed), **restore_split)
+        engine.best_params = dict(headline_params)
+    if report["complete"]:
+        stage(stage_key, DONE)
+    else:
+        stage(stage_key, FAILED, "not every null outcome finished")
+    return report
 
 
 def _build_fusion_study_name(
@@ -1231,6 +1612,65 @@ def _build_fusion_study_name(
     return _STUDY_NAME_UNSAFE.sub("_", raw).strip("_") or "fusion_study"
 
 
+def _spatial_df_list(
+    spatial_adjust_df: "list[int] | None", spatial_adjust_max_df: "int | None"
+) -> list[int]:
+    """The df list a run compares: the older ``max_df`` N as ``0 … N``, else
+    ``spatial_adjust_df``, else the default list."""
+    from geofuse import spatial_basis
+
+    if spatial_adjust_max_df is not None:
+        if spatial_adjust_df is not None:
+            raise ValueError(
+                "Give spatial_adjust_df or the older spatial_adjust_max_df, not both."
+            )
+        return list(range(0, max(1, int(spatial_adjust_max_df)) + 1))
+    if spatial_adjust_df is not None:
+        return sorted({int(d) for d in spatial_adjust_df})
+    return list(spatial_basis.DEFAULT_DF_CANDIDATES)
+
+
+def _spatial_scale_list(value: "list[float] | float | None") -> list[float]:
+    """The pattern scales of a run in the order given, duplicates dropped:
+    empty without a scale (df mode)."""
+    if value is None:
+        return []
+    values = value if isinstance(value, list | tuple) else [value]
+    return list(dict.fromkeys(float(v) for v in values))
+
+
+def _non_default_options(values: dict) -> dict:
+    """``values`` without the smoothing settings at the engine's defaults."""
+    from geofuse import exposure_response, objective_scoring, spatial_basis
+
+    defaults = {
+        "spatial_adjust_criterion": spatial_basis.CRITERIA[0],
+        "spatial_adjust_neighbours": spatial_basis.DEFAULT_NEIGHBOURS,
+        "spatial_adjust_knots_min": spatial_basis.DEFAULT_KNOTS_MIN,
+        "spatial_adjust_knots_max": spatial_basis.DEFAULT_KNOTS_MAX,
+        "residualize_spline_df": objective_scoring.SPLINE_DF,
+        "residualize_spline_min_unique": objective_scoring.SPLINE_MIN_UNIQUE,
+        "exposure_response_spline_df": exposure_response.SPLINE_DF,
+    }
+    return {k: v for k, v in values.items() if v != defaults[k]}
+
+
+def _fingerprint_spelling(method: str, select: str | None, tune_method: str) -> str:
+    """The adjustment as the search fingerprint spells it.
+
+    A basis adjustment keeps the names it had before the methods were named
+    by what they compute (``ks_aic`` when the outcome model picks the df,
+    ``spatial_plus`` otherwise), so earlier runs keep their hash. Spatial+
+    reaches only the reports, so it leaves the search's hash alone unless it
+    also residualizes the search inputs.
+    """
+    if method == "basis":
+        return "ks_aic" if select == "df_outcome_ic" else "spatial_plus"
+    if method == "spatial_plus" and tune_method == "spatial_plus_inputs":
+        return "spatial_plus_inputs"
+    return "none"
+
+
 def _fusion_config_fingerprint(
     *,
     buffer_meters: float,
@@ -1251,8 +1691,11 @@ def _fusion_config_fingerprint(
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
     spatial_adjust_method: str = "none",
-    spatial_adjust_max_df: int = 10,
+    spatial_adjust_max_df: int | None = None,
     spatial_adjust_eps_m: float | None = None,
+    spatial_adjust_df: list[int] | None = None,
+    spatial_options: dict | None = None,
+    residualize_options: dict | None = None,
     gvi_ladder_spacing: str = "linear",
     gvi_ladder_rungs: int = 15,
     ndvi_ladder_spacing: str = "linear",
@@ -1264,14 +1707,27 @@ def _fusion_config_fingerprint(
     gvi_min_coverage: float = 0.95,
     drop_collinear_channels: bool = False,
     categorical_missing: str = "drop",
+    split_seed: int = 42,
+    spatial_split_mode: str = "stripe",
 ) -> str:
     """8-char hex hash of every setting that changes the search space / split.
 
     Anything that affects which params are suggested or which entities are
     sampled lives here; purely cosmetic knobs (standalone toggle, bootstrap
     counts) are excluded so they don't fragment the per-job caches.
+    ``spatial_options`` / ``residualize_options`` hold the smoothing settings
+    that differ from their defaults (:func:`_non_default_options`), so a run
+    at the defaults keeps its hash.
     """
     import hashlib as _hl
+
+    dfs = _spatial_df_list(spatial_adjust_df, spatial_adjust_max_df)
+    # A df list 0 … N is the older ``max_df`` N, so it keeps that hash.
+    df_text = (
+        str(dfs[-1])
+        if dfs == list(range(dfs[-1] + 1))
+        else ",".join(str(d) for d in dfs)
+    )
 
     payload = "|".join(
         [
@@ -1308,12 +1764,14 @@ def _fusion_config_fingerprint(
         # cache; only appended when on so legacy runs keep their hash.
         + (
             [
-                f"spadj:{spatial_adjust_method}@{int(spatial_adjust_max_df)}@"
+                f"spadj:{spatial_adjust_method}@{df_text}@"
                 f"{spatial_adjust_eps_m if spatial_adjust_eps_m is not None else 'auto'}"
             ]
+            + [f"{k}:{v}" for k, v in sorted((spatial_options or {}).items())]
             if spatial_adjust_method and spatial_adjust_method != "none"
             else []
         )
+        + [f"{k}:{v}" for k, v in sorted((residualize_options or {}).items())]
         # Categorical covariates change the design matrix (one-hot dummies), so
         # they split the cache; only appended when any covariate is categorical
         # so legacy (all-numeric) runs keep their hash.
@@ -1351,6 +1809,16 @@ def _fusion_config_fingerprint(
                 f"ndvi={ndvi_ladder_spacing}{int(ndvi_ladder_rungs)}"
             ]
             if "log" in (gvi_ladder_spacing, ndvi_ladder_spacing)
+            else []
+        )
+        # Another split seed holds out other rows; only appended when the seed
+        # is not the default, so default runs keep their hash.
+        + ([f"ss:{int(split_seed)}"] if int(split_seed) != 42 else [])
+        # Randomly drawn test blocks are another split; only appended when
+        # used, so striped runs keep their hash.
+        + (
+            [f"spm:{spatial_split_mode}"]
+            if spatial_split and spatial_split_mode != "stripe"
             else []
         )
     )
@@ -1502,6 +1970,17 @@ def run_fusion(
     cache_metrics: bool = False,
     test_size: float,
     objective_metric: str,
+    split_seed: int = 42,
+    outer_splits: int = 1,
+    outer_comparators: str = "primary",
+    outer_report: str = "full",
+    outer_null_runs: int = 0,
+    outer_null_kind: str = "spatial",
+    outer_null_group: str | None = None,
+    outer_null_stop_after: int | None = None,
+    outer_null_stop_low: int | None = None,
+    outer_null_stop_high: int | None = None,
+    outer_null_workers: int | None = None,
     gvi_api_key: str | None = None,
     ndvi_start_date: str | None = None,
     ndvi_end_date: str | None = None,
@@ -1524,9 +2003,32 @@ def run_fusion(
     whole_grid_scaling: bool = False,
     area_balanced_split: bool = False,
     spatial_adjust_method: str = "none",
-    spatial_adjust_max_df: int = 10,
+    spatial_adjust_max_df: int | None = None,
     spatial_adjust_eps_m: float | None = None,
+    spatial_adjust_df: list[int] | None = None,
+    spatial_adjust_criterion: str = "aic",
+    spatial_adjust_neighbours: int = 10,
+    spatial_adjust_knots_min: int = 35,
+    spatial_adjust_knots_max: int = 150,
+    spatial_paired_smooth: str = "own",
+    spatial_adjust_scale_m: "list[float] | float | None" = None,
+    spatial_adjust_min_component: int | None = None,
+    spatial_tune_scale_m: float | None = None,
+    spatial_adjust_select: str | None = None,
+    spatial_tune_method: str = "basis",
+    spatial_tune_select: str = "fixed_scale",
+    spatial_plus_groups_column: str | None = None,
+    spatial_plus_k: int = 300,
+    spatial_plus_criterion: str = "gcv",
+    spatial_plus_checks: list[str] | None = None,
+    spatial_plus_step1_covariates: bool = False,
+    spatial_select_scales_m: list[int] | None = None,
+    spatial_select_criterion: str = "bic",
+    spatial_select_controls: str = "target",
     residualize_method: str = "linear",
+    residualize_spline_df: int = 4,
+    residualize_spline_min_unique: int = 7,
+    exposure_response_spline_df: int = 4,
     search_scoring_method: str = "mom_em3",
     channel_set: str = "",
     index_form: str = "sweep",
@@ -1538,6 +2040,11 @@ def run_fusion(
     posterior_draws: int = 800,
     posterior_warmup: int = 800,
     posterior_chains: int = 4,
+    outer_warm_start: bool = True,
+    synergy_warm_start: bool = True,
+    outer_posterior_draws: int | None = None,
+    outer_posterior_warmup: int | None = None,
+    outer_posterior_chains: int | None = None,
     radius_prior: str = "rungs",
     gvi_min_coverage: float = 0.95,
     gvi_ladder_spacing: str = "linear",
@@ -1547,6 +2054,7 @@ def run_fusion(
     spatial_split: bool = False,
     spatial_block_size_m: float | None = None,
     n_spatial_blocks: int | None = None,
+    spatial_split_mode: str = "stripe",
     check_collinearity: bool = True,
     vif_threshold: float = 10.0,
     drop_collinear_channels: bool = False,
@@ -1555,9 +2063,13 @@ def run_fusion(
     report_effects_permutations: int = 1000,
     report_paired_bootstrap: int = 2000,
     exposure_iqr: float | None = None,
+    fixed_iqr: dict | None = None,
+    weight_column: str | None = None,
+    weight_search: bool = False,
     moderator_columns: list[str] | None = None,
     negative_controls: list[str] | None = None,
     negative_control_retune: bool = False,
+    specificity_contrast: bool = False,
     comparators: list[str] | None = None,
     comparators_primary: list[str] | None = None,
 ) -> dict:
@@ -1571,9 +2083,10 @@ def run_fusion(
     report whether the pick itself reproduces, and ``gain_splits`` compare the
     composite against each standalone under the identical procedure with a
     permutation null on the gain. The winning params are then scored once on
-    the held-out test split with a percentile bootstrap CI. When standalones are enabled, both a whole-data (``all``) paired
-    objective comparison and an ``all``-data AIC/BIC comparison report whether
-    CGI is justified over the best single channel.
+    the held-out test split with a percentile bootstrap CI. When standalones
+    are enabled, a held-out paired objective comparison against the channel
+    scoring best on train+val gives the verdict, and an in-sample AIC/BIC
+    comparison against that channel is reported beside it.
 
     The ``report_*`` knobs set the reporting replicate budgets: the test-set
     CI bootstrap (``report_ci_bootstrap``; ``None`` picks 2,000 for the O(n²)
@@ -1587,15 +2100,39 @@ def run_fusion(
     drawn from ``report_paired_bootstrap`` resamples. ``negative_control_retune``
     also re-runs the CGI's sweep and posterior with each control as the target
     and reports how closely that tuning reproduces the target's.
+    ``specificity_contrast`` tests, per control on the held-out rows, whether
+    the CGI is more specific than each primary comparator and the comparison
+    channel (``ΔD = D_cgi − D_e``, ``D = |β_target| − |β_control|``), on the
+    first split and on every repeated one.
 
     ``comparators`` names target columns holding finished exposures to
     benchmark the composite against. Each is scored untuned, as a frozen
     composite, on the CGI's own rows, split and covariates, with a paired
     CGI − comparator test whose Holm correction runs over
-    ``comparators_primary`` (all of them when ``None``)."""
+    ``comparators_primary`` (all of them when ``None``).
+
+    ``spatial_adjust_scale_m`` defines the spatial smooth by pattern scales;
+    with more than one, the slopes are also reported at every other scale and
+    unadjusted, on every held-out split (one split when ``outer_splits`` is 1).
+    ``spatial_tune_scale_m`` tunes within areas: the smooth at that scale joins
+    the covariates of every index search, and is the reported scale unless
+    ``spatial_adjust_scale_m`` lists others.
+    ``outer_splits`` > 1 repeats split → tuning → held-out scoring on seeds
+    ``split_seed + 1 …`` (see :mod:`geofuse.jobs.outer_splits`), scoring the
+    comparators ``outer_comparators`` names on each, and reports the spread
+    and a corrected resampled t across all splits; every other report stays
+    on the first split. ``outer_report="decision"`` keeps only the estimates
+    those decisions read on the later splits. ``outer_null_runs`` null
+    outcomes of ``outer_null_kind`` (areas from ``outer_null_group``, else the
+    smooth's clusters) then go through the same search and splits in that
+    report, and give the decision's false-positive rate
+    (:mod:`geofuse.jobs.outer_null`), stopped early by the
+    ``outer_null_stop_*`` rule when set."""
     # Bound before the body so the handlers below can close out the ledger no
     # matter how early a run fails.
     ledger = None
+    # Memory of the job's process tree, read per stage at the end of the run.
+    memory = parallel.MemorySampler().start()
 
     def _close_ledger(status: str, message: str) -> None:
         """Stop the clock on the stage the run died inside, and persist it."""
@@ -1640,6 +2177,19 @@ def run_fusion(
         index_forms: tuple[str, ...] = (
             _bayesian_index.FORMS if index_form == "sweep" else (index_form,)
         )
+        # A job recorded before the select setting existed passes no
+        # ``spatial_adjust_select``: its method is mapped to what it computed.
+        spatial_adjust_method, spatial_adjust_select = _settings.spatial_method_pair(
+            spatial_adjust_method,
+            spatial_adjust_select,
+            scales=spatial_adjust_scale_m,
+            tune_scale=spatial_tune_scale_m,
+        )
+        if weight_search and (not weight_column or "synergy" in index_forms):
+            raise ValueError(
+                "weight_search needs a weight_column and fits the linear form "
+                "only: set index_form to 'linear'."
+            )
 
         standalones: list[str] = list(standalone_channels or [])
         allowed = _cgi_formulas.formula_channels(cgi_formula)
@@ -1708,6 +2258,27 @@ def run_fusion(
         )
         # A panel (several rows per entity) skips it once its data are known.
         retune_enabled = bool(negative_control_retune) and bool(negative_controls)
+        spatial_scales = _spatial_scale_list(spatial_adjust_scale_m)
+        # A composite tuned within areas is scored within the same areas.
+        if spatial_tune_scale_m and not spatial_scales:
+            spatial_scales = [float(spatial_tune_scale_m)]
+        # Other scales and the unadjusted slopes, reported next to the primary.
+        scale_ladder: list[float | None] = (
+            [*spatial_scales[1:], None] if len(spatial_scales) > 1 else []
+        )
+        if spatial_adjust_method != "basis":
+            scale_ladder = []
+        # A scale chosen per split is one of the candidates; the slopes are
+        # also reported at every candidate and unadjusted.
+        selected_scale = (
+            spatial_adjust_method == "basis" and spatial_adjust_select == "scale_ic"
+        )
+        if selected_scale:
+            spatial_scales = [
+                float(v)
+                for v in (spatial_select_scales_m or _settings.SPATIAL_SELECT_SCALES_M)
+            ]
+            scale_ladder = [*spatial_scales, None]
         ledger = _build_fusion_ledger(
             all_labels,
             multi=multi_outcome,
@@ -1716,8 +2287,101 @@ def run_fusion(
             mixedlm_postscore=mixedlm_postscore_enabled,
             negative_control_retune=retune_enabled,
             comparators=bool(comparator_cols),
+            weighted=bool(weight_column),
+            spatial_plus=spatial_adjust_method == "spatial_plus",
+            outer_splits=int(outer_splits) > 1 or bool(scale_ladder),
+            outer_null=int(outer_splits) > 1 and int(outer_null_runs or 0) > 0,
         )
         ctx.update_stage_ledger(ledger.to_dict())
+
+        # Smoothing settings: recorded when they act (a spatially adjusted run,
+        # spline residualizing) or differ from their default, so a run without
+        # them keeps its record and hash.
+        spatial_dfs = _spatial_df_list(spatial_adjust_df, spatial_adjust_max_df)
+        # The scale settings act only when set, so they join the record and
+        # hash only then.
+        scale_settings: dict[str, Any] = {}
+        if spatial_scales:
+            scale_settings["spatial_adjust_scale_m"] = list(spatial_scales)
+        if spatial_adjust_min_component:
+            scale_settings["spatial_adjust_min_component"] = int(
+                spatial_adjust_min_component
+            )
+        if spatial_tune_scale_m:
+            scale_settings["spatial_tune_scale_m"] = float(spatial_tune_scale_m)
+        spatial_settings = {
+            "spatial_adjust_criterion": str(spatial_adjust_criterion),
+            "spatial_adjust_neighbours": int(spatial_adjust_neighbours),
+            "spatial_adjust_knots_min": int(spatial_adjust_knots_min),
+            "spatial_adjust_knots_max": int(spatial_adjust_knots_max),
+        }
+        selection_settings = {
+            "spatial_select_scales_m": list(
+                spatial_select_scales_m or _settings.SPATIAL_SELECT_SCALES_M
+            ),
+            "spatial_select_criterion": str(spatial_select_criterion),
+            "spatial_select_controls": str(spatial_select_controls),
+        }
+        plus_settings = {
+            "spatial_plus_groups_column": spatial_plus_groups_column or None,
+            "spatial_plus_k": int(spatial_plus_k),
+            "spatial_plus_criterion": str(spatial_plus_criterion),
+            "spatial_plus_checks": list(spatial_plus_checks or []),
+            "spatial_plus_step1_covariates": bool(spatial_plus_step1_covariates),
+        }
+        # The search-side options that act: they change the search, so they
+        # join the fingerprint (only when set, so other runs keep their hash).
+        tune_options: dict[str, Any] = {}
+        if str(spatial_tune_method) != "basis":
+            tune_options["spatial_tune_method"] = str(spatial_tune_method)
+            tune_options.update(plus_settings)
+        if spatial_adjust_method == "basis" and str(spatial_tune_select) == "scale_ic":
+            tune_options["spatial_tune_select"] = "scale_ic"
+            tune_options.update(selection_settings)
+        if spatial_adjust_method == "basis" and spatial_adjust_select == "scale_ic":
+            tune_options["spatial_adjust_select"] = "scale_ic"
+            tune_options.update(selection_settings)
+        spatial_record: dict[str, Any] = {}
+        if spatial_adjust_method == "basis":
+            spatial_record = {
+                "spatial_adjust_method": "basis",
+                "spatial_adjust_select": str(spatial_adjust_select),
+                "spatial_adjust_df": list(spatial_dfs),
+                "spatial_adjust_eps_m": spatial_adjust_eps_m,
+                **spatial_settings,
+                "spatial_paired_smooth": str(spatial_paired_smooth),
+                **scale_settings,
+                **(
+                    selection_settings
+                    if "scale_ic" in (spatial_adjust_select, spatial_tune_select)
+                    else {}
+                ),
+                **(
+                    {"spatial_tune_select": str(spatial_tune_select)}
+                    if spatial_tune_select != "fixed_scale"
+                    else {}
+                ),
+            }
+        elif spatial_adjust_method == "spatial_plus":
+            spatial_record = {
+                "spatial_adjust_method": "spatial_plus",
+                "spatial_adjust_eps_m": spatial_adjust_eps_m,
+                "spatial_adjust_min_component": spatial_adjust_min_component,
+                **plus_settings,
+                "spatial_tune_method": str(spatial_tune_method),
+            }
+        spline_settings = {
+            "residualize_spline_df": int(residualize_spline_df),
+            "residualize_spline_min_unique": int(residualize_spline_min_unique),
+        }
+        spline_record: dict[str, Any] = (
+            dict(spline_settings) if residualize_method == "spline" else {}
+        )
+        spline_record.update(
+            _non_default_options(
+                {"exposure_response_spline_df": int(exposure_response_spline_df)}
+            )
+        )
 
         # Settings snapshot written verbatim into each job's ``study_results``
         # so the run is reproducible from disk (the job store records the same
@@ -1727,6 +2391,7 @@ def run_fusion(
         run_config_record: dict[str, Any] = {
             "objective_metric": objective_metric,
             "residualize_method": str(residualize_method),
+            **spline_record,
             "search_scoring_method": str(search_scoring_method),
             "cgi_formula": cgi_formula,
             "channel_set": channel_set,
@@ -1744,6 +2409,55 @@ def run_fusion(
             "posterior_draws": int(posterior_draws),
             "posterior_warmup": int(posterior_warmup),
             "posterior_chains": int(posterior_chains),
+            # Only off their defaults: unchanged runs keep their record and hash.
+            **({} if synergy_warm_start else {"synergy_warm_start": False}),
+            **(
+                {
+                    "outer_warm_start": bool(outer_warm_start),
+                    "outer_posterior_draws": outer_posterior_draws,
+                    "outer_posterior_warmup": outer_posterior_warmup,
+                    "outer_posterior_chains": outer_posterior_chains,
+                }
+                if int(outer_splits) > 1
+                else {}
+            ),
+            **(
+                {"outer_report": str(outer_report)}
+                if int(outer_splits) > 1 and str(outer_report) != "full"
+                else {}
+            ),
+            **(
+                {
+                    "outer_null_runs": int(outer_null_runs),
+                    "outer_null_kind": str(outer_null_kind),
+                    "outer_null_group": outer_null_group or None,
+                    **(
+                        {
+                            "outer_null_gaps": {
+                                "spatial_adjust_eps_m": spatial_adjust_eps_m,
+                                "spatial_adjust_min_component": (
+                                    spatial_adjust_min_component
+                                ),
+                            }
+                        }
+                        if not outer_null_group
+                        and spatial_adjust_method != "basis"
+                        and (spatial_adjust_eps_m or spatial_adjust_min_component)
+                        else {}
+                    ),
+                    "outer_null_stop": (
+                        {
+                            "after": outer_null_stop_after,
+                            "low": outer_null_stop_low,
+                            "high": outer_null_stop_high,
+                        }
+                        if outer_null_stop_after
+                        else None
+                    ),
+                }
+                if int(outer_splits) > 1 and int(outer_null_runs or 0) > 0
+                else {}
+            ),
             "radius_prior": str(radius_prior),
             "gvi_min_coverage": float(gvi_min_coverage),
             "buffer_meters": buffer_meters,
@@ -1769,6 +2483,10 @@ def run_fusion(
             "spatial_split": bool(spatial_split),
             "spatial_block_size_m": spatial_block_size_m,
             "n_spatial_blocks": n_spatial_blocks,
+            "spatial_split_mode": str(spatial_split_mode),
+            "split_seed": int(split_seed),
+            "outer_splits": int(outer_splits),
+            "outer_comparators": str(outer_comparators),
             "check_collinearity": bool(check_collinearity),
             "vif_threshold": float(vif_threshold),
             "drop_collinear_channels": bool(drop_collinear_channels),
@@ -1776,9 +2494,18 @@ def run_fusion(
             "report_effects_bootstrap": int(report_effects_bootstrap),
             "report_effects_permutations": int(report_effects_permutations),
             "exposure_iqr": exposure_iqr,
+            **({"fixed_iqr": dict(fixed_iqr)} if fixed_iqr else {}),
+            **(
+                {"weight_column": weight_column, "weight_search": bool(weight_search)}
+                if weight_column
+                else {}
+            ),
             "moderator_columns": list(moderator_columns or []),
             "negative_controls": list(negative_controls or []),
             "negative_control_retune": bool(negative_control_retune),
+            # Only when on: off, the record and its hash match a run without it.
+            **({"specificity_contrast": True} if specificity_contrast else {}),
+            **spatial_record,
             "comparators": list(comparator_cols),
             "comparators_primary": list(primary_cols),
             "report_paired_bootstrap": int(report_paired_bootstrap),
@@ -1794,6 +2521,13 @@ def run_fusion(
         # A short hash of the settings above, so a result can be matched against
         # the configuration that produced it — and a pre-registered analysis can
         # be shown to be the one that ran, rather than asserted to be.
+        if weight_search:
+            _log_fusion(
+                "WARN",
+                f"The search is weighted by '{weight_column}': the index, its "
+                "posterior and the null calibration refer to the weighted "
+                "likelihood, not to the sample's.",
+            )
         run_config_record["config_hash"] = hashlib.sha256(
             json.dumps(run_config_record, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]
@@ -1856,8 +2590,8 @@ def run_fusion(
             def skey(step: str, _label: str = label) -> str:
                 return _fusion_stage_key(_label, step, multi=multi_outcome)
 
-            def prog(local: float) -> float:
-                return (ti + local) / n_t
+            def prog(local: float, _ti: int = ti) -> float:
+                return (_ti + local) / n_t
 
             # Stage keys belonging to this outcome, for the ledger-derived main
             # progress bar. For multi-outcome runs keys carry a "<label>::"
@@ -1870,7 +2604,10 @@ def run_fusion(
             ]
             _label_total_weight = sum(_fusion_stage_weight(k) for k in label_stage_keys)
 
-            def prog_ledger() -> float:
+            def prog_ledger(
+                _keys: list[str] = label_stage_keys,
+                _total: float = _label_total_weight,
+            ) -> float:
                 """Main-bar value derived from this outcome's ledger state.
 
                 ``(finished + running·progress)`` weighted by
@@ -1878,10 +2615,10 @@ def run_fusion(
                 into the outcome's slice via ``prog``. Monotonic by construction
                 — stages only advance and a running stage's fraction only grows.
                 """
-                if _label_total_weight <= 0:
+                if _total <= 0:
                     return prog(0.0)
                 done = 0.0
-                for k in label_stage_keys:
+                for k in _keys:
                     st_ = ledger.get(k)
                     if st_ is None:
                         continue
@@ -1890,7 +2627,7 @@ def run_fusion(
                         done += w
                     elif st_.status == RUNNING:
                         done += w * st_.progress
-                return prog(done / _label_total_weight)
+                return prog(done / _total)
 
             ctx.progress(
                 value=prog_ledger(),
@@ -1970,14 +2707,46 @@ def run_fusion(
                 whole_grid_scaling=whole_grid_scaling,
                 area_balanced_split=area_balanced_split,
                 spatial_adjust_method=spatial_adjust_method,
-                spatial_adjust_max_df=spatial_adjust_max_df,
+                spatial_adjust_df=spatial_dfs,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                spatial_adjust_criterion=str(spatial_adjust_criterion),
+                spatial_adjust_neighbours=int(spatial_adjust_neighbours),
+                spatial_adjust_knots_min=int(spatial_adjust_knots_min),
+                spatial_adjust_knots_max=int(spatial_adjust_knots_max),
+                spatial_paired_smooth=str(spatial_paired_smooth),
+                spatial_adjust_scale_m=spatial_scales or None,
+                spatial_adjust_min_component=spatial_adjust_min_component,
+                spatial_tune_scale_m=spatial_tune_scale_m or None,
+                spatial_adjust_select=spatial_adjust_select,
+                spatial_tune_method=str(spatial_tune_method),
+                spatial_tune_select=str(spatial_tune_select),
+                spatial_plus_groups_column=spatial_plus_groups_column or None,
+                spatial_plus_k=int(spatial_plus_k),
+                spatial_plus_criterion=str(spatial_plus_criterion),
+                spatial_plus_checks=list(spatial_plus_checks or []),
+                spatial_plus_step1_covariates=bool(spatial_plus_step1_covariates),
+                spatial_select_scales_m=spatial_select_scales_m,
+                spatial_select_criterion=str(spatial_select_criterion),
+                spatial_select_controls=str(spatial_select_controls),
                 residualize_method=residualize_method,
+                residualize_spline_df=int(residualize_spline_df),
+                residualize_spline_min_unique=int(residualize_spline_min_unique),
+                exposure_response_spline_df=int(exposure_response_spline_df),
                 search_scoring_method=search_scoring_method,
                 negative_control_columns=outcome_ncs,
                 comparator_columns=outcome_cmps,
+                weight_column=weight_column or None,
+                weight_search=bool(weight_search),
+                null_group_column=(
+                    outer_null_group
+                    if int(outer_splits) > 1 and int(outer_null_runs or 0) > 0
+                    else None
+                ),
             )
 
+            # ────────────────────────────────────────────
+            # Target and greenery inputs
+            # ────────────────────────────────────────────
             ctx.progress(
                 value=prog_ledger(), status_text=f"{prefix}Loading target data..."
             )
@@ -2011,14 +2780,13 @@ def run_fusion(
 
             last_update_time = {"veg": 0.0, "terrain": 0.0}
 
-            def gvi_progress_callback(component, curr, total):
+            def gvi_progress_callback(
+                component, curr, total, _last: dict = last_update_time
+            ):
                 current_time = time.time()
-                if (
-                    current_time - last_update_time.get(component, 0) < 0.5
-                    and curr != total
-                ):
+                if current_time - _last.get(component, 0) < 0.5 and curr != total:
                     return
-                last_update_time[component] = current_time
+                _last[component] = current_time
                 gvi_progress = {
                     "component": component,
                     "current": curr,
@@ -2180,6 +2948,9 @@ def run_fusion(
                 if ctx.is_cancelled():
                     return {"output_paths": output_paths}
 
+            # ────────────────────────────────────────────
+            # Spatial pre-processing
+            # ────────────────────────────────────────────
             # Sample materialization + the on-disk pre-aggregation cache form one
             # "spatial pre-processing" stage; prepare_fusion_data feeds the cache.
             stage(skey("preaggregate"), RUNNING)
@@ -2200,11 +2971,16 @@ def run_fusion(
             # aggregations. Resumable across cancels/crashes.
             _last_pct = {"v": -1}
 
-            def preaggr_progress(current: int, total: int) -> None:
+            def preaggr_progress(
+                current: int,
+                total: int,
+                _last: dict = _last_pct,
+                _prefix: str = prefix,
+            ) -> None:
                 pct = (current * 100) // max(1, total)
-                if pct == _last_pct["v"]:
+                if pct == _last["v"]:
                     return
-                _last_pct["v"] = pct
+                _last["v"] = pct
                 ctx.set_extra(
                     preaggr_progress={
                         "current": current,
@@ -2216,7 +2992,7 @@ def run_fusion(
                 ctx.progress(
                     value=prog_ledger(),
                     status_text=(
-                        f"{prefix}Spatial pre-processing: "
+                        f"{_prefix}Spatial pre-processing: "
                         f"{current:,}/{total:,} grid cells ({pct}%)"
                     ),
                 )
@@ -2275,7 +3051,7 @@ def run_fusion(
                             f"[{label}] Collinearity check: "
                             f"{sorted(engine._high_vif_channels)} above the VIF "
                             f"threshold (kept in the search). VIFs (initial): "
-                            f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs']))}.",
+                            f"{dict(zip(collinearity_report['channels_in'], collinearity_report['initial_vifs'], strict=False))}.",
                         )
                     elif collinearity_report:
                         _log_fusion(
@@ -2315,9 +3091,24 @@ def run_fusion(
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
-                spatial_adjust_method=spatial_adjust_method,
-                spatial_adjust_max_df=spatial_adjust_max_df,
+                spatial_adjust_method=_fingerprint_spelling(
+                    spatial_adjust_method, spatial_adjust_select, spatial_tune_method
+                ),
+                spatial_adjust_df=spatial_dfs,
                 spatial_adjust_eps_m=spatial_adjust_eps_m,
+                spatial_options={
+                    **_non_default_options(spatial_settings),
+                    **scale_settings,
+                    **{
+                        k: (",".join(map(str, v)) if isinstance(v, list) else v)
+                        for k, v in tune_options.items()
+                    },
+                },
+                residualize_options=(
+                    _non_default_options(spline_settings)
+                    if residualize_method == "spline"
+                    else None
+                ),
                 gvi_ladder_spacing=gvi_ladder_spacing,
                 gvi_ladder_rungs=int(gvi_ladder_rungs),
                 ndvi_ladder_spacing=ndvi_ladder_spacing,
@@ -2329,18 +3120,28 @@ def run_fusion(
                 gvi_min_coverage=float(gvi_min_coverage),
                 drop_collinear_channels=bool(drop_collinear_channels),
                 categorical_missing=str(categorical_missing),
+                split_seed=int(split_seed),
+                spatial_split_mode=str(spatial_split_mode),
             )
 
-            def _standalone_study_name(ch: str) -> str:
-                ch_suffix = ch if resume_existing_study else f"{ch}_{suffix}"
+            def _standalone_study_name(
+                ch: str,
+                _suffix: str = suffix,
+                _label: str = label,
+                _config_fp: str = config_fp,
+            ) -> str:
+                ch_suffix = ch if resume_existing_study else f"{ch}_{_suffix}"
                 return _build_fusion_study_name(
                     target_display_name=target_display_name,
-                    label=label,
+                    label=_label,
                     objective_metric=objective_metric,
                     suffix=ch_suffix,
-                    config_fingerprint=config_fp,
+                    config_fingerprint=_config_fp,
                 )
 
+            # ────────────────────────────────────────────
+            # Held-out split
+            # ────────────────────────────────────────────
             # One held-out test split + the train+val pool that the sweep
             # selection resamples.
             stage(skey("split"), RUNNING)
@@ -2351,10 +3152,11 @@ def run_fusion(
             engine.split_data(
                 fusion_df=fusion_df,
                 test_size=test_size,
-                random_state=42,
+                random_state=int(split_seed),
                 spatial_split=bool(spatial_split),
                 spatial_block_size_m=spatial_block_size_m,
                 n_spatial_blocks=n_spatial_blocks,
+                spatial_split_mode=str(spatial_split_mode),
             )
             stage(skey("split"), DONE)
 
@@ -2393,7 +3195,9 @@ def run_fusion(
             # (one channel's radius x statistic instead of the product) and no
             # trial-budget scaling is needed.
 
-            def _study_progress_cb(study_label: str, stage_key: str | None = None):
+            def _study_progress_cb(
+                study_label: str, stage_key: str | None = None, _prefix: str = prefix
+            ):
                 """Per-stage callback → live caption, progress bar, stage row.
 
                 Throttled to ~0.4 s (always fires on the last step) so the
@@ -2419,7 +3223,7 @@ def run_fusion(
                         )
                     ctx.progress(
                         value=prog_ledger() if stage_key is not None else None,
-                        status_text=f"{prefix}{study_label}: {done:,}/{total:,} steps",
+                        status_text=f"{_prefix}{study_label}: {done:,}/{total:,} steps",
                         fusion_study_progress={
                             "study": study_label,
                             "current": int(done),
@@ -2430,7 +3234,9 @@ def run_fusion(
 
                 return _cb
 
-            # ── Sweep + posterior (dominant compute) ────
+            # ────────────────────────────────────────────
+            # Sweep + posterior (dominant compute)
+            # ────────────────────────────────────────────
             # Headline params: the configuration the sweep picked on the
             # train+val pool, with posterior-mean weights. The sub-bar and the
             # running-stage fraction both live here, so the stage and the
@@ -2458,6 +3264,7 @@ def run_fusion(
                 seed=42,
                 cancel_callback=cancel_check,
                 progress_callback=_study_progress_cb("CGI", skey("optimize")),
+                synergy_warm_start=bool(synergy_warm_start),
             )
             engine.best_params = dict(headline_params)
             cgi_discovery_summary = _posterior_summary(headline_params)
@@ -2469,7 +3276,9 @@ def run_fusion(
                 return {"output_paths": output_paths}
             stage(skey("optimize"), DONE)
 
-            # ── Score the held-out test set ─────────────
+            # ────────────────────────────────────────────
+            # Score the held-out test set
+            # ────────────────────────────────────────────
             stage(skey("evaluate"), RUNNING)
             ctx.progress(
                 value=prog_ledger(),
@@ -2480,7 +3289,9 @@ def run_fusion(
             )
             stage(skey("evaluate"), DONE)
 
-            # ── Replicate statistics: the long tail ─────
+            # ────────────────────────────────────────────
+            # Replicate statistics: the long tail
+            # ────────────────────────────────────────────
             # Test-set percentile bootstrap CI, relationship direction, and the
             # held-out effect sizes / permutation p-value — thousands of
             # replicates, named for what it is instead of hiding under
@@ -2572,7 +3383,9 @@ def run_fusion(
                 _log_fusion("WARN", f"[{label}] Per-entity table not written: {exc}")
             stage(skey("apply"), DONE)
 
-            # ── Post-hoc multi-metric reporting ─────────
+            # ────────────────────────────────────────────
+            # Post-hoc multi-metric reporting
+            # ────────────────────────────────────────────
             # Re-score the trial pool on the test set with all four mixedlm_*
             # metrics, so metric agreement is visible. Skipped when the spec is
             # only routing files per year and the scorer is OLS.
@@ -2605,7 +3418,9 @@ def run_fusion(
                     )
                 stage(skey("mixedlm_postscore"), DONE)
 
-            # ── Standalone discoveries ──────────────────
+            # ────────────────────────────────────────────
+            # Standalone discoveries
+            # ────────────────────────────────────────────
             # One search per channel, reusing the engine, its cache and split.
             # Each overwrites the engine's active channel and best params, so
             # snapshot the CGI state here and restore it after the loop.
@@ -2793,7 +3608,9 @@ def run_fusion(
                 engine.best_params = cgi_best_params
                 engine._active_greenery_channel = "cgi"
 
-            # ── AIC/BIC vs the best standalone ──────────
+            # ────────────────────────────────────────────
+            # AIC/BIC vs the best standalone
+            # ────────────────────────────────────────────
             cgi_vs_standalone_aic_bic: dict | None = None
             if standalones:
                 cgi_vs_standalone_aic_bic = _compare_cgi_vs_standalone(
@@ -2807,18 +3624,19 @@ def run_fusion(
                 if cgi_vs_standalone_aic_bic and cgi_vs_standalone_aic_bic.get("ok"):
                     _log_fusion(
                         "OK",
-                        f"[{label}] CGI vs best standalone "
+                        f"[{label}] CGI vs standalone, in-sample AIC/BIC "
                         f"({cgi_vs_standalone_aic_bic['best_channel']}): "
+                        f"ΔAIC={cgi_vs_standalone_aic_bic['delta_aic']:.1f}, "
                         f"ΔBIC={cgi_vs_standalone_aic_bic['delta_bic']:.1f} → "
                         f"{cgi_vs_standalone_aic_bic['verdict']}.",
                     )
 
             # Paired bootstrap objective difference (CGI − standalone) on the
-            # full dataset, in the metric's own units — computed for every
+            # held-out rows, in the metric's own units — computed for every
             # standalone channel as one family and Holm-corrected across it, so
             # comparing CGI against several channels doesn't inflate
-            # significance. The headline verdict is the AIC/BIC best channel;
-            # AIC/BIC stays a secondary report.
+            # significance. The headline verdict is the channel chosen on the
+            # train+val pool; AIC/BIC stays a secondary, in-sample report.
             cgi_vs_standalone_paired: dict | None = None
             cgi_vs_standalone_paired_family: list[dict] = []
             if standalones and standalones_bundle:
@@ -2841,7 +3659,8 @@ def run_fusion(
                         engine._active_greenery_channel = ch
                         ch_bundle["exposure_response"] = (
                             engine.compute_exposure_response(
-                                params=ch_params, iqr=exposure_iqr
+                                params=ch_params,
+                                iqr=_fixed_scale(fixed_iqr, ch, exposure_iqr),
                             )
                         )
                     except Exception as exc:
@@ -2870,20 +3689,34 @@ def run_fusion(
 
             if cgi_vs_standalone_paired_family:
                 try:
+                    comparison_ch, _ = comparison_channel(
+                        standalones_bundle,
+                        [c for c in standalones if c in standalones_bundle],
+                        objective_metric,
+                    )
                     head = _paired_family_headline(
-                        cgi_vs_standalone_paired_family,
-                        (cgi_vs_standalone_aic_bic or {}).get("best_channel"),
+                        cgi_vs_standalone_paired_family, comparison_ch
                     )
                     cgi_vs_standalone_paired = head
-                    _log_fusion(
-                        "OK",
-                        f"[{label}] CGI vs standalones (family of "
-                        f"{len(cgi_vs_standalone_paired_family)}): headline "
-                        f"`{head.get('standalone_channel')}` "
-                        f"Δ={_fmt_or_na(head.get('observed_diff'), '.4f')}, "
-                        f"p={_fmt_or_na(head.get('p_value'), '.4g')}, "
-                        f"Holm p={_fmt_or_na(head.get('p_value_holm'), '.4g')}.",
-                    )
+                    if head is None:
+                        _log_fusion(
+                            "WARN",
+                            f"[{label}] CGI vs standalones: no paired row for "
+                            f"the channel chosen on train+val ({comparison_ch}), "
+                            "so there is no headline comparison.",
+                        )
+                    else:
+                        _log_fusion(
+                            "OK",
+                            f"[{label}] CGI vs standalones (family of "
+                            f"{len(cgi_vs_standalone_paired_family)}): headline "
+                            f"`{head.get('standalone_channel')}` (chosen on "
+                            "train+val), held-out "
+                            f"Δ={_fmt_or_na(head.get('observed_diff'), '.4f')}, "
+                            f"p={_fmt_or_na(head.get('p_value'), '.4g')}, Holm "
+                            f"p={_fmt_or_na(head.get('p_value_holm'), '.4g')} → "
+                            f"{head.get('verdict')}.",
+                        )
                 except Exception as exc:
                     _log_fusion(
                         "WARN",
@@ -2891,7 +3724,9 @@ def run_fusion(
                         "The run continues.",
                     )
 
-            # ── Comparator exposures ────────────────────
+            # ────────────────────────────────────────────
+            # Comparator exposures
+            # ────────────────────────────────────────────
             # Finished exposures from the target table, scored untuned on the
             # CGI's own rows, split, covariates and objective, then compared
             # with the CGI pairwise. A separate family from the standalones.
@@ -2929,7 +3764,7 @@ def run_fusion(
                             n_effects_boot=int(report_effects_bootstrap),
                             n_perm=int(report_effects_permutations),
                             n_paired=int(report_paired_bootstrap),
-                            iqr=exposure_iqr,
+                            iqr=_fixed_scale(fixed_iqr, name, exposure_iqr),
                             label=label,
                             log=_log_fusion,
                         )
@@ -2956,7 +3791,9 @@ def run_fusion(
                         )
                     stage(skey("comparators"), DONE)
 
-            # ── Composite GeoTIFF (raster write) ────────
+            # ────────────────────────────────────────────
+            # Composite GeoTIFF (raster write)
+            # ────────────────────────────────────────────
             # Runs after the standalone stages so they can advance the ledger
             # first. Failures here don't kill the run — the composite_df is
             # already captured in ``bundle``.
@@ -3035,7 +3872,7 @@ def run_fusion(
             try:
                 exposure_response_report = engine.compute_exposure_response(
                     params=averaged_params or best_params,
-                    iqr=exposure_iqr,
+                    iqr=_fixed_scale(fixed_iqr, "cgi", exposure_iqr),
                 )
             except Exception as exc:
                 _log_fusion(
@@ -3115,6 +3952,324 @@ def run_fusion(
                         ),
                     )
 
+            # ────────────────────────────────────────────
+            # Specificity contrast
+            # ────────────────────────────────────────────
+            # Is the CGI more specific than the primary comparators and the
+            # comparison channel, per negative control, on the held-out rows.
+            primary_cmps = [c for c in (outcome_cmps or []) if c in primary_cols]
+            specificity_report: dict | None = None
+            if specificity_contrast:
+                sc_channel = None
+                if standalones and standalones_bundle:
+                    sc_channel, _ = comparison_channel(
+                        standalones_bundle,
+                        [c for c in standalones if c in standalones_bundle],
+                        objective_metric,
+                    )
+                sc_bundle = standalones_bundle.get(sc_channel) or {}
+                # With repeated splits, the first split scores the comparators
+                # every split scores.
+                sc_mode = str(outer_comparators) if int(outer_splits) > 1 else "primary"
+                sc_exposures = specificity_exposures(
+                    _outer.scored_comparators(
+                        [c for c in (outcome_cmps or []) if c in comparators_report],
+                        primary_cmps,
+                        sc_mode,
+                    ),
+                    primary_cmps,
+                    sc_channel,
+                    sc_bundle.get("averaged_params") or sc_bundle.get("best_params"),
+                )
+                if not outcome_ncs:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Specificity contrast needs negative controls; "
+                        "none for this outcome, so it is skipped.",
+                    )
+                elif not sc_exposures:
+                    _log_fusion(
+                        "WARN",
+                        f"[{label}] Specificity contrast needs comparators or "
+                        "standalone channels to compare the CGI with; skipped.",
+                    )
+                else:
+                    specificity_report = _specificity_report(
+                        engine,
+                        headline_params,
+                        sc_exposures,
+                        int(report_paired_bootstrap),
+                        label=label,
+                        log=_log_fusion,
+                    )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+
+            # ────────────────────────────────────────────
+            # Raw-unit effect sizes
+            # ────────────────────────────────────────────
+            raw_effects_report: dict | None = None
+            try:
+                raw_effects_report = engine.compute_raw_effects(
+                    headline_params,
+                    _raw_exposures(
+                        engine, standalones, standalones_bundle, comparators_report
+                    ),
+                    fixed_iqr=fixed_iqr,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log_fusion("WARN", f"[{label}] Raw-unit effect sizes failed: {exc}")
+
+            # ────────────────────────────────────────────
+            # Weighted estimates
+            # ────────────────────────────────────────────
+            weighted_report: dict | None = None
+            if weight_column:
+                stage(skey("weighted"), RUNNING)
+                try:
+                    weighted_report = engine.compute_weighted_report(
+                        headline_params,
+                        objective_metric,
+                        _raw_exposures(
+                            engine,
+                            standalones,
+                            standalones_bundle,
+                            comparators_report,
+                        ),
+                        channel=(cgi_vs_standalone_paired or {}).get(
+                            "standalone_channel"
+                        ),
+                        comparators=list(comparators_report or {}),
+                        specificity=specificity_report is not None,
+                        scales=_outer.raw_scales(raw_effects_report),
+                        n_boot_score=int(report_effects_bootstrap),
+                        n_boot=int(report_paired_bootstrap),
+                    )
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log_fusion("WARN", f"[{label}] Weighted estimates failed: {exc}")
+                    stage(skey("weighted"), FAILED, str(exc))
+                else:
+                    skipped = (weighted_report or {}).get("skipped")
+                    if skipped:
+                        stage(skey("weighted"), SKIPPED, str(skipped))
+                    else:
+                        stage(skey("weighted"), DONE)
+                _log_weighted(weighted_report, label)
+
+            # ────────────────────────────────────────────
+            # Spatial+ estimates
+            # ────────────────────────────────────────────
+            spatial_plus_report: dict | None = None
+            if engine.spatial_adjust_method == "spatial_plus":
+                stage(skey("spatial_plus"), RUNNING)
+                try:
+                    spatial_plus_report = engine.compute_spatial_plus(
+                        headline_params,
+                        _raw_exposures(
+                            engine,
+                            standalones,
+                            standalones_bundle,
+                            comparators_report,
+                        ),
+                        n_boot=int(report_paired_bootstrap),
+                        seed=int(split_seed),
+                        fixed_iqr=fixed_iqr,
+                    )
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    _log_fusion("WARN", f"[{label}] Spatial+ estimates failed: {exc}")
+                    stage(skey("spatial_plus"), FAILED, str(exc))
+                else:
+                    skipped = (spatial_plus_report or {}).get("skipped")
+                    if skipped:
+                        stage(skey("spatial_plus"), SKIPPED, str(skipped))
+                    else:
+                        stage(skey("spatial_plus"), DONE)
+                        _log_spatial_plus(spatial_plus_report, label)
+
+            # ── Scale profile and effective bandwidths ───────────
+            scale_profile_rows = [
+                {"split": 0, "seed": int(split_seed), **r}
+                for r in getattr(engine, "_scale_profile", None) or []
+            ]
+            bandwidth_rows = [
+                {"split": 0, "seed": int(split_seed), **r}
+                for r in engine.effective_bandwidths(seed=int(split_seed))
+            ]
+            for r in (spatial_plus_report or {}).get("effective_bandwidth") or []:
+                bandwidth_rows.append({"split": 0, "seed": int(split_seed), **r})
+
+            # ────────────────────────────────────────────
+            # Repeated held-out splits
+            # ────────────────────────────────────────────
+            outer_bundle: dict | None = None
+            if int(outer_splits) > 1 or scale_ladder:
+                outer_bundle = _run_outer_splits(
+                    engine,
+                    k_splits=int(outer_splits),
+                    split_seed=int(split_seed),
+                    split_kwargs={
+                        "fusion_df": fusion_df,
+                        "test_size": test_size,
+                        "spatial_split": bool(spatial_split),
+                        "spatial_block_size_m": spatial_block_size_m,
+                        "n_spatial_blocks": n_spatial_blocks,
+                        "spatial_split_mode": str(spatial_split_mode),
+                    },
+                    fit_kwargs={
+                        "forms": index_forms,
+                        "sweep_splits": int(sweep_splits),
+                        "draws": int(outer_posterior_draws or posterior_draws),
+                        "warmup": int(
+                            outer_posterior_warmup
+                            or outer_posterior_draws
+                            or posterior_warmup
+                        ),
+                        "chains": int(outer_posterior_chains or posterior_chains),
+                        "warm_start": bool(outer_warm_start),
+                        "synergy_warm_start": bool(synergy_warm_start),
+                        "radius_prior": str(radius_prior),
+                        "seed": 42,
+                        "cancel_callback": cancel_check,
+                    },
+                    headline_params=headline_params,
+                    metric=objective_metric,
+                    first_split={
+                        "effects": cgi_effects,
+                        "channel_paired": cgi_vs_standalone_paired,
+                        "comparator_paired": cgi_vs_comparator_paired,
+                        "negative_controls": negative_control_report,
+                        "posterior": cgi_discovery_summary,
+                        "specificity": specificity_report,
+                        "raw": raw_effects_report,
+                        "weighted": weighted_report,
+                        "spatial_plus": spatial_plus_report,
+                    },
+                    fixed_iqr=fixed_iqr,
+                    raw_exposures=_raw_exposures(
+                        engine, standalones, standalones_bundle, comparators_report
+                    ),
+                    specificity=specificity_report is not None,
+                    specificity_exposures=(
+                        sc_exposures if specificity_report is not None else None
+                    ),
+                    ladder=scale_ladder,
+                    primary_scale=(
+                        "selected"
+                        if selected_scale
+                        else (spatial_scales[0] if spatial_scales else None)
+                    ),
+                    scale_profiles=scale_profile_rows,
+                    bandwidths=bandwidth_rows,
+                    standalones=(
+                        [c for c in standalones if c in standalones_bundle]
+                        if standalones
+                        else []
+                    ),
+                    comparators=list(outcome_cmps or []),
+                    comparators_primary=[
+                        c for c in (outcome_cmps or []) if c in primary_cols
+                    ],
+                    outer_comparators=str(outer_comparators),
+                    n_effects_boot=int(report_effects_bootstrap),
+                    n_perm=int(report_effects_permutations),
+                    n_paired=int(report_paired_bootstrap),
+                    stage_key=skey("outer_splits"),
+                    stage=stage,
+                    stage_progress=stage_progress,
+                    ctx=ctx,
+                    label=label,
+                    report=str(outer_report),
+                )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+
+            # ────────────────────────────────────────────
+            # Null calibration of the held-out decision
+            # ────────────────────────────────────────────
+            outer_null_report: dict | None = None
+            if int(outer_splits) > 1 and int(outer_null_runs or 0) > 0:
+                outer_null_report = _run_outer_null(
+                    engine,
+                    fusion_df=fusion_df,
+                    n=int(outer_null_runs),
+                    kind=str(outer_null_kind),
+                    group_column=outer_null_group or None,
+                    stop={
+                        "after": outer_null_stop_after,
+                        "low": outer_null_stop_low,
+                        "high": outer_null_stop_high,
+                    },
+                    workers=outer_null_workers,
+                    rule={
+                        "k_splits": int(outer_splits),
+                        "split_seed": int(split_seed),
+                        "metric": objective_metric,
+                        "standalones": (
+                            [c for c in standalones if c in standalones_bundle]
+                            if standalones
+                            else []
+                        ),
+                        "comparators": list(outcome_cmps or []),
+                        "comparators_primary": [
+                            c for c in (outcome_cmps or []) if c in primary_cols
+                        ],
+                        "outer_comparators": str(outer_comparators),
+                        "specificity": specificity_report is not None,
+                    },
+                    split_kwargs={
+                        "test_size": test_size,
+                        "spatial_split": bool(spatial_split),
+                        "spatial_block_size_m": spatial_block_size_m,
+                        "n_spatial_blocks": n_spatial_blocks,
+                        "spatial_split_mode": str(spatial_split_mode),
+                    },
+                    fit_kwargs={
+                        "forms": index_forms,
+                        "sweep_splits": int(sweep_splits),
+                        "draws": int(outer_posterior_draws or posterior_draws),
+                        "warmup": int(
+                            outer_posterior_warmup
+                            or outer_posterior_draws
+                            or posterior_warmup
+                        ),
+                        "chains": int(outer_posterior_chains or posterior_chains),
+                        "warm_start": bool(outer_warm_start),
+                        "synergy_warm_start": bool(synergy_warm_start),
+                        "radius_prior": str(radius_prior),
+                        "seed": 42,
+                        "cancel_callback": cancel_check,
+                    },
+                    setup={
+                        "config_hash": run_config_record.get("config_hash"),
+                        "outcome": label,
+                    },
+                    resume_dir=os.path.join(cache_dir, "outer_null"),
+                    stage_key=skey("outer_null"),
+                    stage=stage,
+                    stage_progress=stage_progress,
+                    ctx=ctx,
+                    label=label,
+                    split_seed=int(split_seed),
+                    restore_split={
+                        "fusion_df": fusion_df,
+                        "test_size": test_size,
+                        "spatial_split": bool(spatial_split),
+                        "spatial_block_size_m": spatial_block_size_m,
+                        "n_spatial_blocks": n_spatial_blocks,
+                        "spatial_split_mode": str(spatial_split_mode),
+                    },
+                    headline_params=headline_params,
+                    observed=(outer_bundle or {}).get("summary") or [],
+                )
+                if ctx.is_cancelled():
+                    return {"output_paths": output_paths}
+
             bundle = {
                 "best_params": best_params,
                 "averaged_params": averaged_params,
@@ -3128,10 +4283,31 @@ def run_fusion(
                 "covariate_impact": covariate_impact,
                 "decline_terms": decline_terms,
                 "exposure_response": exposure_response_report,
+                "raw_effects": raw_effects_report,
+                "weighted": weighted_report,
+                "spatial_plus": spatial_plus_report,
+                "scale_selection": (
+                    {
+                        "criterion": str(spatial_select_criterion),
+                        "rows": scale_profile_rows,
+                        "summary": _scale_selection.summary(
+                            scale_profile_rows, str(spatial_select_criterion)
+                        ),
+                    }
+                    if scale_profile_rows
+                    else None
+                ),
+                "effective_bandwidth": bandwidth_rows or None,
                 "moderation": moderation_report,
                 "negative_controls": negative_control_report,
                 # The spatial blocks the held-out split used, ``None`` without.
                 "spatial_split": getattr(engine, "_spatial_split_report", None),
+                # The smooth's settings and how its df selections went,
+                # ``None`` without spatial adjustment.
+                "spatial_smoothing": engine.spatial_selection_report(),
+                # The smooth the CGI's search was tuned within, ``None``
+                # without within-area tuning.
+                "spatial_tuning": headline_params.get("__spatial_tuning__"),
                 # Comparator exposures, the CGI's row on the same scale, and
                 # the paired CGI − comparator family.
                 "comparators": comparators_report,
@@ -3179,7 +4355,12 @@ def run_fusion(
                 "cgi_effects": cgi_effects,
                 "cgi_vs_standalone_paired": cgi_vs_standalone_paired,
                 "cgi_vs_standalone_paired_family": cgi_vs_standalone_paired_family,
+                "split_seed": int(split_seed),
+                "outer_splits": outer_bundle,
+                "outer_null": outer_null_report,
             }
+            if specificity_contrast:
+                bundle["specificity_contrast"] = specificity_report
             by_target[label] = bundle
 
             # Persist every test result (CGI + standalones) to disk: a
@@ -3219,6 +4400,9 @@ def run_fusion(
         }
         if not multi_outcome:
             results_payload.update(by_target[sole_label])
+        # Where the run spent its time and memory, as the log reports it.
+        results_payload["stage_timing"] = stage_timing_rows(ledger, memory)
+        results_payload["peak_memory_gb"] = round(memory.peak() / 1e9, 3) or None
 
         # Fusion runs in a spawn child, so live engine objects (unpicklable and
         # large) never cross the process boundary. Ship only the JSON-safe
@@ -3245,7 +4429,7 @@ def run_fusion(
         except Exception as exc:
             _log_fusion("WARN", f"Could not write results bundle JSON: {exc}")
 
-        _log_stage_timing(ledger, _log_fusion)
+        _log_stage_timing(ledger, _log_fusion, memory)
 
         ctx.progress(value=1.0, status_text="Completed")
         return {"output_paths": output_paths}
@@ -3264,6 +4448,7 @@ def run_fusion(
         raise
 
     finally:
+        memory.stop()
         if target_cleanup_dir:
             shutil.rmtree(target_cleanup_dir, ignore_errors=True)
         if target_cleanup_file and os.path.isfile(target_cleanup_file):

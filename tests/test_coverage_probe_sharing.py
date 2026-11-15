@@ -79,7 +79,7 @@ class TestSharedJoinMatchesSeparateJoins(unittest.TestCase):
         # A regular grid with query points equidistant from several sources is
         # where a tie-break difference would show up.
         gx, gy = np.meshgrid(np.arange(0, 500, 50.0), np.arange(0, 500, 50.0))
-        pts = [Point(x, y) for x, y in zip(gx.ravel(), gy.ravel())]
+        pts = [Point(x, y) for x, y in zip(gx.ravel(), gy.ravel(), strict=True)]
         rng = np.random.default_rng(7)
         veg = gpd.GeoDataFrame({"gvi_veg": rng.random(len(pts))}, geometry=pts, crs=CRS)
         veg.attrs["metric_column"] = "gvi_veg"
@@ -90,7 +90,8 @@ class TestSharedJoinMatchesSeparateJoins(unittest.TestCase):
         # Query exactly at cell centres — equidistant from four sources.
         qx, qy = np.meshgrid(np.arange(25, 475, 50.0), np.arange(25, 475, 50.0))
         query = gpd.GeoDataFrame(
-            geometry=[Point(x, y) for x, y in zip(qx.ravel(), qy.ravel())], crs=CRS
+            geometry=[Point(x, y) for x, y in zip(qx.ravel(), qy.ravel(), strict=True)],
+            crs=CRS,
         )
         sep_v = metric_sampling.nearest_metric_join(query, veg, "gvi_veg", 1000.0)
         sep_t = metric_sampling.nearest_metric_join(query, terrain, "gvi_ter", 1000.0)

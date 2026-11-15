@@ -95,11 +95,17 @@ def _add_setting_flags(
                 kw.update(nargs="+", choices=list(s.choices), metavar="STAT")
             elif s.kind == "chains":
                 kw.update(nargs="+", metavar="'NAME: OP, OP'")
+            elif s.kind == "intlist":
+                kw.update(nargs="+", type=int, metavar="N")
             elif s.kind == "choice":
                 kw["choices"] = list(s.choices)
             elif s.kind in ("int", "float"):
                 kw["type"] = int if s.kind == "int" else float
                 kw["metavar"] = "N" if s.kind == "int" else "X"
+            elif s.kind == "floatmap":
+                kw["metavar"] = "'NAME=X, NAME=X'"
+            elif s.kind == "text":
+                kw["metavar"] = "TEXT"
             group.add_argument(flag, **kw)
 
 

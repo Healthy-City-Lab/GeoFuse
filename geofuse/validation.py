@@ -236,7 +236,7 @@ def _replicate(task) -> dict:
         # interior true weights; the absolute error covers every one.
         rec["weight_covered"] = [
             bool(lo <= wt <= hi)
-            for lo, wt, hi in zip(w_lo, w_true, w_hi)
+            for lo, wt, hi in zip(w_lo, w_true, w_hi, strict=True)
             if 0.0 < wt < 1.0
         ]
         rec["weight_abs_error"] = float(
@@ -290,12 +290,12 @@ def summarise(records: list[dict]) -> list[dict]:
             _rate_rows(name, pr2, "false_positive_rate" if null else "power", hits, n)
         )
 
-        def mean_row(metric, values):
+        def mean_row(metric, values, _name=name, _pr2=pr2):
             vals = [v for v in values if v is not None and np.isfinite(v)]
             rows.append(
                 {
-                    "scenario": name,
-                    "partial_r2": pr2,
+                    "scenario": _name,
+                    "partial_r2": _pr2,
                     "metric": metric,
                     "value": float(np.mean(vals)) if vals else float("nan"),
                     "ci_low": None,

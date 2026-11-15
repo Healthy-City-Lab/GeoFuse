@@ -9,7 +9,6 @@ import numpy as np
 import psutil
 import torch
 from PIL import Image
-from tqdm import tqdm
 
 # Add parent path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -82,13 +81,10 @@ def stress_test_pipeline(model_path, iterations, output_dir):
     # each, runs segmentation, computes GVI, then invokes ``result_callback``.
     # By mocking the network fetchers we keep the loop deterministic and let
     # the test target the in-process memory profile.
-    pbar = tqdm(total=iterations)
-
     def on_result(_res) -> None:
         ram_log.append(get_memory_usage())
         if torch.cuda.is_available():
             vram_log.append(torch.cuda.memory_allocated() / 1024**2)
-        pbar.update(1)
         if len(ram_log) % 25 == 0:
             gc.collect()
             if torch.cuda.is_available():
@@ -119,8 +115,6 @@ def stress_test_pipeline(model_path, iterations, output_dir):
             )
     except KeyboardInterrupt:
         print("\n[WARN] Test interrupted by user. Generating report...")
-    finally:
-        pbar.close()
 
     if len(ram_log) > 0:
         print(f"\n[INFO] Final RAM: {ram_log[-1]:.2f} MB")

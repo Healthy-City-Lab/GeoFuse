@@ -29,8 +29,9 @@ STATS = ["mean", "p50"]
 def _entity_cells(X, static):
     """The stub has no CGI cells: each entity stands for its one cell."""
 
-    def design(_static, kept, channel_index, *_):
-        cov = static["cov"]
+    def design(_static, kept, channel_index, *_, cov=None):
+        if cov is None:
+            cov = static["cov"]
         return bayesian_index.SynergyDesign.build(
             X[kept][:, list(channel_index)],
             None if cov is None else cov[kept],
@@ -58,7 +59,12 @@ def _stub_engine(n=300, seed=0):
         gvi_buffer_step_m=150.0,
         ndvi_ladder_spacing="linear",
         gvi_ladder_spacing="linear",
+        _posterior_warm={},
+        _fit_label="split 0",
+        spatial_tune_scale_m=None,
     )
+    eng._radius_mask = MetricFusionEngine._radius_mask
+    eng._warm_fit_fallback = MetricFusionEngine._warm_fit_fallback
     eng.build_index_tensor = lambda subset="train_val": (
         X,
         np.asarray(RADII),
@@ -75,6 +81,8 @@ def _stub_engine(n=300, seed=0):
         "_search_radii",
         "_inner_split_groups",
         "_ladder_description",
+        "_posterior_start",
+        "_search_covariates",
     ):
         setattr(eng, name, types.MethodType(getattr(MetricFusionEngine, name), eng))
     return eng
@@ -127,7 +135,7 @@ class TestFitBayesianIndexWiring(unittest.TestCase):
         self.assertEqual(post["distance_scale"], "raw")
         self.assertEqual(len(post["r50_mean"]), 2)
         for lo, mid, hi in zip(
-            post["r50_ci_low"], post["r50_mean"], post["r50_ci_high"]
+            post["r50_ci_low"], post["r50_mean"], post["r50_ci_high"], strict=True
         ):
             self.assertLessEqual(lo, mid + 1e-9)
             self.assertLessEqual(mid, hi + 1e-9)
@@ -278,7 +286,12 @@ def _retune_stub(n=600, seed=3):
         gvi_buffer_step_m=150.0,
         ndvi_ladder_spacing="linear",
         gvi_ladder_spacing="linear",
+        _posterior_warm={},
+        _fit_label="split 0",
+        spatial_tune_scale_m=None,
     )
+    eng._radius_mask = MetricFusionEngine._radius_mask
+    eng._warm_fit_fallback = MetricFusionEngine._warm_fit_fallback
     eng.build_index_tensor = lambda subset="train_val": (
         X,
         np.asarray(RADII),
@@ -295,6 +308,8 @@ def _retune_stub(n=600, seed=3):
         "_search_radii",
         "_inner_split_groups",
         "_ladder_description",
+        "_posterior_start",
+        "_search_covariates",
         "fit_bayesian_index",
         "retune_concordance",
     ):
@@ -312,14 +327,14 @@ class TestRetuneOnAControl(unittest.TestCase):
         )
         parallel.process_worker_count = lambda *a, **k: 1
         cls.eng = _retune_stub()
-        kw = dict(
-            forms=("linear",),
-            sweep_splits=3,
-            draws=150,
-            warmup=150,
-            chains=1,
-            radius_kernel="dirichlet",
-        )
+        kw = {
+            "forms": ("linear",),
+            "sweep_splits": 3,
+            "draws": 150,
+            "warmup": 150,
+            "chains": 1,
+            "radius_kernel": "dirichlet",
+        }
         cls.target = cls.eng.fit_bayesian_index(
             "r2", reps=0, shuffles=0, gain_splits=0, null_runs=0, **kw
         )

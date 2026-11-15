@@ -101,7 +101,7 @@ def build_scenario(tmpdir, *, lazy_raster):
     rng = np.random.default_rng(4)
     grid = np.arange(0, 2400, 40, dtype=np.float64)
     xx, yy = np.meshgrid(grid, grid)
-    pts = [Point(x, y) for x, y in zip(xx.ravel(), yy.ravel())]
+    pts = [Point(x, y) for x, y in zip(xx.ravel(), yy.ravel(), strict=True)]
     n_pts = len(pts)
     veg = gpd.GeoDataFrame({"gvi_veg": rng.random(n_pts)}, geometry=pts, crs=CRS)
     veg.attrs["metric_column"] = "gvi_veg"
@@ -210,7 +210,9 @@ class TestProcessPoolEquivalence(unittest.TestCase):
     def _assert_matches(self, lazy_raster):
         pooled, in_process, ticks = self._run_both(lazy_raster)
         self.assertIsNotNone(pooled)
-        for name, got, expected in zip(("veg", "terrain", "ndvi"), pooled, in_process):
+        for name, got, expected in zip(
+            ("veg", "terrain", "ndvi"), pooled[:3], in_process, strict=True
+        ):
             self.assertTrue(
                 np.isfinite(expected).any(), f"{name} reference is entirely NaN"
             )
@@ -506,24 +508,26 @@ class TestWorkersAreThreadPinned(unittest.TestCase):
                 os.environ["OMP_NUM_THREADS"] = previous
 
 
+@contextlib.contextmanager
+def pretend_free(free_bytes):
+    """Report ``free_bytes`` of free commit, whatever the host has."""
+    original = parallel.available_memory_bytes
+    parallel.available_memory_bytes = lambda: free_bytes
+    try:
+        yield
+    finally:
+        parallel.available_memory_bytes = original
+
+
 class TestPoolIsBoundedByMemory(unittest.TestCase):
     """A pool spends memory per worker, so cores alone cannot size it."""
 
-    @contextlib.contextmanager
-    def _pretend_free(self, free_bytes):
-        original = parallel.available_memory_bytes
-        parallel.available_memory_bytes = lambda: free_bytes
-        try:
-            yield
-        finally:
-            parallel.available_memory_bytes = original
-
     def test_a_tight_host_narrows_the_pool(self):
-        with self._pretend_free(1 * 1024**3):
+        with pretend_free(1 * 1024**3):
             self.assertLess(parallel.process_worker_count(10_000), 4)
 
     def test_a_roomy_host_lets_the_cores_decide(self):
-        with self._pretend_free(512 * 1024**3):
+        with pretend_free(512 * 1024**3):
             self.assertEqual(
                 parallel.process_worker_count(10_000),
                 max(2, int(parallel.cpu_budget() * parallel.cpu_share())),
@@ -533,7 +537,7 @@ class TestPoolIsBoundedByMemory(unittest.TestCase):
         previous = os.environ.get("GEOFUSE_WORKERS")
         os.environ["GEOFUSE_WORKERS"] = "64"
         try:
-            with self._pretend_free(1 * 1024**3):
+            with pretend_free(1 * 1024**3):
                 self.assertLess(parallel.process_worker_count(10_000), 8)
         finally:
             if previous is None:
@@ -542,18 +546,23 @@ class TestPoolIsBoundedByMemory(unittest.TestCase):
                 os.environ["GEOFUSE_WORKERS"] = previous
 
     def test_an_unreadable_figure_falls_back_to_cores(self):
-        with self._pretend_free(0):
+        with pretend_free(0):
             self.assertEqual(
                 parallel.process_worker_count(10_000),
                 max(2, int(parallel.cpu_budget() * parallel.cpu_share())),
             )
 
     def test_never_returns_less_than_one(self):
-        with self._pretend_free(1):
+        with pretend_free(1):
             self.assertEqual(parallel.process_worker_count(10_000), 1)
 
 
 class TestProcessWorkerCount(unittest.TestCase):
+    """Sizing by cores, on a host with memory to spare whatever else runs."""
+
+    def setUp(self):
+        self.enterContext(pretend_free(512 * 1024**3))
+
     def test_never_exceeds_the_work_available(self):
         self.assertEqual(parallel.process_worker_count(3), 3)
 

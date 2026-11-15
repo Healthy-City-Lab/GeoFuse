@@ -260,16 +260,61 @@ Nothing below is pre-specified.
   default, is never touched during tuning. The winning configuration is scored
   on it once, with a percentile bootstrap interval and a permutation p-value
   (Freedman-Lane when covariates are controlled). Whole-data figures are shown
-  only as descriptive and carry no p-value.
+  only as descriptive and carry no p-value. The split seed is a setting.
+  Spatial test blocks are striped evenly across the extent by default, which
+  leaves a seed only a few test sets to choose from, or drawn at random, so
+  each seed holds out other blocks.
+- **One split need not decide.** A weak association can look strong on one
+  equally valid test set and vanish on another. With several held-out splits,
+  split, tuning and held-out scoring are repeated on each, and every headline
+  result — held-out score and slope, composite minus channel, composite minus
+  comparator, negative-control slopes — is reported as its spread across the
+  splits, the share of splits where it holds, and a corrected resampled t-test
+  across them (the splits share data, so their p-values are not combined).
+  Each split's posterior is reported too: the effect, every term's weight,
+  R50 / R90 per channel and the chosen form, with their range across the
+  splits and the share of splits in which each term carries the largest
+  weight, so a distance of influence or a dominant layer read from one split
+  can be checked against the others.
 - **Effects are estimated on all rows and tested on held-out ones.** The
   per-IQR effect, quantile gradient, spline curve, moderation slopes, decline
-  terms, covariate table and the paired CGI-versus-channel difference report
-  their estimates from every row, as descriptive figures, and their standard
-  errors, intervals and p-values from the held-out rows, which never chose the
-  composite. Each row also carries the held-out estimate and the minimum
-  detectable effect, 2.8 held-out standard errors (80 % power at a two-sided
-  5 % level), so a null held-out result can be read against the effect size
-  the test split could have detected.
+  terms and covariate table report their estimates from every row, as
+  descriptive figures, and their standard errors, intervals and p-values from
+  the held-out rows, which never chose the composite. Each row also carries the
+  held-out estimate and the minimum detectable effect, 2.8 held-out standard
+  errors (80 % power at a two-sided 5 % level), so a null held-out result can
+  be read against the effect size the test split could have detected.
+- **Effects in the units readers compare.** A slope per SD of a composite or
+  of a compressed statistic says little about how much greener a place must
+  be. Every split therefore also reports, for the composite, every channel
+  and every comparator, the held-out change in the outcome in its own units
+  per interquartile range and per 5th–95th percentile range of the exposure,
+  on the target and on each negative control, with the same covariates and
+  smooth as the per-SD slope. The ranges are set on the split's train+val
+  rows, never on the rows that judge them, and a fixed increment per
+  exposure (such as 0.1 NDVI) can replace them. The composite's IQR is also
+  given in each layer's units at the cell it reads, so a per-IQR contrast of
+  the composite can be stated as so much NDVI or street-view greenery.
+- **Sampling weights.** A cohort sampled with unequal probabilities is
+  reported both ways. With a weight column, every held-out result (score,
+  slopes, negative-control slopes and D, paired differences, specificity
+  contrasts, raw-unit effects) gets a weighted twin on every split: weighted
+  least squares with the weights normalised to mean 1 on the rows used,
+  design-based (robust) standard errors, and bootstraps whose resample counts
+  are multiplied by the weights. Each weighted row carries Kish's effective
+  sample size and the rows left out for a missing weight. The search stays
+  unweighted unless the weighted search is asked for, a deliberate choice for
+  an explicitly population-level question; its posterior and null
+  calibration then refer to the weighted likelihood.
+- **The composite is judged against one channel on held-out rows.** The
+  comparison channel is the standalone that scores best on the train+val rows,
+  so the test rows never choose the channel they then judge. The verdict is the
+  paired bootstrap difference CGI − channel on the held-out rows, with both
+  scores, its interval and its p-value from those same rows, Holm-corrected
+  across the channels: CGI better, standalone better or no difference.
+  Whole-data differences are kept as descriptive figures, and the AIC / BIC
+  comparison of all channels against that one channel is reported as a
+  secondary, in-sample statistic.
 - **Reproducibility is measured, not assumed.** The whole discovery is repeated
   on independent reshuffles and the report says how often it landed on the same
   configuration. A low share means the surface is flat, not that the pick is
@@ -298,6 +343,29 @@ Nothing below is pre-specified.
   columns' cross-products, the identical likelihood at a cost that does not
   grow with the number of entities, so large samples and many refits stay
   affordable; synergy and panels sum over the rows.
+- **The decision itself is calibrated.** The permutation refits above check
+  one split's posterior; the decision a repeated study reports is the
+  corrected resampled t of the held-out slope across its splits. With null
+  outcomes set, each null runs through the same search and the same held-out
+  splits and seeds as the real outcome, inside the same job, and the share
+  whose corrected p falls below 5 % is that decision's false-positive rate,
+  with an exact interval and the real outcome's p ranked among the nulls'.
+  Spatially structured nulls keep the outcome's spatial pattern at two scales
+  and randomise its alignment with greenery: the area means are permuted across
+  areas (a named column, or the spatial smooth's clusters), and within areas
+  the deviations are replaced by variogram-matched surrogates (Viladomat et al.
+  2014), so the rate shows whether spatial structure alone produces "findings".
+  Freely permuted nulls are the classical check. A sequential rule set in
+  advance can stop after a first batch when the rejections are clearly few or
+  clearly many. The later splits can report only the estimates the decisions
+  read, which skips their bootstraps and permutations and leaves every
+  corrected test unchanged; the nulls always run that way.
+- **Warm starts.** A synergy posterior starts from a short linear fit of the
+  same columns, and each repeated held-out split starts its posteriors from
+  the previous split's, so most of the sampler's tuning is not redone. A warm
+  fit that mixes worse than its source (R-hat above 1.01, or a lower effective
+  sample size per draw) is refitted from scratch, and every fit records how it
+  started.
 - **Repeated measures count once.** On a panel the posterior carries a random
   intercept per entity, integrated out exactly, so one person's waves do not
   narrow the interval on the effect as if they were independent people; the
@@ -330,8 +398,76 @@ Nothing below is pre-specified.
   projection is rank-safe: a redundant design, such as an empty category or a
   full set of dummies, removes only its real span, and the job log reports how
   many directions were redundant.
-- Optional spatial-confounding adjustment (KS-AIC or Spatial+) and spatial block
-  cross-validation, so geographic autocorrelation cannot inflate scores.
+- Optional spatial-confounding adjustment and spatial block cross-validation,
+  so geographic autocorrelation cannot inflate scores. The **basis**
+  adjustment (`spatial_adjust_method = "basis"`) adds an unpenalized
+  thin-plate basis of the coordinates to the outcome model, the adjustment of
+  Keller & Szpiro (2020); its coordinate smooth enters the scores, the
+  direction, the paired tests, the slopes, the negative controls and the
+  specificity contrast, on every held-out split, but not the tuning.
+  `spatial_adjust_select` says how its size is set: the df by AIC/BIC of the
+  outcome model without the exposure (`df_outcome_ic`, Keller & Szpiro), the
+  df by AIC/BIC of the exposure model (`df_exposure_ic`, the "df-Spatial+" of
+  Rainey et al. 2025), a fixed pattern scale (`fixed_scale`) or a scale chosen
+  by AIC/BIC of the outcome model (`scale_ic`). Once chosen, the basis joins
+  the covariates on both the outcome and the exposure side under every rule:
+  an unpenalized exposure residual leaves the slope equal to the plain basis
+  adjustment (Frisch–Waugh–Lovell; Dupont, Wood & Augustin 2022, §4), so the
+  rules differ only in the basis size. **Spatial+** with penalized smooths is
+  a method of its own (`spatial_adjust_method = "spatial_plus"`): the
+  exposure's spatial part, a penalized thin-plate fit per site, is removed
+  first, then the outcome is fitted on that residual with its own penalized
+  smooth per site, the penalties chosen by GCV (or REML) (Dupont, Wood &
+  Augustin 2022, with site-specific smooths). Its slopes, negative controls,
+  specificity contrasts and paired ΔR² are reported beside the unadjusted
+  results on every held-out split, with mgcv's Bayesian intervals and
+  bootstraps that refit both steps at the chosen penalties
+  (`spatial_plus.csv`). The basis scale can also be chosen per split by
+  Keller & Szpiro's rule (`spatial_adjust_select = "scale_ic"`): the outcome
+  model without the exposure, on the split's train+val rows, picks the
+  candidate scale with the smallest BIC (or AIC), separately for the reported
+  slopes and, optionally, the tuning. Every basis run saves that AIC-NE /
+  BIC-NE profile (`scale_selection.csv`) and the effective bandwidth of every
+  smooth it uses (`effective_bandwidth.csv`, by the Keller & Szpiro and the
+  Rainey & Keller rules). Under Spatial+ the search itself can run on
+  Spatial+ residuals (`spatial_tune_method = "spatial_plus_inputs"`, a geofuse
+  extension): every input column loses its own penalized spatial fit and the
+  outcome and inputs are transformed by the outcome smoother, so the layers,
+  radii and weights are chosen on local greenery (linear form only). Every adjusted
+  slope records the method and the smooth's degrees of freedom. The smooth is
+  a thin-plate spline per cluster: an intercept, a linear trend and radial
+  functions constrained to carry no trend of their own (Wood 2003), so K
+  knots give K − 3 radial functions; spatially adjusted results differ
+  slightly from versions whose radial functions lacked the constraint. The
+  size of the smooth is chosen by AIC (or BIC) among candidate sizes, by
+  default 0, 1, 2, 3, 4, 6, 8, 11, 15 and 20 radial functions per spatial
+  cluster; the run keeps the criterion of every
+  candidate and warns when the largest wins, since a larger smooth might then
+  fit better. The knots and the neighbour graph that splits entities into
+  clusters are settings too. In a paired CGI-vs-exposure test when the
+  exposure model picks the df, each exposure is scored with the smooth selected on itself by default, as
+  when it is scored alone, so the paired difference is the difference of the
+  two printed scores; the CGI's smooth for both, one selected on the outcome,
+  or the larger of the two are the alternatives. The smooth can instead be
+  defined by a pattern scale in metres: every cluster then gets the knots its
+  area needs at that scale and all of its radial functions, so the smooth
+  removes exposure variation coarser than about that scale everywhere, and
+  one smooth serves every exposure. Clusters split at a gap of twice the
+  scale, and clusters too small to stand alone share a neighbour's level.
+  Given several scales, the first decides the scores and verdicts and every
+  slope is also reported at the others and unadjusted, so one run shows how
+  the estimate moves with the scale assumed. Next to the per-SD slopes, whose
+  unit (an SD of what the smooth leaves) shrinks with the scale, each rung
+  reports the change per SD0, the exposure's SD after the covariates alone,
+  and per IQR and p5–p95 range, so a curve against the scale compares one
+  unit; each rung also records the share of the exposure the smooth
+  absorbs, with and without the covariates, and the share a smooth of that
+  size would absorb from noise. Optionally the search itself
+  is tuned within areas: the smooth at a given scale joins the covariates of
+  every search stage, so the layer, radius, statistic and weights are chosen
+  on variation within areas of that size rather than on the whole map. The
+  exposure-response, moderation, covariate-impact and AIC / BIC tables
+  control for the covariates only, and say so in an adjusted run.
 - Optional collinearity check on the study's own channels (GVI as the sum of
   its components) that reports the channels above a VIF threshold, and
   optionally leaves them out of the search.
@@ -346,6 +482,17 @@ Nothing below is pre-specified.
   and reports how closely its radius, aggregator and weights match the
   target's. Controls are scored for cross-sectional and year-aware runs; a
   panel skips them.
+- **Specificity contrast.** An optional, paired test of whether the composite
+  is less non-specific than another exposure. For each exposure, D = |β target|
+  − |β control|, and the contrast is D(composite) − D(exposure), positive when
+  the composite is the more specific. It is computed per control on the
+  held-out entities, against each primary comparator and the comparison
+  channel. All four slopes are refitted on each paired bootstrap resample,
+  because two exposures' slopes on the same rows move together: their
+  separate intervals overlap even when the difference is clear. The result is
+  an interval and a one-sided p, Holm-corrected over the primary comparators.
+  It is repeated on every held-out split and tested across them with the
+  corrected t. Off by default.
 - **Comparator exposures.** "Does mixing beat the best single channel?" is the
   standalones' question; "does the tuned composite beat the exposure the
   literature already uses?" is a different one. Name existing exposure columns
@@ -388,6 +535,10 @@ Nothing below is pre-specified.
   fetch remote outputs. A dropped connection reopens on its own.
 - **Sized to the machine.** Thread pools take about a third of the cores;
   process pools take 80 % by default. Override with `GEOFUSE_WORKERS` and
-  `GEOFUSE_CPU_SHARE`. Every run logs a stage-by-stage wall-clock breakdown.
+  `GEOFUSE_CPU_SHARE`. A fusion job runs its own numeric libraries on 4
+  threads (`limits.job_threads`) and its pool workers on one, which bounds what
+  each process reserves. Every run logs a stage-by-stage breakdown of wall
+  clock and peak memory. [PERFORMANCE.md](PERFORMANCE.md) lists every fast
+  path, its speed-up and how closely it reproduces the original result.
 - **Everything on disk, per run.** Each run writes to its own timestamped folder
   so reruns never overwrite earlier results.

@@ -3,8 +3,8 @@
 Before optimization, every sample pixel's metric values are aggregated across
 every buffer radius in the ladder and every aggregation statistic (mean plus a
 compact percentile set) for each channel (``veg``, ``terrain``, ``ndvi``), so
-each Optuna trial reads a stored value instead of recomputing circular-buffer
-aggregations — and the work survives cancels/crashes and is reused by later
+every scored cell is a stored value instead of a circular-buffer
+aggregation — and the work survives cancels/crashes and is reused by later
 runs with the same inputs.
 
 The store is :class:`GreeneryCache`: one compact ``.npz`` per greenery-file set
@@ -859,7 +859,7 @@ class GreeneryCache:
         self._wave_unit: dict[int, str] = {}
         self.n_bytes = 0
 
-    # ---------------------------------------------------------------- identity
+    # ── Identity ────────────────────────────────────────────────
     def unit_key(self, veg_id: str, terrain_id: str, ndvi_id: str) -> str:
         """Stable id for the greenery-file set + grid config (not the target)."""
         raw = "|".join(
@@ -882,10 +882,7 @@ class GreeneryCache:
         """Route lookups for ``wave_index`` to the unit ``cfg_key``."""
         self._wave_unit[int(wave_index)] = cfg_key
 
-    def is_resident(self, cfg_key: str) -> bool:
-        return cfg_key in self._units
-
-    # ----------------------------------------------------------- reuse / build
+    # ── Reuse / build ───────────────────────────────────────────
     def open_unit(
         self,
         cfg_key: str,
@@ -1075,7 +1072,7 @@ class GreeneryCache:
         )
         os.replace(tmp + ".npz", path)
 
-    # ------------------------------------------------------------------ lookup
+    # ── Lookup ──────────────────────────────────────────────────
     #
     # A lookup is two steps: find each requested id's row in its wave's unit,
     # then read one (radius, stat) cell out of that row. Only the second step
@@ -1181,7 +1178,7 @@ class GreeneryCache:
             return None
         return self.gather(plan, channel, radius, column)
 
-    # -------------------------------------------------------------- utilities
+    # ── Utilities ───────────────────────────────────────────────
     @staticmethod
     def _setdiff(required: np.ndarray, present: np.ndarray) -> np.ndarray:
         if present.size == 0:

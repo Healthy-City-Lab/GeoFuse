@@ -125,6 +125,7 @@ def prep(
     *,
     channel_index=None,
     return_info: bool = False,
+    weights: np.ndarray | None = None,
 ):
     """Frisch-Waugh: project the covariates out of **both** sides, then z-score.
 
@@ -160,6 +161,13 @@ def prep(
     ``column_sd``, shaped ``X.shape[1:]`` — the SD each residualised column was
     divided by, which undoes the z-scoring when weights are read on the raw
     scale — and ``kept``, the boolean mask of input rows that survived.
+
+    ``weights`` makes the fit weighted least squares: the rows are scaled by
+    ``√w`` (``w`` normalised to mean 1 on the kept rows; a missing or
+    non-positive weight drops the row), the basis is ``√w · [1, covariates]``,
+    and each side is divided by its root mean square, its weighted residual
+    SD. Every Gram matrix, sweep and likelihood built on the result is then
+    the weighted one.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -175,10 +183,15 @@ def prep(
         keep &= np.isfinite(cov).all(1)
     if measured.any():
         keep &= np.isfinite(scan[:, measured]).all(1)
+    if weights is not None:
+        w = np.asarray(weights, dtype=np.float64)
+        keep &= np.isfinite(w) & (w > 0)
     if not keep.all():
         X, y = X[keep], y[keep]
         cov = None if cov is None else cov[keep]
 
+    if weights is not None:
+        return _weighted_prep(X, y, cov, w[keep], keep, return_info)
     q, deficit = covariate_basis(cov, len(y))
     if deficit:
         logger.warning(
@@ -205,6 +218,35 @@ def prep(
         "residual_df": int(len(y) - q.shape[1]),
         "column_sd": sd.reshape(X.shape[1:]),
         "kept": keep,
+    }
+    return yr, flat.reshape(X.shape), info
+
+
+def _weighted_prep(X, y, cov, w, keep, return_info):
+    """:func:`prep` on rows scaled by the square root of their weight."""
+    sw = np.sqrt(w / w.mean())
+    ones = np.ones((len(y), 1))
+    design = ones if cov is None else np.column_stack([ones, cov])
+    q = col_basis(sw[:, None] * design)
+    deficit = design.shape[1] - q.shape[1]
+
+    def rz(a):
+        return a - q @ (q.T @ a)
+
+    yr = rz(sw * y)
+    yr = yr / (np.sqrt(np.mean(yr * yr)) + 1e-12)
+    flat = rz(sw[:, None] * X.reshape(len(X), -1))
+    sd = np.sqrt(np.mean(flat * flat, axis=0))
+    flat = flat / (sd + 1e-12)
+    if not return_info:
+        return yr, flat.reshape(X.shape)
+    info = {
+        "covariate_rank": int(q.shape[1]),
+        "dropped_directions": int(deficit),
+        "residual_df": int(len(y) - q.shape[1]),
+        "column_sd": sd.reshape(X.shape[1:]),
+        "kept": keep,
+        "weighted": True,
     }
     return yr, flat.reshape(X.shape), info
 
@@ -348,6 +390,114 @@ def simplex_fit(gram: np.ndarray, xty: np.ndarray):
             if v > best_v:
                 best_v, best = v, (np.asarray(idx), np.clip(w, 0.0, None))
     return best
+
+
+def _inverses(g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of every matrix in a stack, and which ones exist.
+
+    One LAPACK call for the stack; a stack holding a singular matrix (whose
+    candidate :func:`simplex_fit` skips) is redone one matrix at a time.
+    """
+    try:
+        return np.linalg.inv(g), np.ones(len(g), dtype=bool)
+    except np.linalg.LinAlgError:
+        out = np.zeros_like(g)
+        ok = np.ones(len(g), dtype=bool)
+        for i, m in enumerate(g):
+            try:
+                out[i] = np.linalg.inv(m)
+            except np.linalg.LinAlgError:
+                ok[i] = False
+        return out, ok
+
+
+def simplex_fit_batch(gram: np.ndarray, xty: np.ndarray, combos) -> tuple:
+    """:func:`simplex_fit` for every candidate column set at once.
+
+    ``combos`` is ``(C, k)`` column indices into ``gram`` / ``xty``. Every
+    active set of one size has the same closed form, so each is solved for all
+    candidates in one batched call, in :func:`simplex_fit`'s order (sign, then
+    active set) and with its strict ``>`` rule, so a candidate keeps the
+    solution the loop would give it up to floating point. Returns
+    ``(found, weights)``: ``(C,)`` booleans and ``(C, k)`` weights in the
+    candidate's own column order, zero where the active set dropped a column.
+    """
+    combos = np.asarray(combos, dtype=np.int64)
+    n_c, k = combos.shape
+    G = gram[combos[:, :, None], combos[:, None, :]]
+    c_all = xty[combos]
+    masks = []
+    for mask in range(1, 1 << k):
+        idx = [i for i in range(k) if mask >> i & 1]
+        g = np.ascontiguousarray(G[:, idx][:, :, idx])
+        gi, ok = _inverses(g)
+        masks.append((idx, g, gi, ok))
+    best_v = np.full(n_c, -np.inf)
+    weights = np.zeros((n_c, k))
+    for sign in (1.0, -1.0):
+        for idx, g, gi, ok in masks:
+            c = sign * c_all[:, idx]
+            one = np.ones(len(idx))
+            ogi = one @ gi
+            denom = ogi @ one
+            good = ok & (np.abs(denom) >= 1e-15)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                lam = (np.einsum("cs,cs->c", ogi, c) - 1.0) / denom
+            w = np.einsum("cst,ct->cs", gi, c - lam[:, None] * one)
+            good &= ~np.any(w < -1e-9, axis=1)
+            quad = np.einsum("cs,cst,ct->c", w, g, w)
+            good &= quad > 1e-15
+            with np.errstate(divide="ignore", invalid="ignore"):
+                v = np.abs(np.einsum("cs,cs->c", w, c_all[:, idx])) / np.sqrt(quad)
+            better = good & (v > best_v)
+            best_v = np.where(better, v, best_v)
+            if better.any():
+                rows = np.flatnonzero(better)
+                weights[rows] = 0.0
+                weights[np.ix_(rows, idx)] = np.clip(w[rows], 0.0, None)
+    return np.isfinite(best_v), weights
+
+
+def _train_t(w, cg, cy, syy, n):
+    """Training |t| of each candidate's index from centred cross-products.
+
+    The correlation of ``Z w`` with ``y`` is ``wᵀ C_zy / √(wᵀ C_zz w · C_yy)``
+    with ``C`` the centred cross-products of the training rows, so the index
+    is never formed row by row. Clipped and scaled as :func:`_tstat`; ``nan``
+    where the index is constant.
+    """
+    num = np.einsum("ck,ck->c", w, cy)
+    den = np.einsum("ck,ckl,cl->c", w, cg, w) * syy
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.clip(num / np.sqrt(den), -0.999999, 0.999999)
+    return np.abs(r) * math.sqrt(max(n - 2, 1)) / np.sqrt(1.0 - r * r)
+
+
+def _centred(ztr: np.ndarray, y: np.ndarray):
+    """Centred Gram, centred cross-products with ``y`` and ``y``'s sum of
+    squares, of the training rows."""
+    zc = ztr - ztr.mean(axis=0)
+    yc = y - y.mean()
+    return zc.T @ zc, zc.T @ yc, float(yc @ yc)
+
+
+def _best_combo(ztr, y, combos):
+    """The candidate with the largest training |t| (first on ties), or ``None``.
+
+    The batched form of the loops in :func:`_discovery_shuffle` and
+    :func:`_gain_split`: every candidate's simplex fit by
+    :func:`simplex_fit_batch`, its training |t| by :func:`_train_t`.
+    """
+    combos = np.asarray(combos, dtype=np.int64)
+    if not len(combos):
+        return None
+    g, c = ztr.T @ ztr, ztr.T @ y
+    found, w = simplex_fit_batch(g, c, combos)
+    cg, cy, syy = _centred(ztr, y)
+    v = _train_t(w, cg[combos[:, :, None], combos[:, None, :]], cy[combos], syy, len(y))
+    v = np.where(found & np.isfinite(v), v, -np.inf)
+    best = int(np.argmax(v))
+    return None if not np.isfinite(v[best]) else tuple(int(i) for i in combos[best])
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -495,6 +645,10 @@ def candidate_columns(channels, radius_idx, n_radii, n_stats, stat_idx=None):
     ]
 
 
+# Candidates solved per batch in a sweep split.
+_SWEEP_SLAB = 50_000
+
+
 def _sweep_split(task):
     """One inner split of the linear grid. Runs in its own process.
 
@@ -511,19 +665,22 @@ def _sweep_split(task):
     g_te, c_te = zte.T @ zte, zte.T @ y[te]
     yn = float(np.linalg.norm(y[te]))
     n_te = int(te.sum())
+    combos = np.asarray(combos, dtype=np.int64)
     out = np.zeros(len(combos))
-    for k, combo in enumerate(combos):
-        i = np.asarray(combo)
-        fit = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
-        if fit is None:
-            continue
-        sub, w = fit
-        j = i[sub]
-        den = math.sqrt(max(float(w @ g_te[np.ix_(j, j)] @ w), 1e-15))
-        r = float(
-            np.clip(float(w @ c_te[j]) / den / max(yn, 1e-12), -0.999999, 0.999999)
+    # Candidates in slabs: the stacked k x k blocks of every active set stay
+    # small however large the grid.
+    for s in range(0, len(combos), _SWEEP_SLAB):
+        cb = combos[s : s + _SWEEP_SLAB]
+        found, w = simplex_fit_batch(g_tr, c_tr, cb)
+        quad = np.einsum("ck,ckl,cl->c", w, g_te[cb[:, :, None], cb[:, None, :]], w)
+        den = np.sqrt(np.maximum(quad, 1e-15))
+        r = np.clip(
+            np.einsum("ck,ck->c", w, c_te[cb]) / den / max(yn, 1e-12),
+            -0.999999,
+            0.999999,
         )
-        out[k] = abs(r) * math.sqrt(max(n_te - 2, 1)) / math.sqrt(1.0 - r * r)
+        t = np.abs(r) * math.sqrt(max(n_te - 2, 1)) / np.sqrt(1.0 - r * r)
+        out[s : s + _SWEEP_SLAB] = np.where(found, t, 0.0)
     return out
 
 
@@ -1227,7 +1384,7 @@ class IndexPosterior:
             "weight_prior_ci": list(w_prior),
             "weight_width_ratio": [
                 _width_ratio(a, b, *w_prior)
-                for a, b in zip(np.atleast_1d(w_lo), np.atleast_1d(w_hi))
+                for a, b in zip(np.atleast_1d(w_lo), np.atleast_1d(w_hi), strict=True)
             ],
             "beta_mean": float(self.beta.mean()),
             "beta_ci_low": float(lo),
@@ -1264,7 +1421,7 @@ class IndexPosterior:
             out["peak_radius_prior_ci"] = list(prior)
             out["peak_radius_width_ratio"] = [
                 _width_ratio(a, b, *prior)
-                for a, b in zip(np.atleast_1d(p_lo), np.atleast_1d(p_hi))
+                for a, b in zip(np.atleast_1d(p_lo), np.atleast_1d(p_hi), strict=True)
             ]
         if self.kernel_width is not None:
             out["kernel_width_mean"] = self.kernel_width.mean(0).tolist()
@@ -1279,8 +1436,8 @@ class IndexPosterior:
             out["aggregator_uniform"] = 1.0 / self.aggregator_weights.shape[2]
             out["aggregator_informative"] = self.informative_aggregators()
             out["aggregator_width_ratio"] = [
-                [_width_ratio(a, b, *a_prior) for a, b in zip(lo_c, hi_c)]
-                for lo_c, hi_c in zip(a_lo, a_hi)
+                [_width_ratio(a, b, *a_prior) for a, b in zip(lo_c, hi_c, strict=True)]
+                for lo_c, hi_c in zip(a_lo, a_hi, strict=True)
             ]
         return out
 
@@ -1312,6 +1469,17 @@ LIKELIHOODS = ("auto", "rows")
 # re-adapts its mass matrix; it saves the cold start's long search for a step
 # size and a typical set.
 NULL_WARMUP_WARM = 150
+
+#: Warm-up of a synergy posterior started from a linear pre-fit
+#: (:func:`synergy_warm_start`): the kernel, aggregator and effect start where
+#: the linear fit left them, but the interaction weights and the step size
+#: still have to adapt.
+SYNERGY_WARMUP_WARM = 250
+
+#: Share of the synergy weights given to the interaction terms at the start of
+#: a warm-started synergy fit; the main terms keep the rest in the linear
+#: fit's proportions.
+SYNERGY_START_SHARE = 0.05
 
 
 def _masked_grid(E, radius_mask=None) -> np.ndarray:
@@ -1382,6 +1550,68 @@ def warm_start_from(mcmc, *, warmup: int = NULL_WARMUP_WARM) -> dict:
         "init": init,
         "warmup": int(warmup),
         "adapt_mass_matrix": True,
+    }
+
+
+def linear_prefit(grid, y, *, chains, seed, draws=200, warmup=300, **grid_kwargs):
+    """A short linear fit of the grid, to start a synergy posterior from.
+
+    The linear form's posterior runs from the columns' cross-products, so this
+    costs seconds where a cold synergy warm-up costs minutes. ``grid_kwargs``
+    are :func:`grid_posterior`'s; the synergy design is not used.
+    """
+    kw = {
+        k: v for k, v in grid_kwargs.items() if k not in ("design", "design_channels")
+    }
+    return fit(
+        grid,
+        y,
+        form="linear",
+        draws=draws,
+        warmup=warmup,
+        chains=chains,
+        seed=seed,
+        **kw,
+    )
+
+
+def synergy_warm_start(
+    linear_mcmc,
+    n_terms: int,
+    *,
+    warmup: int = SYNERGY_WARMUP_WARM,
+    share: float = SYNERGY_START_SHARE,
+) -> dict:
+    """A synergy fit's starting point from a fitted linear fit of the same grid.
+
+    The sites both models share (kernel, aggregator, effect, residual scale)
+    start at the linear posterior mean with its adapted inverse mass. The
+    weights start at the linear weights scaled by ``1 − share``, the
+    interaction terms sharing ``share`` equally, with every weight's mass at
+    the linear weights' median entry. The mass matrix and the step size
+    re-adapt over ``warmup`` iterations, so only the starting point changes,
+    not the target.
+    """
+    base = warm_start_from(linear_mcmc, warmup=warmup)
+    ((key, diag),) = base["inverse_mass_matrix"].items()
+    step = np.asarray(linear_mcmc.last_state.adapt_state.step_size).reshape(-1)
+    chained = step.size > 1
+    sizes = {
+        name: int(np.prod(np.shape(value)[1:] if chained else np.shape(value)))
+        for name, value in linear_mcmc.last_state.z.items()
+    }
+    parts, pos = {}, 0
+    for name in key:
+        parts[name] = diag[pos : pos + sizes[name]]
+        pos += sizes[name]
+    w = np.asarray(base["init"]["w"], dtype=np.float64)
+    parts["w"] = np.full(len(w) + n_terms - 1, float(np.median(parts["w"])))
+    init = dict(base["init"])
+    init["w"] = np.concatenate([w * (1.0 - share), np.full(n_terms, share / n_terms)])
+    return {
+        **base,
+        "inverse_mass_matrix": {key: np.concatenate([parts[name] for name in key])},
+        "init": init,
     }
 
 
@@ -1827,6 +2057,7 @@ def grid_posterior(
     radius_prior="rungs",
     entities=None,
     design=None,
+    warm_start=None,
 ):
     """The joint model over the whole grid of the index channels, summarised.
 
@@ -1835,22 +2066,25 @@ def grid_posterior(
     can refit the same model, e.g. for :func:`null_calibration`. ``entities``
     (a panel's entity per row) adds the per-entity intercept of :func:`fit`,
     and ``design`` the synergy form's terms; both travel in ``grid_kwargs``.
+    ``warm_start`` (:func:`warm_start_from`, :func:`synergy_warm_start`)
+    starts the sampler from another fit; the posterior's own adapted sampler
+    is returned as ``posterior.warm_start`` for the next fit.
     """
     grid = np.asarray(Xr)[:, list(channel_index), :, :]
     radius_mask = np.zeros((len(channels), len(radii)), dtype=bool)
     for ci, allowed in enumerate(radius_idx):
         radius_mask[ci, list(allowed)] = True
-    grid_kwargs = dict(
-        radii=radii,
-        stats=stats,
-        radius_mask=radius_mask,
-        radius_kernel=radius_kernel,
-        aggregator=aggregator,
-        radius_prior=radius_prior,
-        entities=entities,
-        design=design,
-        design_channels=tuple(channel_index),
-    )
+    grid_kwargs = {
+        "radii": radii,
+        "stats": stats,
+        "radius_mask": radius_mask,
+        "radius_kernel": radius_kernel,
+        "aggregator": aggregator,
+        "radius_prior": radius_prior,
+        "entities": entities,
+        "design": design,
+        "design_channels": tuple(channel_index),
+    }
     mcmc = fit(
         grid,
         yr,
@@ -1859,6 +2093,7 @@ def grid_posterior(
         warmup=warmup,
         chains=chains,
         seed=seed,
+        warm_start=warm_start,
         **grid_kwargs,
     )
     post = posterior_from(
@@ -1891,18 +2126,7 @@ def _discovery_shuffle(task):
     tr = ~te
     combos = list(itertools.product(*cols_per_channel))
     ztr = np.asarray(z[tr])
-    g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
-
-    best, best_v = None, -np.inf
-    for combo in combos:
-        i = np.asarray(combo)
-        fit_ = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
-        if fit_ is None:
-            continue
-        sub, w = fit_
-        v = _tstat(ztr[:, i[sub]] @ w, y[tr])
-        if v > best_v:
-            best_v, best = v, combo
+    best = _best_combo(ztr, y[tr], combos)
     if best is None:
         return None
 
@@ -2038,28 +2262,25 @@ def _gain_split(task):
     ztr = np.asarray(z[tr])
 
     train_t = {}
+    cg, cy, syy = _centred(ztr, y[tr])
     for ci, single in enumerate(per_channel_cols):
-        best, best_v = None, -np.inf
-        for col in single:
-            v = _tstat(ztr[:, col], y[tr])
-            if v > best_v:
-                best_v, best = v, col
+        # Each column's training |t| from the centred cross-products; the
+        # winner's is recomputed from its rows, which the channel pick reads.
+        single = np.asarray(single, dtype=np.int64)
+        v = _train_t(
+            np.ones((len(single), 1)),
+            cg[single, single][:, None, None],
+            cy[single][:, None],
+            syy,
+            int(tr.sum()),
+        )
+        best = int(single[int(np.argmax(np.where(np.isfinite(v), v, -np.inf)))])
         e = np.asarray(z[:, best])
         out[f"ch{ci}"] = _tstat(e[te], y[te])
-        train_t[f"ch{ci}"] = best_v
+        train_t[f"ch{ci}"] = _tstat(ztr[:, best], y[tr])
 
     combos = list(itertools.product(*cols))
-    g_tr, c_tr = ztr.T @ ztr, ztr.T @ y[tr]
-    best, best_v = None, -np.inf
-    for combo in combos:
-        i = np.asarray(combo)
-        f_ = simplex_fit(g_tr[np.ix_(i, i)], c_tr[i])
-        if f_ is None:
-            continue
-        sub, w = f_
-        v = _tstat(ztr[:, i[sub]] @ w, y[tr])
-        if v > best_v:
-            best_v, best = v, combo
+    best = _best_combo(ztr, y[tr], combos)
     E = form_columns(forms, z, best, design)
     scores = {}
     for form in forms:

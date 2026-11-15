@@ -6,13 +6,12 @@ environmental-epidemiology literature reports three other shapes, and this
 module produces all three from an already-chosen composite:
 
 * **Per-IQR effect** — the coefficient rescaled to one interquartile-range
-  increase in the exposure. This is how every greenspace effect estimate is
-  published (the CLSA papers use an NDVI IQR of 0.06). It is a pure change of
-  units, so it does not require a refit.
+  increase in the exposure. This is how greenspace effect estimates are
+  usually published, often per a fixed NDVI IQR. It is a pure change of units,
+  so it does not require a refit.
 * **Quartile contrasts** — the exposure cut at its own quartiles and entered
   as three indicators against Q1. This is the form used when the authors want
-  to show the shape of the gradient without assuming one, and it is what the
-  CLSA self-rated-social-standing paper models.
+  to show the shape of the gradient without assuming one.
 * **Non-linearity test** — a restricted cubic spline on the exposure against
   the linear term, so "is the exposure–response function actually a line" gets
   an answer instead of an assumption.
@@ -51,11 +50,9 @@ Fitter = Callable[[np.ndarray, Sequence[str]], "dict[str, tuple] | None"]
 #: Key under which a fitter returns ``(names, covariance_matrix)``.
 COV_KEY = "__cov__"
 
-#: Interquartile range of NDVI in the CLSA cohort, the scaling constant the
-#: published CLSA greenspace effect estimates are expressed in. Supplied as a
-#: default only so a replication can reproduce their numbers exactly; a
-#: composite index has its own IQR and should be scaled by that instead.
-CLSA_NDVI_IQR: float = 0.06
+#: A fixed NDVI interquartile range for reproducing effects published per
+#: IQR; a composite has its own IQR and should be scaled by that instead.
+REFERENCE_NDVI_IQR: float = 0.06
 
 #: Spline basis size for the non-linearity test. Four knots is the usual
 #: choice for an exposure–response curve — enough to bend twice, not enough to
@@ -88,12 +85,12 @@ def iqr_scaled_effect(
     """Rescale a per-unit effect to a per-IQR increase.
 
     Pass *exposure* to use its own interquartile range (the right choice for a
-    composite index), or *iqr* to pin the divisor — ``CLSA_NDVI_IQR`` when the
+    composite index), or *iqr* to pin the divisor — ``REFERENCE_NDVI_IQR`` when the
     point is to reproduce a published NDVI estimate.
 
     With ``logistic=True`` the estimate and its interval are also exponentiated
-    into an odds ratio, which is the form the CLSA depression and loneliness
-    papers report.
+    into an odds ratio, the form logistic greenspace estimates are usually
+    reported in.
 
     Scaling is linear in the coefficient and its standard error, so the
     z-statistic and p-value are unchanged by construction — only the units move.

@@ -8,13 +8,20 @@ entity coordinates that absorbs that unmeasured spatial structure, so the partia
 association reflects only the finer-scale greenery↔outcome co-variation a smooth
 confounder cannot explain.
 
-Two estimators consume the basis (see :mod:`geofuse.objective_scoring`):
+The basis enters the outcome model unpenalized, by OLS: the adjustment of
+Keller & Szpiro (2020, §2.2), equal at the observed locations to their
+pre-adjustment of the exposure (§2.3). Its size is set one of three ways (see
+:mod:`geofuse.objective_scoring` and ``MetricFusionEngine``):
 
-* **KS-AIC** (Keller & Szpiro, 2020) — add the smooth to the outcome model and
-  pick its degrees of freedom by AIC on the outcome model *without* the exposure.
-* **df-Spatial+** (the unpenalized, AIC-df variant of Dupont–Wood–Augustin used by
-  Rainey et al., 2025) — residualize the exposure on the smooth, df by AIC on the
-  exposure model.
+* ``df_outcome_ic`` — the df by AIC/BIC of the outcome model *without* the
+  exposure (Keller & Szpiro 2020).
+* ``df_exposure_ic`` — the df by AIC/BIC of the exposure model ("df-Spatial+"
+  of Rainey et al. 2025). The exposure residual is taken on an unpenalized
+  basis, so by Frisch–Waugh–Lovell the slope equals the plain basis adjustment
+  (Dupont, Wood & Augustin 2022, §4); only the basis size differs.
+* ``fixed_scale`` — a pattern scale in metres, with no criterion.
+
+Spatial+ itself, with penalized smooths, lives in :mod:`geofuse.spatial_plus`.
 
 Construction
 ------------
@@ -34,6 +41,7 @@ coordinates — the void interior is never predicted.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -43,14 +51,38 @@ from scipy.spatial.distance import cdist
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
 
-# Default neighbour count for the k-NN connectivity graph used to detect spatial
-# components when no explicit ``eps`` is given. A dense cluster stays whole via
-# neighbour chains; a void wider than the local k-NN reach severs the graph.
-_DEFAULT_KNN: int = 10
+#: Neighbour count of the k-NN connectivity graph that detects spatial
+#: components when no explicit ``eps`` is given. A dense cluster stays whole via
+#: neighbour chains; a void wider than the local k-NN reach severs the graph.
+DEFAULT_NEIGHBOURS: int = 10
 
-# Upper bound on knots per component, before the df-many coarsest eigenvectors
-# are taken. Caps the O(k^3) energy-matrix eigendecomposition on dense areas.
-_KNOT_CAP: int = 150
+#: Knots per component: at least ``2·df + 1`` and :data:`DEFAULT_KNOTS_MIN`, at
+#: most :data:`DEFAULT_KNOTS_MAX` (caps the O(k³) energy-matrix
+#: eigendecomposition on dense areas) and the component's size.
+DEFAULT_KNOTS_MIN: int = 35
+DEFAULT_KNOTS_MAX: int = 150
+
+#: Candidate radial df per component a spatially adjusted run compares, besides
+#: "no smooth": roughly log-spaced up to 20.
+DEFAULT_DF_CANDIDATES: tuple[int, ...] = (0, 1, 2, 3, 4, 6, 8, 11, 15, 20)
+
+#: Information criteria the df is selected by.
+CRITERIA: tuple[str, ...] = ("aic", "bic")
+
+#: A scale-defined basis (``scale_m``) above this many radial columns in all, or
+#: in one cluster, logs a warning naming the scale and the largest cluster.
+SCALE_WARN_COLUMNS = 2000
+SCALE_WARN_BLOCK = 400
+
+#: Smallest cluster that keeps a level of its own when a scale defines the
+#: smooth; a smaller one joins its nearest larger cluster's level.
+DEFAULT_MIN_COMPONENT = 30
+
+#: A cluster is reported as chained when its extent exceeds this multiple of the
+#: entity-weighted median extent, or it holds more than this share of entities
+#: while being wider than twice that median.
+CHAINED_EXTENT = 5.0
+CHAINED_SHARE = 0.25
 
 
 def _tps_eta(r: np.ndarray) -> np.ndarray:
@@ -62,7 +94,7 @@ def _tps_eta(r: np.ndarray) -> np.ndarray:
 
 
 def connected_components(
-    xy: np.ndarray, eps: float | None = None, *, k: int = _DEFAULT_KNN
+    xy: np.ndarray, eps: float | None = None, *, k: int = DEFAULT_NEIGHBOURS
 ) -> tuple[np.ndarray, float]:
     """Label points by connected spatial component.
 
@@ -125,8 +157,167 @@ def _maximin_knots(z: np.ndarray, k: int) -> np.ndarray:
     return z[chosen]
 
 
+def covering_knots(z: np.ndarray, radius: float) -> np.ndarray:
+    """Farthest-point sample of ``z`` until every point is within ``radius`` of a
+    knot.
+
+    Starts from the point nearest the centroid, as :func:`_maximin_knots` does,
+    and adds the point farthest from the knots chosen so far, so a cluster gets
+    as many knots as its occupied area needs at that radius, wherever it lies.
+    """
+    n = len(z)
+    c0 = int(np.argmin(((z - z.mean(axis=0)) ** 2).sum(axis=1)))
+    chosen = [c0]
+    d = cdist(z, z[[c0]]).ravel()
+    while len(chosen) < n and float(d.max()) > radius:
+        i = int(np.argmax(d))
+        chosen.append(i)
+        d = np.minimum(d, cdist(z, z[[i]]).ravel())
+    return z[chosen]
+
+
+def extent_m(xy: np.ndarray) -> float:
+    """A cluster's extent: the square root of its convex hull's area (metres),
+    or of its bounding box's when the hull is degenerate."""
+    xy = np.asarray(xy, dtype=np.float64)
+    if len(xy) < 3:
+        return 0.0
+    try:
+        from scipy.spatial import ConvexHull
+
+        return float(np.sqrt(ConvexHull(xy).volume))
+    except Exception:
+        span = xy.max(axis=0) - xy.min(axis=0)
+        return float(np.sqrt(max(span[0] * span[1], 0.0)))
+
+
+def merge_small_components(
+    xy: np.ndarray, labels: np.ndarray, min_size: int
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Relabel each cluster smaller than ``min_size`` to its nearest larger one.
+
+    The nearest larger cluster is the one holding the entity closest to any of
+    the small cluster's entities. Returns ``(labels, merged, n_merged)``: the new
+    dense labels, a mask of the entities that were moved, and how many clusters
+    were merged. Nothing moves when no cluster reaches ``min_size``.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    labels = np.asarray(labels).copy()
+    sizes = np.bincount(labels)
+    large = np.flatnonzero(sizes >= int(min_size))
+    small = np.flatnonzero(sizes < int(min_size))
+    merged = np.zeros(len(labels), dtype=bool)
+    if not len(large) or not len(small):
+        _, dense = np.unique(labels, return_inverse=True)
+        return dense.astype(np.int64), merged, 0
+    in_large = np.isin(labels, large)
+    nn = NearestNeighbors(n_neighbors=1).fit(xy[in_large])
+    target = labels[in_large]
+    for c in small:
+        rows = np.flatnonzero(labels == c)
+        dist, idx = nn.kneighbors(xy[rows])
+        labels[rows] = target[int(idx[int(np.argmin(dist[:, 0])), 0])]
+        merged[rows] = True
+    _, dense = np.unique(labels, return_inverse=True)
+    return dense.astype(np.int64), merged, int(len(small))
+
+
+def radial_coefficients(knots: np.ndarray) -> np.ndarray:
+    """Knot coefficients of the thin-plate radial functions, coarsest first.
+
+    The functions ``η(‖z − knot‖) @ δ`` satisfy the thin-plate constraint
+    ``Tᵀδ = 0`` with ``T = [1, knot x, knot y]`` (Wood 2003): ``δ`` lies in the
+    null space ``Z`` of ``Tᵀ``, and the columns are the eigenvectors of the
+    reduced energy matrix ``Zᵀ E Z`` in descending ``|eigenvalue|`` order, so
+    the radial part carries nothing the linear terms already hold. ``[K, K − 3]``
+    for ``K`` knots; no column below 4 knots.
+    """
+    k = len(knots)
+    if k < 4:
+        return np.empty((k, 0), dtype=np.float64)
+    T = np.column_stack([np.ones(k), knots])
+    Q, _r = np.linalg.qr(T, mode="complete")
+    Z = Q[:, 3:]
+    E = _tps_eta(cdist(knots, knots))
+    w, V = np.linalg.eigh(Z.T @ E @ Z)
+    return Z @ V[:, np.argsort(np.abs(w))[::-1]]
+
+
+def _scale_columns(xy_c: np.ndarray, scale_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Linear + radial columns of one cluster at pattern scale ``scale_m``.
+
+    Knots cover the cluster at radius ``scale_m / 2`` (:func:`covering_knots`)
+    and every constrained radial function (:func:`radial_coefficients`) is
+    kept, up to ``n_c − 4`` so the cluster leaves room for residuals.
+    """
+    n_c = len(xy_c)
+    empty = np.empty((n_c, 0), dtype=np.float64)
+    if n_c < 4:
+        return empty, empty
+    center = xy_c.mean(axis=0)
+    z = xy_c - center
+    span = float(np.sqrt((z**2).sum(axis=1)).std())
+    if span <= 0:
+        return empty, empty
+    z = z / span
+    linear = z.copy()
+    r_max = n_c - 4
+    if r_max <= 0:
+        return linear, empty
+    knots = covering_knots(z, 0.5 * float(scale_m) / span)
+    delta = radial_coefficients(knots)
+    if delta.shape[1] == 0:
+        return linear, empty
+    phi = (_tps_eta(cdist(z, knots)) @ delta)[:, :r_max]
+    std = phi.std(axis=0)
+    std[std == 0] = 1.0
+    return linear, (phi - phi.mean(axis=0)) / std
+
+
+def component_report(xy: np.ndarray, labels: np.ndarray, knots: list) -> dict:
+    """Per-cluster entities, extent and knots, and whether one cluster chains.
+
+    ``chained`` is a message when the widest cluster's extent exceeds
+    :data:`CHAINED_EXTENT` times the entity-weighted median extent, or a
+    cluster wider than twice that median holds more than
+    :data:`CHAINED_SHARE` of the entities, else ``None``.
+    """
+    n_comp = int(labels.max()) + 1 if len(labels) else 0
+    sizes = np.bincount(labels, minlength=n_comp)
+    extents = np.array([extent_m(xy[labels == c]) for c in range(n_comp)])
+    out = {
+        "components": [
+            {
+                "n": int(sizes[c]),
+                "extent_m": round(float(extents[c]), 1),
+                "knots": int(knots[c]) if c < len(knots) else 0,
+            }
+            for c in range(n_comp)
+        ],
+        "chained": None,
+    }
+    if n_comp < 2:
+        return out
+    order = np.argsort(extents)
+    cum = np.cumsum(sizes[order]) / sizes.sum()
+    median = float(extents[order][np.searchsorted(cum, 0.5)])
+    big = int(np.argmax(sizes))
+    wide = int(np.argmax(extents))
+    if median > 0 and extents[wide] > CHAINED_EXTENT * median:
+        out["chained"] = (
+            f"one spatial cluster spans {extents[wide] / 1000:.0f} km against a median "
+            f"of {median / 1000:.1f} km"
+        )
+    elif sizes[big] > CHAINED_SHARE * sizes.sum() and extents[big] > 2 * median:
+        out["chained"] = (
+            f"one spatial cluster holds {sizes[big] / sizes.sum():.0%} of the entities"
+        )
+    return out
+
+
 def _component_columns(
-    xy_c: np.ndarray, max_df: int, knot_cap: int
+    xy_c: np.ndarray, max_df: int, knot_cap: int, knot_floor: int = DEFAULT_KNOTS_MIN
 ) -> tuple[np.ndarray, np.ndarray]:
     """Linear + resolution-ordered radial columns for one component.
 
@@ -156,15 +347,14 @@ def _component_columns(
     if r_max <= 0:
         return linear, empty
 
-    k = min(n_c, max(2 * int(max_df) + 1, 35), int(knot_cap))
+    k = min(n_c, max(2 * int(max_df) + 1, int(knot_floor)), int(knot_cap))
     knots = _maximin_knots(z, k)
-    energy = _tps_eta(cdist(knots, knots))
-    # Eigenvectors ordered by descending |eigenvalue| span coarse→fine spatial
-    # patterns; project the data-to-knot kernel onto them.
-    w, U = np.linalg.eigh(energy)
-    order = np.argsort(np.abs(w))[::-1]
-    U = U[:, order]
-    phi = _tps_eta(cdist(z, knots)) @ U  # [n_c, k]
+    # Constrained eigenvectors ordered coarse→fine; project the data-to-knot
+    # kernel onto them.
+    delta = radial_coefficients(knots)
+    if delta.shape[1] == 0:
+        return linear, empty
+    phi = _tps_eta(cdist(z, knots)) @ delta  # [n_c, k − 3]
     phi = phi[:, : min(r_max, phi.shape[1])]
 
     # Standardize radial columns for downstream lstsq conditioning (column
@@ -218,15 +408,59 @@ class SpatialBasis:
         return np.column_stack(parts)
 
 
+def cluster_components(
+    xy: np.ndarray,
+    *,
+    eps: float | None = None,
+    neighbours: int = DEFAULT_NEIGHBOURS,
+    min_component: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, int, float]:
+    """The clusters :func:`build_block_basis` builds on the finite rows of
+    ``xy``: ``(labels, merged, n_merged, eps_used)`` (:func:`connected_components`
+    then :func:`merge_small_components`). Pass them as ``components`` to build
+    several bases on one set of clusters without forming it again."""
+    xy = np.asarray(xy, dtype=np.float64)
+    finite = np.isfinite(xy).all(axis=1)
+    lab_f, eps_used = connected_components(xy[finite], eps=eps, k=neighbours)
+    moved_f = np.zeros(len(lab_f), dtype=bool)
+    n_merged = 0
+    if min_component:
+        lab_f, moved_f, n_merged = merge_small_components(
+            xy[finite], lab_f, int(min_component)
+        )
+    return lab_f, moved_f, n_merged, eps_used
+
+
 def build_block_basis(
-    xy: np.ndarray, *, max_df: int = 10, eps: float | None = None
+    xy: np.ndarray,
+    *,
+    max_df: int = 10,
+    eps: float | None = None,
+    neighbours: int = DEFAULT_NEIGHBOURS,
+    knots_min: int = DEFAULT_KNOTS_MIN,
+    knots_max: int = DEFAULT_KNOTS_MAX,
+    scale_m: float | None = None,
+    min_component: int | None = None,
+    components: "tuple | None" = None,
 ) -> SpatialBasis:
     """Assemble the per-component block-diagonal spatial basis for ``xy``.
 
     ``xy`` is an ``[n, 2]`` array of entity coordinates in a metre CRS.
-    ``max_df`` bounds the radial functions per component; ``eps`` is forwarded
-    to :func:`connected_components`. The basis is a thin-plate regression
-    spline, with knots capped at :data:`_KNOT_CAP`.
+    ``max_df`` bounds the radial functions per component; ``eps`` and
+    ``neighbours`` are forwarded to :func:`connected_components`. The basis is
+    a thin-plate regression spline with ``min(n_c, max(2·max_df + 1,
+    knots_min), knots_max)`` knots per component.
+
+    ``scale_m`` defines the smooth by a distance instead: clusters come from a
+    gap of ``eps`` (default twice the scale), each cluster's knots cover it at
+    radius ``scale_m / 2`` (:func:`covering_knots`) and all its radial
+    functions are used, so the smooth removes patterns coarser than about
+    ``scale_m`` everywhere; ``max_df`` and the knot bounds do not apply.
+    ``min_component`` joins every smaller cluster to its nearest larger one's
+    level (:func:`merge_small_components`): its entities share that cluster's
+    intercept and get no trend or radial terms of their own. ``components``
+    (from :func:`cluster_components` on the same ``xy``, ``eps``,
+    ``neighbours`` and ``min_component``) skips forming the clusters again.
 
     Non-finite rows contribute no spatial columns (they fall back to covariate
     control). Returns a :class:`SpatialBasis`; ``has_spatial`` is ``False`` when
@@ -249,14 +483,25 @@ def build_block_basis(
             "eps_used": 0.0,
             "max_df_avail": 0,
             "knots_per_component": [],
+            "neighbours": int(neighbours),
+            "knots_min": int(knots_min),
+            "knots_max": int(knots_max),
         },
     )
     if n < 4 or finite.sum() < 4:
         return base
 
     labels = np.full(n, -1, dtype=np.int64)
-    lab_f, eps_used = connected_components(xy[finite], eps=eps)
+    if scale_m is not None and eps is None:
+        eps = 2.0 * float(scale_m)
+    if components is None:
+        components = cluster_components(
+            xy, eps=eps, neighbours=neighbours, min_component=min_component
+        )
+    lab_f, moved_f, n_merged, eps_used = components
     labels[finite] = lab_f
+    moved = np.zeros(n, dtype=bool)
+    moved[finite] = moved_f
 
     n_comp = int(lab_f.max()) + 1 if len(lab_f) else 0
 
@@ -273,12 +518,18 @@ def build_block_basis(
     knots_per_component: list[int] = []
 
     for c in range(n_comp):
-        idx = np.where(labels == c)[0]
+        members = np.where(labels == c)[0]
+        idx = members[~moved[members]]
         if c > 0:
             ind = np.zeros(n, dtype=np.float64)
-            ind[idx] = 1.0
+            ind[members] = 1.0
             intercept_cols.append(ind)
-        lin_c, phi_c = _component_columns(xy[idx], max_df=max_df, knot_cap=_KNOT_CAP)
+        if scale_m is not None:
+            lin_c, phi_c = _scale_columns(xy[idx], float(scale_m))
+        else:
+            lin_c, phi_c = _component_columns(
+                xy[idx], max_df=max_df, knot_cap=knots_max, knot_floor=knots_min
+            )
         knots_per_component.append(int(phi_c.shape[1]))
         for j in range(lin_c.shape[1]):
             col = np.zeros(n, dtype=np.float64)
@@ -288,7 +539,8 @@ def build_block_basis(
             col = np.zeros(n, dtype=np.float64)
             col[idx] = phi_c[:, r]
             radial_cols.append(col)
-            radial_rank.append(r)
+            # Scale mode keeps every function, so all share the first level.
+            radial_rank.append(0 if scale_m is not None else r)
 
     linear = (
         np.column_stack(intercept_cols + linear_cols)
@@ -302,7 +554,26 @@ def build_block_basis(
         "knots_per_component": knots_per_component,
         "max_df_avail": (int(max(radial_rank)) + 1) if radial_rank else 0,
         "n_singletons": int(np.sum(np.bincount(lab_f) == 1)) if len(lab_f) else 0,
+        "neighbours": int(neighbours),
+        "knots_min": int(knots_min),
+        "knots_max": int(knots_max),
+        **component_report(xy[finite][~moved_f], lab_f[~moved_f], knots_per_component),
     }
+    if min_component:
+        summary.update(
+            min_component=int(min_component),
+            merged_components=int(n_merged),
+            merged_entities=int(moved.sum()),
+        )
+    if scale_m is not None:
+        summary.update(scale_m=float(scale_m), radial_columns=len(radial_cols))
+        biggest = max(knots_per_component, default=0)
+        if len(radial_cols) > SCALE_WARN_COLUMNS or biggest > SCALE_WARN_BLOCK:
+            summary["size_warning"] = (
+                f"the smooth at {float(scale_m) / 1000:g} km has {len(radial_cols)} "
+                f"radial functions, {biggest} in its largest cluster; a larger scale "
+                "or a smaller cluster gap (spatial_adjust_eps_m) keeps it smaller"
+            )
     return SpatialBasis(
         linear=linear,
         radial=radial,
@@ -336,53 +607,89 @@ def _ols_info_criterion(y: np.ndarray, X: np.ndarray | None, criterion: str) -> 
     return float(2.0 * k - 2.0 * loglik)
 
 
+def candidate_dfs(
+    basis: SpatialBasis, candidates: Sequence[int] | None = None
+) -> list[int]:
+    """The df levels a selection compares on ``basis``, ascending.
+
+    ``None`` means every level ``0 … basis.max_df``. A listed df above what the
+    basis holds is capped to ``basis.max_df`` (a component smaller than a df is
+    capped per component by :meth:`SpatialBasis.design` as well), and
+    duplicates are dropped, so the levels compared are distinct designs.
+    """
+    top = basis.max_df
+    if candidates is None:
+        return list(range(0, top + 1))
+    return sorted({min(int(d), top) for d in candidates if int(d) >= 0})
+
+
+def _check_criterion(criterion: str) -> None:
+    if criterion not in CRITERIA:
+        raise ValueError(
+            f"criterion must be one of {list(CRITERIA)}, not {criterion!r}."
+        )
+
+
 def select_df_aic(
     y: np.ndarray,
     basis: SpatialBasis,
     covariates: np.ndarray | None = None,
     *,
     criterion: str = "aic",
-) -> tuple[int | None, np.ndarray | None]:
+    candidates: Sequence[int] | None = None,
+    return_profile: bool = False,
+):
     """Choose the spatial df by information criterion (Keller–Szpiro rule).
 
-    Fits ``y ~ spatial(df) + covariates`` for each candidate df and the
-    no-spatial baseline ``y ~ covariates``, returning the lowest-AIC choice as
-    ``(df, columns)``. ``df is None`` (``columns is None``) means the criterion
-    preferred no spatial adjustment. For KS-AIC pass the *outcome* as ``y``; for
-    df-Spatial+ pass the *exposure*.
+    Fits ``y ~ spatial(df) + covariates`` for each candidate df
+    (:func:`candidate_dfs`) and the no-spatial baseline ``y ~ covariates``,
+    returning the lowest-criterion choice as ``(df, columns)``; on a tie the
+    smaller design wins. ``df is None`` (``columns is None``) means the
+    criterion preferred no spatial adjustment. For ``df_outcome_ic`` pass the
+    *outcome* as ``y``; for ``df_exposure_ic`` the *exposure*.
+
+    With ``return_profile`` a third value holds the criterion of every design
+    compared, ``{"none": ic, "<df>": ic, …}`` in the order compared (empty when
+    nothing was compared).
 
     Non-finite rows of ``y`` / ``covariates`` are dropped for the criterion fits
     only; the returned ``columns`` stay full length (and finite by construction),
     aligned with the original rows.
     """
+    _check_criterion(criterion)
+    profile: dict[str, float] = {}
     if not basis.has_spatial:
-        return None, None
+        return (None, None, profile) if return_profile else (None, None)
 
     y = np.asarray(y, dtype=np.float64).ravel()
     fin = np.isfinite(y)
     if covariates is not None:
         fin &= np.isfinite(covariates).all(axis=1)
     if fin.sum() < 4:
-        return None, None
+        return (None, None, profile) if return_profile else (None, None)
     yf = y[fin]
     covf = None if covariates is None else covariates[fin]
 
     best_df: int | None = None
     best_cols: np.ndarray | None = None
     best_ic = _ols_info_criterion(yf, covf, criterion)  # baseline: no spatial
+    profile["none"] = best_ic
 
-    for df in range(0, basis.max_df + 1):
+    for df in candidate_dfs(basis, candidates):
         spatial = basis.design(df)
         if spatial.shape[1] == 0:
             continue
         sf = spatial[fin]
         X = sf if covf is None else np.column_stack([covf, sf])
         ic = _ols_info_criterion(yf, X, criterion)
+        profile[str(df)] = ic
         if ic < best_ic:
             best_ic = ic
             best_df = df
             best_cols = spatial
 
+    if return_profile:
+        return best_df, best_cols, profile
     return best_df, best_cols
 
 
@@ -396,14 +703,54 @@ class DfSelectionPrecompute:
     prefix of ``‖Qᵀy‖²`` — the per-call df search becomes a single matvec
     instead of ``max_df + 1`` least-squares fits.
 
-    ``k_of_df[df]`` is the column count in ``Q`` (intercept included) at that
-    df level; ``designs[df]`` is the spatial design (no intercept) returned to
-    the caller — same column *span* as ``SpatialBasis.design(df)``.
+    ``k_of_df[df]`` is the design's column count (intercept included) at that
+    df level, the parameter count of its criterion; ``spans[df]`` the number of
+    leading ``Q`` columns spanning that design (fewer than ``k_of_df[df]`` when
+    it is rank-deficient, :func:`nested_basis`); ``designs[df]`` is the spatial
+    design (no intercept) returned to the caller — same column *span* as
+    ``SpatialBasis.design(df)``.
     """
 
     Q: np.ndarray
     k_of_df: np.ndarray
     designs: list
+    spans: np.ndarray | None = None
+    n_base: int = 1
+
+
+#: Relative size of a column's part outside the earlier columns below which
+#: :func:`nested_basis` treats it as dependent.
+NESTED_RTOL: float = 1e-10
+
+
+def nested_basis(M: np.ndarray, rtol: float = NESTED_RTOL):
+    """Orthonormal basis of ``M``'s leading columns, prefix by prefix.
+
+    Returns ``(Q, kept)``: ``Q[:, :kept[j]]`` spans ``M[:, :j + 1]`` for every
+    ``j``. A full-rank ``M`` gets its economy QR unchanged (``kept[j] = j + 1``);
+    a column whose part outside the earlier ones is below ``rtol`` of its norm
+    adds no direction, where an un-pivoted QR would add an arbitrary one.
+    """
+    n, p = M.shape
+    Q, R = np.linalg.qr(M, mode="reduced")
+    norms = np.linalg.norm(M, axis=0)
+    diag = np.abs(np.diag(R))
+    if p == 0 or (diag > rtol * np.maximum(norms, 1e-300)).all():
+        return Q, np.arange(1, p + 1, dtype=np.int64)
+    cols: list[np.ndarray] = []
+    kept = np.empty(p, dtype=np.int64)
+    for j in range(p):
+        v = M[:, j].astype(np.float64, copy=True)
+        if cols:
+            B = np.column_stack(cols)
+            for _ in range(2):
+                v -= B @ (B.T @ v)
+        size = float(np.linalg.norm(v))
+        if norms[j] > 0 and size > rtol * norms[j]:
+            cols.append(v / size)
+        kept[j] = len(cols)
+    Qn = np.column_stack(cols) if cols else np.empty((n, 0), dtype=np.float64)
+    return Qn, kept
 
 
 def precompute_df_selection(basis: SpatialBasis) -> DfSelectionPrecompute | None:
@@ -416,20 +763,24 @@ def precompute_df_selection(basis: SpatialBasis) -> DfSelectionPrecompute | None
     n_linear = basis.linear.shape[1]
 
     M = np.column_stack([np.ones(basis.n), basis.linear, radial_sorted])
-    Q, _r = np.linalg.qr(M, mode="reduced")
+    Q, kept = nested_basis(M)
 
     k_of_df = np.empty(basis.max_df + 1, dtype=np.int64)
+    spans = np.empty(basis.max_df + 1, dtype=np.int64)
     designs: list = []
     for df in range(basis.max_df + 1):
         n_radial = int(np.searchsorted(sorted_ranks, df, side="left"))
         k_of_df[df] = 1 + n_linear + n_radial
+        spans[df] = kept[k_of_df[df] - 1]
         parts = []
         if n_linear:
             parts.append(basis.linear)
         if n_radial:
             parts.append(radial_sorted[:, :n_radial])
         designs.append(np.column_stack(parts) if parts else None)
-    return DfSelectionPrecompute(Q=Q, k_of_df=k_of_df, designs=designs)
+    return DfSelectionPrecompute(
+        Q=Q, k_of_df=k_of_df, designs=designs, spans=spans, n_base=int(kept[0])
+    )
 
 
 def select_df_aic_fast(
@@ -438,7 +789,9 @@ def select_df_aic_fast(
     pre: DfSelectionPrecompute | None,
     *,
     criterion: str = "aic",
-) -> tuple[int | None, np.ndarray | None]:
+    candidates: Sequence[int] | None = None,
+    return_profile: bool = False,
+):
     """Covariate-free :func:`select_df_aic` via the nested-QR precompute.
 
     Matches ``select_df_aic(y, basis, None)`` (same RSS, hence the same
@@ -447,17 +800,27 @@ def select_df_aic_fast(
     downstream residualization is order-invariant. Falls back to the exact
     legacy search when the precompute is missing or ``y`` has non-finite rows
     (the legacy path drops those rows for the criterion fits).
+    ``candidates`` and ``return_profile`` are as in :func:`select_df_aic`.
     """
+    _check_criterion(criterion)
     y = np.asarray(y, dtype=np.float64).ravel()
     if pre is None or not np.isfinite(y).all():
-        return select_df_aic(y, basis, None, criterion=criterion)
+        return select_df_aic(
+            y,
+            basis,
+            None,
+            criterion=criterion,
+            candidates=candidates,
+            return_profile=return_profile,
+        )
     n = len(y)
     if n < 4:
-        return None, None
+        return (None, None, {}) if return_profile else (None, None)
 
     yy = float(y @ y)
     proj = pre.Q.T @ y
     cum = np.cumsum(proj * proj)
+    spans = pre.k_of_df if pre.spans is None else pre.spans
 
     def _ic(rss: float, k_cols: int) -> float:
         if rss <= 0:
@@ -470,16 +833,20 @@ def select_df_aic_fast(
 
     best_df: int | None = None
     best_cols: np.ndarray | None = None
-    best_ic = _ic(yy - float(cum[0]), 1)  # baseline: intercept only
+    best_ic = _ic(yy - float(cum[pre.n_base - 1]), 1)  # baseline: intercept only
+    profile: dict[str, float] = {"none": best_ic}
 
-    for df in range(len(pre.k_of_df)):
+    for df in candidate_dfs(basis, candidates):
         k_cols = int(pre.k_of_df[df])
         if k_cols <= 1:  # no spatial columns at this level
             continue
-        ic = _ic(yy - float(cum[k_cols - 1]), k_cols)
+        ic = _ic(yy - float(cum[int(spans[df]) - 1]), k_cols)
+        profile[str(df)] = ic
         if ic < best_ic:
             best_ic = ic
             best_df = df
             best_cols = pre.designs[df]
 
+    if return_profile:
+        return best_df, best_cols, profile
     return best_df, best_cols

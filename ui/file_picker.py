@@ -478,12 +478,6 @@ def pick_ordered_files(
     return out
 
 
-def clear_path_state(key: str) -> None:
-    """Drop the current selection from session state (used by the "reset"
-    buttons sprinkled around the tabs)."""
-    st.session_state.pop(key, None)
-
-
 def path_to_dataset(path: str) -> PickedDataset:
     """Wrap a real filesystem path in a ``PickedDataset`` for engine handoff.
 

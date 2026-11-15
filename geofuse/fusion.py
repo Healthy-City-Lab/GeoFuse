@@ -5,6 +5,7 @@ This module implements the optimization logic from CGI.ipynb for tuning
 weighted combinations of NDVI and GVI metrics against target outcomes.
 """
 
+import contextlib
 import gc
 import hashlib
 import logging
@@ -41,6 +42,7 @@ from . import (
     parallel,
     pdcor,
     preaggregation,
+    resampling,
     spatial_basis,
 )
 from .cgi_formulas import WEIGHTED_AVERAGE, compute_cgi
@@ -51,7 +53,6 @@ from .crs_utils import (
     crs_uses_metre_axes,
     default_geotiff_creation_options,
     estimate_metre_projected_crs_for_gdf,
-    metres_per_degree_at_lat,
     normalize_geographic_gdf_to_wgs84,
     reproject_geodataframe_to_wgs84,
     select_grid_crs_with_warning,
@@ -135,9 +136,190 @@ _SWEEP_OBJECTIVES: frozenset[str] = frozenset({"quartile_contrast"})
 # ``<column>=missing`` level of its own.
 CATEGORICAL_MISSING = ("drop", "indicator")
 
+# How whole spatial blocks are chosen for the held-out test: ``stripe`` takes
+# evenly spaced positions of the space-filling block order, ``random`` draws
+# blocks at random until they hold the test share.
+SPATIAL_SPLIT_MODES = ("stripe", "random")
+
 # Active-channel prefix under which a comparator column is scored as a frozen
 # exposure (``comparator_mode``).
 _COMPARATOR_PREFIX = "comparator:"
+
+# Keys of a paired CGI-vs-exposure row that always exist, ``None`` when the
+# held-out rows could not be scored.
+PAIRED_HEADLINE_KEYS = (
+    "observed_diff",
+    "cgi_score",
+    "standalone_score",
+    "n",
+    "favors_cgi",
+    "lower",
+    "upper",
+    "p_value",
+)
+
+
+#: A warm-started posterior is refitted from a cold start above this R-hat, or
+#: when its smallest effective sample size per draw falls below this share of
+#: its source fit's.
+WARM_RHAT_MAX = 1.01
+WARM_ESS_SHARE = 0.8
+
+#: Which smooth each exposure of a paired CGI-vs-exposure test is scored with
+#: when the exposure model picks the df (see
+#: ``MetricFusionEngine._paired_difference_on``).
+SPATIAL_PAIRED_SMOOTHS: tuple[str, ...] = ("own", "cgi", "outcome", "max")
+
+#: Spatial-confounding adjustments: none, an unpenalized thin-plate basis in
+#: the outcome model (Keller & Szpiro 2020), or Spatial+ with penalized
+#: smooths per group (Dupont, Wood & Augustin 2022).
+SPATIAL_ADJUST_METHODS: tuple[str, ...] = ("none", "basis", "spatial_plus")
+
+#: How a ``basis`` adjustment sets its size: the df by AIC/BIC of the outcome
+#: model without the exposure (Keller & Szpiro 2020), the df by AIC/BIC of the
+#: exposure model (df-Spatial+, Rainey 2025; unpenalized, so equal to the
+#: basis adjustment, Dupont et al. 2022 §4), a fixed pattern scale, or the
+#: scale by AIC/BIC of the outcome model without the exposure.
+SPATIAL_ADJUST_SELECTS: tuple[str, ...] = (
+    "df_outcome_ic",
+    "df_exposure_ic",
+    "fixed_scale",
+    "scale_ic",
+)
+
+#: Tuning within areas: the basis joins the search's covariates, or every
+#: search input is residualized on its own penalized smooth (Spatial+ step 1).
+SPATIAL_TUNE_METHODS: tuple[str, ...] = ("basis", "spatial_plus_inputs")
+
+#: How the tuning basis scale is set: given, or selected per split.
+SPATIAL_TUNE_SELECTS: tuple[str, ...] = ("fixed_scale", "scale_ic")
+
+#: Negative controls of a scale selection: the target's scale, or their own.
+SPATIAL_SELECT_CONTROLS: tuple[str, ...] = ("target", "own")
+
+#: What each adjustment computes, with its reference, for records and logs.
+SPATIAL_LABELS: dict[str, str] = {
+    "df_outcome_ic": "basis size by AIC/BIC of the outcome model without the "
+    "exposure (Keller & Szpiro 2020)",
+    "df_exposure_ic": "basis size by AIC/BIC of the exposure model "
+    "(df-Spatial+, Rainey 2025; unpenalized, equal to the basis adjustment, "
+    "Dupont et al. 2022 §4)",
+    "fixed_scale": "fixed-scale thin-plate basis adjustment (Keller & Szpiro 2020)",
+    "scale_ic": "basis scale by AIC/BIC of the outcome model without the "
+    "exposure (Keller & Szpiro 2020)",
+    "spatial_plus": "Spatial+ (Dupont et al. 2022), site-specific smooths",
+    "spatial_plus_inputs": "Spatial+ applied to the search inputs (geofuse "
+    "extension of Dupont et al. 2022; outcome smoother's penalties fixed at "
+    "the outcome-only fit)",
+}
+
+
+def _spatial_method_pair(
+    method, select, scales, tune_scale
+) -> tuple[str, "str | None"]:
+    """``(method, select)`` of an engine: ``ks_aic`` is the basis whose df the
+    outcome model picks; a ``basis`` without a select gets ``fixed_scale``
+    with a pattern scale and ``df_outcome_ic`` without; ``none`` and
+    ``spatial_plus`` have no select."""
+    method = str(method or "none").lower()
+    scaled = scales is not None or tune_scale is not None
+    if method == "ks_aic":
+        return "basis", ("fixed_scale" if scaled else "df_outcome_ic")
+    if method == "basis":
+        if select is None:
+            return method, ("fixed_scale" if scaled else "df_outcome_ic")
+        return method, str(select)
+    return method, None
+
+
+def _absorbed_share(x: np.ndarray, smooth: np.ndarray) -> float | None:
+    """Share of ``x``'s variance a spatial smooth absorbs: the R² of ``x`` on
+    the smooth's columns and an intercept, over the finite rows."""
+    keep = np.isfinite(x) & np.isfinite(smooth).all(axis=1)
+    xc = x[keep] - x[keep].mean()
+    sst = float(xc @ xc)
+    if keep.sum() < 3 or sst <= 0:
+        return None
+    S = smooth[keep] - smooth[keep].mean(axis=0)
+    coef, *_ = np.linalg.lstsq(S, xc, rcond=None)
+    r = xc - S @ coef
+    return round(1.0 - float(r @ r) / sst, 6)
+
+
+def _absorbed_given_cov(
+    x: np.ndarray, cov: "np.ndarray | None", smooth: np.ndarray
+) -> float | None:
+    """Share of ``x``'s variance after the covariates that a spatial smooth
+    absorbs: ``1 − x'M_[Z,S]x / x'M_Z x`` with ``M`` the residual maker of
+    ``[1, covariates]`` (``Z``) and of ``[1, covariates, smooth]``, over the
+    finite rows."""
+    keep = np.isfinite(x) & np.isfinite(smooth).all(axis=1)
+    if cov is not None:
+        keep &= np.isfinite(cov).all(axis=1)
+    if keep.sum() < 3:
+        return None
+    ones = np.ones((int(keep.sum()), 1))
+    base = ones if cov is None else np.column_stack([ones, cov[keep]])
+    xk = x[keep]
+
+    def rss(X):
+        coef, *_ = np.linalg.lstsq(X, xk, rcond=None)
+        r = xk - X @ coef
+        return float(r @ r)
+
+    within = rss(base)
+    if within <= 0:
+        return None
+    return 1.0 - rss(np.column_stack([base, smooth[keep]])) / within
+
+
+def _per_sd0(x, y, cov, design) -> dict:
+    """:func:`negative_controls.raw_slope` of ``y`` on ``x`` given ``design``
+    per SD0, the SD of ``x`` after ``cov`` alone on the same rows, with
+    ``sd0`` and the outcome's residual SD given ``design`` (``outcome_sd``)."""
+    from . import negative_controls as _nc
+
+    keep = np.isfinite(x) & np.isfinite(y)
+    if design is not None:
+        keep &= np.isfinite(design).all(axis=1)
+    sub = None if cov is None else cov[keep]
+    xr0, _y0, _n0, _d0 = _nc._residualised(x[keep], y[keep], sub)
+    sd0 = float(xr0.std()) if len(xr0) else float("nan")
+    res = _nc.raw_slope(x, y, design, scale=sd0 if sd0 > 0 else float("nan"))
+    _xr, yr, _n, _d = _nc._residualised(x, y, design)
+    res["sd0"] = sd0
+    res["outcome_sd"] = float(yr.std()) if len(yr) else None
+    return res
+
+
+_CHANCE_CACHE: dict = {}
+
+
+def _chance_share(smooth: np.ndarray) -> float:
+    """The share of variance a smooth absorbs from noise in expectation: the
+    rank of its centred columns over the row count. Cached on the smooth's
+    shape and sums, since every exposure of a row set shares one smooth in
+    scale mode."""
+    key = (smooth.shape, float(smooth.sum()), float((smooth * smooth).sum()))
+    if key not in _CHANCE_CACHE:
+        if len(_CHANCE_CACHE) > 64:
+            _CHANCE_CACHE.clear()
+        S = smooth - smooth.mean(axis=0)
+        _CHANCE_CACHE[key] = float(np.linalg.matrix_rank(S)) / max(len(S), 1)
+    return _CHANCE_CACHE[key]
+
+
+def _spatially_adjusted(engine) -> bool:
+    """Whether ``engine``'s run adjusts for a spatial smooth (any method, or a
+    scale ladder whose current rung is the unadjusted one)."""
+    return getattr(engine, "_basis", "none") != "none" or bool(
+        getattr(engine, "spatial_adjust_scales", None)
+    )
+
+
+def _exposure_kind(params: dict) -> str:
+    """``"comparator"`` for a comparator's params, else ``"channel"``."""
+    return "comparator" if "comparator" in params else "channel"
 
 
 def comparator_mode(column: str) -> str:
@@ -149,6 +331,40 @@ def comparator_mode(column: str) -> str:
     exactly as the CGI is, without being tuned.
     """
     return _COMPARATOR_PREFIX + column
+
+
+def _search_weight_column(engine) -> str | None:
+    """The weight column ``engine``'s search uses, ``None`` for an unweighted
+    search."""
+    if not getattr(engine, "weight_search", False):
+        return None
+    return getattr(engine, "weight_column", None)
+
+
+def _distribution(values: np.ndarray) -> dict:
+    """``median``, ``q25``, ``q75``, ``iqr``, ``p5``, ``p95`` and ``n`` of the
+    finite values (``None`` each without any)."""
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if not v.size:
+        empty = dict.fromkeys(("median", "q25", "q75", "iqr", "p5", "p95"))
+        return {**empty, "n": 0}
+    quantiles = np.quantile(v, [0.05, 0.25, 0.5, 0.75, 0.95])
+    p5, q25, med, q75, p95 = (float(q) for q in quantiles)
+    return {
+        "median": med,
+        "q25": q25,
+        "q75": q75,
+        "iqr": q75 - q25,
+        "p5": p5,
+        "p95": p95,
+        "n": int(v.size),
+    }
+
+
+def _scale(value) -> float:
+    """A contrast's scale, NaN when it is missing or not positive."""
+    return float(value) if value is not None and float(value) > 0 else float("nan")
 
 
 class MetricFusionEngine:
@@ -189,7 +405,7 @@ class MetricFusionEngine:
         whole_grid_scaling: bool = False,
         area_balanced_split: bool = False,
         spatial_adjust_method: str = "none",
-        spatial_adjust_max_df: int = 10,
+        spatial_adjust_max_df: int | None = None,
         spatial_adjust_eps_m: float | None = None,
         residualize_method: str = "linear",
         search_scoring_method: str = "mom_em3",
@@ -206,6 +422,32 @@ class MetricFusionEngine:
         drop_collinear_channels: bool = False,
         categorical_missing: str = "drop",
         comparator_columns: list[str] | None = None,
+        weight_column: str | None = None,
+        weight_search: bool = False,
+        null_group_column: str | None = None,
+        spatial_adjust_df: "list[int] | tuple[int, ...] | None" = None,
+        spatial_adjust_criterion: str = "aic",
+        spatial_adjust_neighbours: int = spatial_basis.DEFAULT_NEIGHBOURS,
+        spatial_adjust_knots_min: int = spatial_basis.DEFAULT_KNOTS_MIN,
+        spatial_adjust_knots_max: int = spatial_basis.DEFAULT_KNOTS_MAX,
+        spatial_paired_smooth: str = "own",
+        spatial_adjust_scale_m: "float | list[float] | tuple[float, ...] | None" = None,
+        spatial_adjust_min_component: int | None = None,
+        spatial_tune_scale_m: float | None = None,
+        spatial_adjust_select: str | None = None,
+        spatial_tune_method: str = "basis",
+        spatial_tune_select: str = "fixed_scale",
+        spatial_plus_groups_column: str | None = None,
+        spatial_plus_k: int = 300,
+        spatial_plus_criterion: str = "gcv",
+        spatial_plus_checks: "list[str] | tuple[str, ...] | None" = None,
+        spatial_plus_step1_covariates: bool = False,
+        spatial_select_scales_m: "list[float] | tuple[float, ...] | None" = None,
+        spatial_select_criterion: str = "bic",
+        spatial_select_controls: str = "target",
+        residualize_spline_df: int = objective_scoring.SPLINE_DF,
+        residualize_spline_min_unique: int = objective_scoring.SPLINE_MIN_UNIQUE,
+        exposure_response_spline_df: int = exposure_response.SPLINE_DF,
     ):
         """
         Initialize the fusion engine.
@@ -275,6 +517,60 @@ class MetricFusionEngine:
                 an entity; scored through :func:`comparator_mode`. A column
                 that is the outcome, a covariate or a negative control is
                 refused.
+            weight_column: a numeric target column of sampling weights.
+                Carried like negative controls; the reports add weighted
+                estimates (:meth:`compute_weighted_report`) next to the
+                unweighted ones, which it leaves unchanged.
+            weight_search: the search itself (residualising, sweep,
+                posterior and its null refits) weighted by
+                ``weight_column``: a weighted likelihood. Linear form only.
+            null_group_column: a target column (numeric or labels)
+                whose areas the spatial null outcomes permute their means
+                across; carried with its own values, never tuned on.
+            spatial_adjust_df: radial df per spatial cluster the criterion
+                compares, besides no smooth (``0`` = cluster intercepts and
+                linear trends only). ``None`` gives
+                :data:`spatial_basis.DEFAULT_DF_CANDIDATES`, or every df
+                ``0 … spatial_adjust_max_df`` when that older form is given;
+                giving both is refused.
+            spatial_adjust_criterion: ``"aic"`` or ``"bic"``, for both df
+                rules of the basis (outcome and exposure model).
+            spatial_adjust_neighbours / spatial_adjust_knots_min /
+                spatial_adjust_knots_max: the k-NN graph that splits entities
+                into spatial clusters (when ``spatial_adjust_eps_m`` is unset)
+                and the knots per cluster; see
+                :func:`spatial_basis.build_block_basis`.
+            spatial_paired_smooth: which smooth each exposure of a paired
+                CGI-vs-exposure test is scored with under ``spatial_plus``:
+                its own (``"own"``), the CGI's (``"cgi"``), one selected on the
+                outcome (``"outcome"``) or the larger of the two dfs
+                (``"max"``); see :meth:`_paired_difference_on`.
+            spatial_adjust_scale_m: define the smooth by a distance instead of
+                a df: one pattern scale in metres, or a list whose first entry
+                is the primary scale (scores, paired tests, verdicts) and the
+                rest are reported for the slopes only (:meth:`spatial_scale`).
+                Clusters split at a gap of ``spatial_adjust_eps_m`` (default
+                twice the primary scale), each cluster's knots cover it at half
+                the scale, every radial function is used and no criterion
+                runs, so every exposure shares one smooth per row set. ``None``
+                keeps the df ladder.
+            spatial_adjust_min_component: clusters smaller than this join their
+                nearest larger cluster's level instead of keeping their own
+                intercept (default 30 with a scale, none without); see
+                :func:`spatial_basis.merge_small_components`.
+            spatial_tune_scale_m: tune within areas: the smooth at this
+                pattern scale (clusters, knots and merging as
+                ``spatial_adjust_scale_m``), built on the rows each search
+                uses, joins the covariates of the index search, so the layer,
+                radius, statistic and weights are chosen on variation within
+                areas of about this size (:meth:`_search_covariates`). Needs a
+                spatial adjustment method; the reported scales default to this
+                one. ``None`` tunes on all variation.
+            residualize_spline_df / residualize_spline_min_unique: the
+                covariate splines of ``residualize_method="spline"``; see
+                :func:`objective_scoring._expand_covariate_basis`.
+            exposure_response_spline_df: spline df of the exposure-response
+                curve and its non-linearity test.
         """
         # Route Optuna's chatter ("Trial X finished with value Y …") into
         # the per-job log instead of the Streamlit host terminal. Fusion
@@ -395,27 +691,185 @@ class MetricFusionEngine:
         self._covariate_missing_report: dict | None = None
 
         # Spatial-confounding adjustment. ``none`` keeps the plain covariate-
-        # residualized objective. ``ks_aic`` / ``spatial_plus`` fold a low-rank
-        # coordinate smooth (built per spatial cluster, df chosen by AIC) into
-        # the residualization so the score reflects greenery↔outcome co-variation
-        # beyond an unmeasured smooth spatial confounder. Entity coordinates ride
-        # on the prepared frame as ``_cx`` / ``_cy``; the per-split candidate
-        # basis is cached on ``_spatial_basis_cache`` keyed by split id.
-        method = str(spatial_adjust_method or "none").lower()
-        if method not in objective_scoring.SPATIAL_METHODS:
+        # residualized objective. ``basis`` folds an unpenalized thin-plate
+        # basis of the coordinates (built per spatial cluster) into the
+        # residualization, so the score reflects greenery↔outcome co-variation
+        # beyond an unmeasured smooth spatial confounder; ``_basis`` says which
+        # model sets its size (``outcome`` / ``exposure``; ``none`` without a
+        # basis). ``spatial_plus`` leaves the search and the standard reports
+        # unadjusted and adds Spatial+ rows (penalized smooths, see
+        # :meth:`compute_spatial_plus`). Entity coordinates ride on the prepared
+        # frame as ``_cx`` / ``_cy``; the per-split candidate basis is cached on
+        # ``_spatial_basis_cache`` keyed by split id.
+        method, select = _spatial_method_pair(
+            spatial_adjust_method,
+            spatial_adjust_select,
+            spatial_adjust_scale_m,
+            spatial_tune_scale_m,
+        )
+        if method not in SPATIAL_ADJUST_METHODS:
             raise ValueError(
-                f"spatial_adjust_method must be one of "
-                f"{sorted(objective_scoring.SPATIAL_METHODS)}; got {method!r}."
+                f"spatial_adjust_method must be one of {SPATIAL_ADJUST_METHODS}; "
+                f"got {method!r}."
+            )
+        if method == "basis" and select not in SPATIAL_ADJUST_SELECTS:
+            raise ValueError(
+                f"spatial_adjust_select must be one of {SPATIAL_ADJUST_SELECTS}; "
+                f"got {select!r}."
             )
         self.spatial_adjust_method: str = method
-        self.spatial_adjust_max_df: int = max(1, int(spatial_adjust_max_df))
+        self.spatial_adjust_select: str | None = select
+        if spatial_tune_method not in SPATIAL_TUNE_METHODS:
+            raise ValueError(
+                f"spatial_tune_method must be one of {SPATIAL_TUNE_METHODS}; "
+                f"got {spatial_tune_method!r}."
+            )
+        if spatial_tune_select not in SPATIAL_TUNE_SELECTS:
+            raise ValueError(
+                f"spatial_tune_select must be one of {SPATIAL_TUNE_SELECTS}; "
+                f"got {spatial_tune_select!r}."
+            )
+        self.spatial_tune_method: str = spatial_tune_method
+        self.spatial_tune_select: str = spatial_tune_select
+        if spatial_tune_method == "spatial_plus_inputs" and method != "spatial_plus":
+            raise ValueError(
+                "spatial_tune_method 'spatial_plus_inputs' needs "
+                "spatial_adjust_method 'spatial_plus'."
+            )
+        if (
+            select is not None
+            and select.startswith("df_")
+            and (spatial_adjust_scale_m is not None or spatial_tune_scale_m is not None)
+        ):
+            raise ValueError(
+                f"spatial_adjust_select {select!r} sets the basis by a df; a "
+                "pattern scale needs 'fixed_scale' or 'scale_ic'."
+            )
+        # Which model sets the basis size, and so which code path builds the
+        # smooths: the outcome's (each outcome its own) or the exposure's (one
+        # smooth shared by every outcome). A fixed scale has no criterion and
+        # shares one smooth, as does a scale selected on the target.
+        self._basis: str = "none"
+        if method == "basis":
+            self._basis = (
+                "outcome"
+                if select == "df_outcome_ic"
+                or (select == "scale_ic" and spatial_select_controls == "own")
+                else "exposure"
+            )
+        if spatial_adjust_df is not None and spatial_adjust_max_df is not None:
+            raise ValueError(
+                "Give spatial_adjust_df or the older spatial_adjust_max_df, not both."
+            )
+        if spatial_adjust_max_df is not None:
+            dfs = range(0, max(1, int(spatial_adjust_max_df)) + 1)
+        elif spatial_adjust_df is not None:
+            dfs = spatial_adjust_df
+        else:
+            dfs = spatial_basis.DEFAULT_DF_CANDIDATES
+        self.spatial_adjust_df: tuple[int, ...] = tuple(
+            sorted({int(d) for d in dfs if int(d) >= 0})
+        )
+        if not self.spatial_adjust_df:
+            raise ValueError("spatial_adjust_df needs at least one df.")
+        self.spatial_adjust_max_df: int = max(1, max(self.spatial_adjust_df))
+        if spatial_adjust_criterion not in spatial_basis.CRITERIA:
+            raise ValueError(
+                f"spatial_adjust_criterion must be one of {spatial_basis.CRITERIA}; "
+                f"got {spatial_adjust_criterion!r}."
+            )
+        self.spatial_adjust_criterion: str = spatial_adjust_criterion
+        self.spatial_adjust_neighbours: int = int(spatial_adjust_neighbours)
+        self.spatial_adjust_knots_min: int = int(spatial_adjust_knots_min)
+        self.spatial_adjust_knots_max: int = int(spatial_adjust_knots_max)
+        if self.spatial_adjust_knots_min > self.spatial_adjust_knots_max:
+            raise ValueError(
+                "spatial_adjust_knots_min must not exceed spatial_adjust_knots_max."
+            )
+        if spatial_paired_smooth not in SPATIAL_PAIRED_SMOOTHS:
+            raise ValueError(
+                f"spatial_paired_smooth must be one of {SPATIAL_PAIRED_SMOOTHS}; "
+                f"got {spatial_paired_smooth!r}."
+            )
+        self.spatial_paired_smooth: str = spatial_paired_smooth
         self.spatial_adjust_eps_m: float | None = (
             float(spatial_adjust_eps_m)
             if spatial_adjust_eps_m is not None and float(spatial_adjust_eps_m) > 0
             else None
         )
+        self.spatial_tune_scale_m: float | None = (
+            None if spatial_tune_scale_m is None else float(spatial_tune_scale_m)
+        )
+        if self.spatial_tune_scale_m is not None:
+            if self.spatial_tune_scale_m <= 0:
+                raise ValueError("spatial_tune_scale_m must be a positive distance.")
+            if method != "basis":
+                raise ValueError(
+                    "spatial_tune_scale_m needs spatial_adjust_method 'basis'."
+                )
+            # A composite tuned within areas is scored within the same areas.
+            if spatial_adjust_scale_m is None:
+                spatial_adjust_scale_m = [self.spatial_tune_scale_m]
+        # A selected scale is one of the candidates, which the ladder reports.
+        if select == "scale_ic" and spatial_adjust_scale_m is None:
+            from . import spatial_scale_selection as _ss
+
+            spatial_adjust_scale_m = list(
+                spatial_select_scales_m or _ss.DEFAULT_SCALES_M
+            )
+        scales = spatial_adjust_scale_m
+        if scales is not None and not isinstance(scales, list | tuple):
+            scales = [scales]
+        self.spatial_adjust_scales: tuple[float, ...] = tuple(
+            dict.fromkeys(float(v) for v in scales or ())
+        )
+        if any(v <= 0 for v in self.spatial_adjust_scales):
+            raise ValueError("spatial_adjust_scale_m must be positive distances.")
+        if self.spatial_adjust_scales and method != "basis":
+            raise ValueError(
+                "spatial_adjust_scale_m needs spatial_adjust_method 'basis'."
+            )
+        # The scale the smooths are built at now (the primary one, or another
+        # inside :meth:`spatial_scale`); ``None`` in df mode.
+        self._spatial_scale: float | None = (
+            self.spatial_adjust_scales[0] if self.spatial_adjust_scales else None
+        )
+        if (
+            self.spatial_tune_scale_m is not None
+            and self.spatial_adjust_scales[0] != self.spatial_tune_scale_m
+        ):
+            _log(
+                "WARN",
+                f"Tuned within areas of {self.spatial_tune_scale_m / 1000:g} km "
+                f"but scored at {self.spatial_adjust_scales[0] / 1000:g} km: the "
+                "primary scores and slopes then answer a different question than "
+                "the search did.",
+            )
+        if spatial_adjust_min_component is None and self.spatial_adjust_scales:
+            spatial_adjust_min_component = spatial_basis.DEFAULT_MIN_COMPONENT
+        self.spatial_adjust_min_component: int | None = (
+            int(spatial_adjust_min_component) if spatial_adjust_min_component else None
+        )
         self._spatial_basis_cache: dict = {}
+        # The scale selection of the current split and whether a report runs
+        # at a ladder rung (see :meth:`_select_scales`, :meth:`spatial_scale`).
+        self._scale_profile: list | None = None
+        self._control_scales: dict = {}
+        self._in_ladder: bool = False
+        # Penalties of the search-input transform, per row set and outcome.
+        self._plus_inputs_cache: dict = {}
         self._spatial_adjust_summary: dict | None = None
+        # The run's first basis (the first split's), kept when a re-split
+        # resets the per-split summary, for the run's record.
+        self._spatial_run_summary: dict | None = None
+        # The first basis built at each scale, for the record.
+        self._spatial_scale_summaries: dict[float, dict] = {}
+        # The latest posterior per (channel, form), to warm-start the next fit
+        # of the same kind, and the label recorded as its source.
+        self._posterior_warm: dict = {}
+        self._fit_label: str = "split 0"
+        # Selections made and how many landed on the largest candidate df.
+        self._spatial_selections: dict[str, int] = {"n": 0, "at_cap": 0}
 
         # Covariate residualization basis for the residualizing metrics
         # (distance_corr / spearman / r2 / nrmse). ``spline`` removes nonlinear
@@ -427,12 +881,11 @@ class MetricFusionEngine:
                 f"{sorted(objective_scoring.RESIDUALIZE_METHODS)}; got {res_method!r}."
             )
         self.residualize_method: str = res_method
+        self.residualize_spline_df: int = int(residualize_spline_df)
+        self.residualize_spline_min_unique: int = int(residualize_spline_min_unique)
+        self.exposure_response_spline_df: int = int(exposure_response_spline_df)
 
-        # Longitudinal search scorer. ``mom_em3`` (default) / ``mom_em1`` /
-        # ``mom`` / ``reml`` estimate the per-fold variance components for the
-        # fast fixed-V GLS trial scorer (see ``mixed_effects_scoring``);
-        # ``exact`` bypasses it and fits a full MixedLM per trial (the original
-        # behaviour). Reports always use the exact MixedLM refit regardless.
+        # Recorded with the job; every MixedLM score is an exact fit.
         self.search_scoring_method: str = str(search_scoring_method)
 
         # Negative-control outcomes: attribute columns carried onto the frame
@@ -455,6 +908,43 @@ class MetricFusionEngine:
             clash = [c for c in self.comparator_columns if c in cols]
             if clash:
                 raise ValueError(f"Comparator column(s) {clash} are also {role}.")
+        # Sampling weights: carried like the controls, used by the weighted
+        # reports and, with ``weight_search``, by the search.
+        self.weight_column: str | None = weight_column or None
+        self.weight_search: bool = bool(weight_search)
+        if self.weight_column and self.weight_column == target_feature:
+            raise ValueError("The weight column cannot be the outcome.")
+        if self.weight_search and not self.weight_column:
+            raise ValueError("weight_search needs a weight_column.")
+        self.null_group_column: str | None = null_group_column or None
+        # Spatial+ (penalized smooths per group) and the scale selection.
+        from . import spatial_plus as _sp
+
+        if spatial_plus_criterion not in _sp.CRITERIA:
+            raise ValueError(
+                f"spatial_plus_criterion must be one of {_sp.CRITERIA}; got "
+                f"{spatial_plus_criterion!r}."
+            )
+        bad = [c for c in (spatial_plus_checks or ()) if c not in _sp.CRITERIA]
+        if bad:
+            raise ValueError(f"spatial_plus_checks may only hold {_sp.CRITERIA}.")
+        self.spatial_plus_groups_column: str | None = spatial_plus_groups_column or None
+        self.spatial_plus_k: int = int(spatial_plus_k)
+        self.spatial_plus_criterion: str = spatial_plus_criterion
+        self.spatial_plus_checks: tuple[str, ...] = tuple(
+            c for c in (spatial_plus_checks or ()) if c != spatial_plus_criterion
+        )
+        self.spatial_plus_step1_covariates: bool = bool(spatial_plus_step1_covariates)
+        if spatial_select_controls not in SPATIAL_SELECT_CONTROLS:
+            raise ValueError(
+                f"spatial_select_controls must be one of {SPATIAL_SELECT_CONTROLS}; "
+                f"got {spatial_select_controls!r}."
+            )
+        self.spatial_select_scales_m: tuple[float, ...] = tuple(
+            float(v) for v in (spatial_select_scales_m or ())
+        )
+        self.spatial_select_criterion: str = spatial_select_criterion
+        self.spatial_select_controls: str = spatial_select_controls
 
         # Longitudinal / mixed-effects spec. ``None`` keeps the engine in
         # cross-sectional mode (no behaviour change). When set, every code
@@ -538,15 +1028,6 @@ class MetricFusionEngine:
         # summed into the phase's achieved-concurrency figure.
         self._objective_secs: list[float] = []
 
-        # Donut / ring cache: per-point annulus samples keyed by fold subset + indices
-        self._ring_raster_cache: dict = {}
-        self._ring_vector_cache: dict = {}
-        self._max_points_ring_cache = 8000
-        # Payload ceiling for one ring-cache entry. The point cap above bounds
-        # rows only; a fine raster under a wide radius stores tens of thousands
-        # of values per row, so the estimated byte size gates the build too.
-        self._max_ring_cache_bytes = 1_000_000_000
-
         # Reporting-phase caches (all invalidated by ``split_data``): the
         # train+val+test union frame is rebuilt by several report helpers,
         # ``apply_fusion`` is called repeatedly with the same winning params,
@@ -563,7 +1044,7 @@ class MetricFusionEngine:
         self._pdcor_cache: OrderedDict = OrderedDict()
         self._spline_basis_cache: dict = {}
         # Trial-invariant per-fold data (collapse codes, collapsed target /
-        # covariates / coords, points slices); cleared with the ring caches.
+        # covariates / coords, points slices); cleared with every new split.
         self._fold_static_cache: dict = {}
         # Monotonic counter bumped whenever the live fold row sets are replaced
         # (a fresh split, or each bootstrap resample). Fold-static entries key
@@ -572,11 +1053,6 @@ class MetricFusionEngine:
         # The spatial blocking a held-out split used and the test share it
         # realised; ``None`` without spatial blocks.
         self._spatial_split_report: dict | None = None
-
-        # Trial threads for the search. Only the longitudinal
-        # fast-GLS path uses them: the other paths keep LRU scoring caches that
-        # are not thread-safe (see ``_search_n_jobs``).
-        self._search_workers: int = parallel.worker_count()
 
         # Spatial pre-aggregation (mandatory; built by precompute_aggregations()).
         # Backed by an on-disk SQLite cache (geofuse/preaggregation.py) so the
@@ -755,8 +1231,24 @@ class MetricFusionEngine:
             self.longitudinal_spec,
             self.target_feature,
             self.covariate_columns or (),
-            [*self.negative_control_columns, *self.comparator_columns],
+            self._carried_columns,
         )
+
+    @property
+    def _carried_columns(self) -> list[str]:
+        """Target columns carried outside every NaN gate: the negative
+        controls, the comparators, the weight column and the null-group
+        column."""
+        extra = [
+            c
+            for c in (
+                getattr(self, "weight_column", None),
+                getattr(self, "null_group_column", None),
+                getattr(self, "spatial_plus_groups_column", None),
+            )
+            if c
+        ]
+        return [*self.negative_control_columns, *self.comparator_columns, *extra]
 
     def _longitudinal_extra_cols(self) -> tuple[str, ...]:
         """Extra DataFrame columns carried through every prep path in long mode."""
@@ -802,7 +1294,7 @@ class MetricFusionEngine:
             target_input,
             outcome_col=outcome_col,
             covariate_cols=self.covariate_columns,
-            extra_cols=[*self.negative_control_columns, *self.comparator_columns],
+            extra_cols=self._carried_columns,
         )
         # The per-file frames have been concatenated into ``long_gdf``; drop
         # the engine's reference so their memory is reclaimed rather than held
@@ -1042,7 +1534,7 @@ class MetricFusionEngine:
             self._ndvi_export_resolution_m = float(ndvi_resolution_m)
         if gvi_grid_spacing_m is not None:
             self._gvi_grid_spacing_m = float(gvi_grid_spacing_m)
-        self._clear_ring_caches()
+        self._clear_fold_caches()
 
     def load_metrics(
         self,
@@ -1088,7 +1580,7 @@ class MetricFusionEngine:
         self._gvi_grid_spacing_m = (
             float(gvi_grid_spacing_m) if gvi_grid_spacing_m is not None else 75.0
         )
-        self._clear_ring_caches()
+        self._clear_fold_caches()
         # Check for multi-band GVI cache (Band 1=Veg, Band 2=Terrain)
         gvi_multiband_cache = self._get_cache_filename("gvi_combined", ".tif")
 
@@ -1763,93 +2255,10 @@ class MetricFusionEngine:
         logger.info(f"NDVI downloaded: {result['tif']}")
         return result["tif"]
 
-    def _ring_cache_bytes_estimate(
-        self,
-        points_gdf: gpd.GeoDataFrame,
-        metric_data: gpd.GeoDataFrame | dict,
-        max_radius_m: float,
-    ) -> float:
-        """Rough resident size of the ring cache this call would build.
-
-        Rasters: points × disc area ÷ pixel area. Vectors: points × the mean
-        neighbour count of a small sample. Both times 8 bytes per value.
-        """
-        n_pts = len(points_gdf)
-        if n_pts == 0 or max_radius_m <= 0:
-            return 0.0
-        disc_area = np.pi * float(max_radius_m) ** 2
-        try:
-            if isinstance(metric_data, dict):
-                transform = metric_data["transform"]
-                px = abs(float(transform.a))
-                py = abs(float(transform.e))
-                if getattr(metric_data["crs"], "is_geographic", False):
-                    # Degree pixels: convert with the local metre-per-degree
-                    # scale so the estimate is not off by ~10^5.
-                    lat = float(
-                        np.mean(
-                            self.buffered_extent.to_crs("EPSG:4326")
-                            .geometry.iloc[0]
-                            .bounds[1::2]
-                        )
-                        if self.buffered_extent is not None
-                        else 0.0
-                    )
-                    m_lon, m_lat = metres_per_degree_at_lat(lat)
-                    px *= m_lon
-                    py *= m_lat
-                pixel_area = max(px * py, 1e-9)
-                per_point = disc_area / pixel_area
-            else:
-                if len(metric_data) == 0:
-                    return 0.0
-                # Feature density from the extent's bounding box — cheap and
-                # good enough to separate "fits easily" from "many GB".
-                minx, miny, maxx, maxy = (float(v) for v in metric_data.total_bounds)
-                span_x = max(maxx - minx, 1e-9)
-                span_y = max(maxy - miny, 1e-9)
-                if getattr(metric_data.crs, "is_geographic", False):
-                    m_lon, m_lat = metres_per_degree_at_lat((miny + maxy) / 2.0)
-                    span_x *= m_lon
-                    span_y *= m_lat
-                density = len(metric_data) / max(span_x * span_y, 1.0)
-                per_point = disc_area * density
-        except Exception:
-            return 0.0
-        return float(n_pts) * float(per_point) * 8.0
-
-    def _search_n_jobs(self, metric: str) -> int:
-        """Thread count for ``study.optimize``.
-
-        Every metric runs its trials in parallel. All trials of a bootstrap
-        share one fold, so the per-fold state they touch — fold statics, the
-        pre-aggregation lookup plan, ring caches, fast components — takes
-        idempotent writes: two threads may build the same entry, but neither
-        can observe a wrong one. The two scoring caches that were *not* safe
-        (:mod:`geofuse.pdcor`'s side cache and the spline-basis cache) evicted
-        by walking their own iterator while another thread inserted; both now
-        guard that bookkeeping with a lock and keep the expensive build outside
-        it, which is what lifted the restriction to the fast-GLS metrics.
-
-        An exact ``statsmodels`` MixedLM refit stays the exception: it is
-        dominated by Python-level optimiser work holding the GIL, and threading
-        it measured 0.62x of serial, so it is left alone.
-        """
-        exact_refit = (
-            self.is_longitudinal
-            and metric not in mixed_effects_scoring.FAST_SEARCH_METRICS
-            and metric in mixed_effects_scoring.MIXEDLM_METRICS
-        )
-        if exact_refit:
-            return 1
-        return max(1, int(self._search_workers))
-
-    def _clear_ring_caches(self) -> None:
-        self._ring_raster_cache.clear()
-        self._ring_vector_cache.clear()
+    def _clear_fold_caches(self) -> None:
         # Fold-static data (collapse codes, collapsed target/covariates,
-        # points slices) shares the ring caches' lifecycle: both key off the
-        # live fold row sets, which change with every bootstrap resample.
+        # points slices) keys off the live fold row sets, which change with
+        # every bootstrap resample.
         self._fold_static_cache.clear()
 
     def _clear_scoring_caches(self) -> None:
@@ -1877,10 +2286,7 @@ class MetricFusionEngine:
             return f"log ({len(self._ladder(channel))} rungs)"
         return f"linear (step {getattr(self, f'{channel}_buffer_step_m'):g} m)"
 
-    def _outer_radii_metres(self, *, gvi: bool) -> np.ndarray:
-        return np.asarray(self._ladder("gvi" if gvi else "ndvi"), dtype=np.int64)
-
-    def _aggregate_with_ring_cache(
+    def _cached_channel_values(
         self,
         points_gdf: gpd.GeoDataFrame,
         metric_data: gpd.GeoDataFrame | dict,
@@ -1889,18 +2295,13 @@ class MetricFusionEngine:
         percentile: int,
         *,
         channel: str,
-        fold_idx: int | None,
-        subset: str | None,
     ) -> np.ndarray:
-        """
-        Circular neighbourhood aggregation using precomputed annuli when possible.
+        """A channel's neighbourhood values for ``points_gdf``, read from the
+        pre-aggregation cache.
 
-        When ``precompute_aggregations()`` has populated the pre-aggregation
-        table and the trial's (radius, stat, percentile) maps to a cell, the
-        call becomes a vectorised ``numpy.take`` and returns immediately.
-
-        Otherwise falls back to the ring cache (or the direct circular buffer
-        path) — same behaviour as before.
+        Every scored (radius, stat, percentile) cell is on the cache's ladder,
+        so a miss means a radius or statistic the cache was not built for,
+        and raises rather than reducing a different metric.
         """
         # ── Fast path: pre-aggregation lookup table ─────────
         if getattr(self, "_preaggregation_done", False):
@@ -1939,95 +2340,17 @@ class MetricFusionEngine:
             if looked_up is not None:
                 return looked_up
 
-        # A channel with no source layer is served only from the cache, so a
-        # miss cannot be recovered by aggregating — there is nothing to
-        # aggregate. Falling through would silently reduce the wrong metric.
         if metric_data is None:
             raise RuntimeError(
                 f"Channel {channel!r} is stored in the pre-aggregation cache "
                 f"and has no source layer, but radius {radius_m} with "
                 f"stat={stat!r} percentile={percentile!r} is not in the cache."
             )
-
-        # Fell through the fast path (or pre-aggregation off): the ring-cache and
-        # circular-buffer routines need geometry, so re-materialize it if a
-        # geometry-free slice was passed in (see the fast path in ``_objective``).
-        if not isinstance(points_gdf, gpd.GeoDataFrame):
-            points_gdf = self.target_gdf.loc[points_gdf.index]
-
-        if (
-            fold_idx is None
-            or subset is None
-            or len(points_gdf) > self._max_points_ring_cache
-        ):
-            return _helpers.apply_circular_buffer_aggregation(
-                points_gdf, metric_data, radius_m, stat, percentile
-            )
-
-        gvi = channel in ("veg", "terrain")
-        radii = self._outer_radii_metres(gvi=gvi)
-        if radii.size == 0:
-            return _helpers.apply_circular_buffer_aggregation(
-                points_gdf, metric_data, radius_m, stat, percentile
-            )
-
-        # A ring cache holds every raw metric value inside the largest radius
-        # for every point, so the row count alone does not bound it: a fine
-        # raster under a wide radius is tens of thousands of values per point.
-        # Estimate the payload and take the direct path when it would not fit.
-        if self._ring_cache_bytes_estimate(
-            points_gdf, metric_data, float(radii[-1])
-        ) > (self._max_ring_cache_bytes):
-            return _helpers.apply_circular_buffer_aggregation(
-                points_gdf, metric_data, radius_m, stat, percentile
-            )
-
-        cache_store = (
-            self._ring_raster_cache
-            if isinstance(metric_data, dict)
-            else self._ring_vector_cache
+        raise RuntimeError(
+            f"Radius {radius_m} with stat={stat!r} percentile={percentile!r} of "
+            f"channel {channel!r} is not in the pre-aggregation cache; its "
+            "ladders and statistics are the ones the job set."
         )
-        key = metric_sampling.ring_cache_key(
-            channel, fold_idx, subset, points_gdf, radii
-        )
-
-        if key not in cache_store:
-            try:
-                if isinstance(metric_data, dict):
-                    rows = metric_sampling.precompute_raster_ring_values(
-                        metric_data, points_gdf, radii
-                    )
-                else:
-                    col = metric_sampling.vector_metric_column(metric_data, channel)
-                    rows = metric_sampling.precompute_vector_ring_values(
-                        metric_data, points_gdf, radii, col
-                    )
-                prefix = metric_sampling.ring_prefix_stats(rows)
-                cache_store[key] = (radii, rows, prefix, {})
-                logger.info(
-                    f"Ring cache built: channel={channel} subset={subset} fold={fold_idx} "
-                    f"points={len(points_gdf)} rings={len(radii)}"
-                )
-            except Exception as e:
-                logger.warning(f"Ring cache build failed ({channel}): {e}")
-                return _helpers.apply_circular_buffer_aggregation(
-                    points_gdf, metric_data, radius_m, stat, percentile
-                )
-
-        _, rows, prefix, memo = cache_store[key]
-        # Result memo: trials repeat the same (radius, stat, percentile) cells
-        # constantly, and the grid is small (n_radii × mean/median/deciles) —
-        # so the per-point percentile reduce runs once per distinct cell.
-        end_idx = metric_sampling.ring_end_index(radii, radius_m)
-        memo_key = (end_idx, stat, int(percentile) if stat == "percentile" else 0)
-        hit = memo.get(memo_key)
-        if hit is not None:
-            return hit
-        out = metric_sampling.aggregate_from_ring_cache(
-            radii, rows, radius_m, stat, percentile, prefix=prefix
-        )
-        memo[memo_key] = out
-        return out
 
     def _aggregate_channel_for_fold(
         self,
@@ -2038,8 +2361,6 @@ class MetricFusionEngine:
         percentile: int,
         *,
         channel: str,
-        fold_idx: int | None,
-        subset: str | None,
     ) -> tuple[np.ndarray, bool]:
         """Channel values for one scored fold, plus whether they are deduplicated.
 
@@ -2067,15 +2388,13 @@ class MetricFusionEngine:
                     if looked_up is not None:
                         return looked_up, True
         return (
-            self._aggregate_with_ring_cache(
+            self._cached_channel_values(
                 static["points"],
                 metric_data,
                 radius_m,
                 stat,
                 percentile,
                 channel=channel,
-                fold_idx=fold_idx,
-                subset=subset,
             ),
             False,
         )
@@ -2215,8 +2534,6 @@ class MetricFusionEngine:
         points_gdf,
         params: dict,
         *,
-        subset: str,
-        fold_idx: int = -1,
         channels: tuple[str, ...] | None = None,
     ) -> dict[str, np.ndarray]:
         """``{channel: aggregated values}`` at ``params`` for the rows given.
@@ -2242,15 +2559,13 @@ class MetricFusionEngine:
                 out[ch] = np.zeros(len(points_gdf), dtype=np.float32)
                 continue
             radius, stat, pct = self._channel_spec(params, ch)
-            out[ch] = self._aggregate_with_ring_cache(
+            out[ch] = self._cached_channel_values(
                 points_gdf,
                 self._channel_source(ch),
                 radius,
                 stat,
                 pct,
                 channel=ch,
-                fold_idx=fold_idx,
-                subset=subset,
             )
         return out
 
@@ -2302,7 +2617,7 @@ class MetricFusionEngine:
             sample = np.ascontiguousarray(data[::17, ::17]).tobytes()
             digest = hashlib.sha256(sample).hexdigest()[:16]
             return f"ras:{data.shape}:{tuple(metric['bounds'])}:{data.dtype}:{digest}"
-        col = _helpers.metric_value_column(metric, channel)
+        col = metric_sampling.vector_metric_column(metric, channel)
         vals = np.ascontiguousarray(metric[col].to_numpy(dtype=np.float64))
         digest = hashlib.sha256(vals.tobytes()).hexdigest()[:16]
         return f"vec:{len(metric)}:{tuple(metric.total_bounds)}:{col}:{digest}"
@@ -2413,12 +2728,12 @@ class MetricFusionEngine:
             logger.warning(
                 f"Collinearity check: {sorted(dropped)} above the VIF threshold "
                 f"(kept in the search). Initial VIFs: "
-                f"{dict(zip(all_channels, report['initial_vifs']))}."
+                f"{dict(zip(all_channels, report['initial_vifs'], strict=False))}."
             )
         else:
             logger.info(
                 f"Collinearity check passed: all VIFs ≤ {vif_threshold}. "
-                f"VIFs: {dict(zip(all_channels, report['initial_vifs']))}."
+                f"VIFs: {dict(zip(all_channels, report['initial_vifs'], strict=False))}."
             )
         return self._collinearity_report
 
@@ -2708,7 +3023,7 @@ class MetricFusionEngine:
         """
         if isinstance(src, dict):  # raster source
             return ("raster", src["data"], src["transform"], src["crs"])
-        col = _helpers.metric_value_column(src, channel)
+        col = metric_sampling.vector_metric_column(src, channel)
         metric = src.to_crs(utm_crs)
         metric = metric[metric[col].notna()]
         if not all_points:
@@ -2759,7 +3074,7 @@ class MetricFusionEngine:
         cancel_callback: Callable[[], bool] | None,
         stage_secs: dict[str, float],
         progress_callback: Callable[[int], None] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
         """Compute veg / terrain / ndvi stats for the pixels at ``positions``.
 
         ``positions`` index into ``point_xy_utm`` / ``entity_geoms_utm``. Each
@@ -3303,8 +3618,8 @@ class MetricFusionEngine:
                 progress_callback=(
                     None
                     if progress_callback is None
-                    else lambda done: progress_callback(
-                        min(unit_base + done, total_missing), max(total_missing, 1)
+                    else lambda done, _base=unit_base: progress_callback(
+                        min(_base + done, total_missing), max(total_missing, 1)
                     )
                 ),
             )
@@ -3442,6 +3757,8 @@ class MetricFusionEngine:
         cancel_callback: Callable[..., bool] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
         outcome: str | None = None,
+        warm_start: bool = False,
+        synergy_warm_start: bool = False,
     ) -> dict:
         """Select the CGI configuration from data, then quantify it.
 
@@ -3462,6 +3779,24 @@ class MetricFusionEngine:
         what :meth:`retune_concordance` uses; entities missing it are dropped.
         ``radius_prior`` (``bayesian_index.RADIUS_PRIORS``) ties the radius
         kernel's prior to the listed rungs or to the range they span.
+
+        With ``spatial_tune_scale_m`` every stage residualises on the
+        covariates and the smooth at that scale (:meth:`_search_covariates`),
+        and ``__spatial_tuning__`` records the smooth and the share of each
+        channel's variance it absorbs; ``column_sd``, and so the raw-scale
+        weights, then refer to the spread within areas.
+
+        ``warm_start`` starts the posterior from this engine's most recent fit
+        of the same channel and form (its posterior mean and mass matrix, with
+        only the step size re-adapted over a short warm-up); ``synergy_warm_start``
+        starts a synergy posterior with no such fit from a short linear
+        pre-fit (:func:`bayesian_index.synergy_warm_start`). Both change only
+        the Monte Carlo draws. A warm-started fit whose R-hat exceeds
+        :data:`WARM_RHAT_MAX`, or whose smallest effective sample size falls
+        below :data:`WARM_ESS_SHARE` of its source fit's (per draw), is redone
+        from a cold start. ``__posterior__["warm_start"]`` records the source
+        (``fit_label`` of the fit it came from, ``linear pre-fit`` or ``none``),
+        the warm-up length and any fallback.
         """
         t0 = time.perf_counter()
         steps, done = 5, 0
@@ -3492,13 +3827,42 @@ class MetricFusionEngine:
 
         # The channels in play are settled before residualising, so a coverage
         # gap in a channel this study never reads cannot drop rows from it.
+        cov, tuning = self._search_covariates(static)
+        if getattr(self, "spatial_tune_method", "basis") == "spatial_plus_inputs":
+            if bayesian_index.eligible_forms(forms, len(index_channels)) != ("linear",):
+                raise ValueError(
+                    "spatial_plus_inputs tunes the linear form only (synergy "
+                    "terms need positive inputs); set index_form to 'linear'."
+                )
+            X, y, cov, tuning = self._spatial_plus_inputs(
+                X, y, cov, static, channel_index, index_channels, outcome
+            )
+        weights = None
+        if _search_weight_column(self):
+            if "synergy" in forms:
+                raise ValueError(
+                    "weight_search fits the linear form only; set index_form "
+                    "to 'linear'."
+                )
+            weights = static.get("sample_weight")
         yr, Xr, prep_info = bayesian_index.prep(
             X,
             y,
-            static.get("cov"),
+            cov,
             channel_index=channel_index,
             return_info=True,
+            weights=weights,
         )
+        if tuning is not None and tuning.get("method") != "spatial_plus_inputs":
+            tuning = self._tuning_record(
+                tuning,
+                X,
+                y,
+                static.get("cov"),
+                channel_index,
+                index_channels,
+                prep_info,
+            )
         dropped = int(len(X) - len(Xr))
         if dropped:
             _log(
@@ -3524,7 +3888,13 @@ class MetricFusionEngine:
         design = None
         if bayesian_index.eligible_forms(forms, len(index_channels)) != ("linear",):
             design = self._synergy_design(
-                static, prep_info["kept"], channel_index, index_channels, radii, stats
+                static,
+                prep_info["kept"],
+                channel_index,
+                index_channels,
+                radii,
+                stats,
+                cov=cov,
             )
         tick()
 
@@ -3607,9 +3977,7 @@ class MetricFusionEngine:
         if cancelled():
             raise JobCancelled("Index posterior cancelled by user.")
         t_post = time.perf_counter()
-        post, grid, grid_kwargs = bayesian_index.grid_posterior(
-            Xr,
-            yr,
+        posterior_kw = dict(
             channels=index_channels,
             channel_index=channel_index,
             radii=radii,
@@ -3628,9 +3996,65 @@ class MetricFusionEngine:
             entities=entities,
             design=design,
         )
+        start, source, reference = self._posterior_start(
+            res.form,
+            warm_start=warm_start,
+            synergy_warm_start=synergy_warm_start,
+            prefit=lambda: bayesian_index.linear_prefit(
+                Xr[:, list(channel_index)],
+                yr,
+                chains=chains,
+                seed=seed,
+                radii=radii,
+                stats=stats,
+                radius_mask=self._radius_mask(len(index_channels), radii, radius_idx),
+                radius_kernel=radius_kernel,
+                aggregator=aggregator,
+                radius_prior=radius_prior,
+                entities=entities,
+            ),
+            n_terms=len(cgi_formulas.synergy_combos(len(index_channels))),
+        )
+        post, grid, grid_kwargs = bayesian_index.grid_posterior(
+            Xr, yr, warm_start=start, **posterior_kw
+        )
+        fallback = self._warm_fit_fallback(post, start, reference, draws * chains)
+        if fallback:
+            _log(
+                "WARN",
+                f"Warm-started posterior ({source}) refitted from a cold start: "
+                f"{fallback}.",
+            )
+            post, grid, grid_kwargs = bayesian_index.grid_posterior(
+                Xr, yr, **posterior_kw
+            )
+        warm_record = {
+            "source": source if start is not None else "none",
+            "warmup": (
+                int(start["warmup"])
+                if start is not None and not fallback
+                else int(warmup)
+            ),
+            "fallback": fallback,
+        }
+        self._posterior_warm[(self._active_greenery_channel, res.form)] = {
+            "warm": post.warm_start,
+            "ess_per_draw": (
+                float(post.ess_min) / max(draws * chains, 1)
+                if np.isfinite(post.ess_min)
+                else None
+            ),
+            "label": self._fit_label,
+        }
         _log(
             "INFO",
             f"Posterior fitted in {time.perf_counter() - t_post:.0f}s"
+            + (
+                f" (warm start: {warm_record['source']}, "
+                f"{warm_record['warmup']} warm-up iterations)"
+                if start is not None and not fallback
+                else ""
+            )
             + (f"; {null_runs} warm-started null refits follow." if null_runs else "."),
         )
         null = (
@@ -3704,6 +4128,7 @@ class MetricFusionEngine:
             "splits": sweep_splits,
         }
         params["__posterior__"] = post.summary()
+        params["__posterior__"]["warm_start"] = warm_record
         params["__posterior__"]["ladder_spacing"] = {
             ch: self._ladder_description("ndvi" if ch == "ndvi" else "gvi")
             for ch in index_channels
@@ -3711,6 +4136,8 @@ class MetricFusionEngine:
         params["__discovery__"] = disc
         params["__holdout_gain__"] = gain
         params["__null_calibration__"] = null
+        if tuning is not None:
+            params["__spatial_tuning__"] = tuning
         params["__coverage__"] = getattr(self, "_coverage_report", None)
         params["__elapsed_s__"] = float(time.perf_counter() - t0)
         _log(
@@ -3772,6 +4199,268 @@ class MetricFusionEngine:
         ]
         return index_channels, channel_index, radius_idx
 
+    @property
+    def _tune_eps(self) -> float:
+        """The cluster gap of the tuning smooth: the job's, else twice the
+        tuning scale."""
+        if self.spatial_adjust_eps_m is not None:
+            return self.spatial_adjust_eps_m
+        if self.spatial_tune_select == "scale_ic":
+            return self._selection_eps()
+        return 2.0 * self.spatial_tune_scale_m
+
+    def _spatial_plus_inputs(
+        self, X, y, cov, static, channel_index, index_channels, outcome
+    ):
+        """``(X, y, None, record)``: the search inputs after Spatial+ step 1.
+
+        Every measured tensor column is residualized on its own penalized
+        smooth per group, the outcome smoother is fitted on ``y ~ covariates +
+        group + Σ_g s_g(t)`` without any exposure, and the outcome and every
+        residual are multiplied by ``(I − H)^{1/2}``
+        (:func:`spatial_plus.search_transform`), so the search's slopes are
+        Spatial+ step-2 slopes with the outcome smoother's penalties fixed; the
+        covariates are absorbed. Rows missing a value become missing (``prep``
+        drops them). The penalties are cached per row set and outcome, so the
+        standalone searches and the null outcomes of the same split reuse the
+        outcome's smoother. A geofuse extension of Dupont et al. (2022).
+        """
+        from . import spatial_plus as _sp
+
+        if self.is_panel:
+            raise ValueError("spatial_plus_inputs needs one row per entity.")
+        coords = static.get("coords")
+        if coords is None:
+            raise ValueError(
+                "spatial_plus_inputs needs the target's locations, which this "
+                "target does not provide."
+            )
+        n = len(X)
+        flat = X.reshape(n, -1)
+        scan = X[:, list(channel_index)].reshape(n, -1)
+        measured = ~np.isnan(scan).all(0)
+        keep = np.isfinite(y) & np.isfinite(coords).all(axis=1)
+        dense = None if cov is None else np.asarray(cov, dtype=np.float64)
+        if dense is not None:
+            dense = dense.reshape(n, -1)
+            keep &= np.isfinite(dense).all(1)
+        keep &= np.isfinite(scan[:, measured]).all(1)
+        usable = np.isfinite(flat[keep]).all(0)
+        cols = np.flatnonzero(usable)
+        xy = np.asarray(coords, dtype=np.float64)[keep]
+        values = None
+        if self.spatial_plus_groups_column and static.get("pid") is not None:
+            full = self._full_data_frame()
+            if full is not None and self.spatial_plus_groups_column in full.columns:
+                values = (
+                    full.groupby("polygon_id", sort=False)[
+                        self.spatial_plus_groups_column
+                    ]
+                    .first()
+                    .reindex(np.asarray(static["pid"]))
+                    .to_numpy()[keep]
+                )
+        labels, rule = _sp.group_labels(
+            xy,
+            eps_m=self.spatial_adjust_eps_m,
+            min_component=self.spatial_adjust_min_component,
+            values=values,
+        )
+        c = None if dense is None else dense[keep]
+        key = (
+            "plus_inputs",
+            outcome,
+            _helpers.spatial_cache_key(xy, np.empty(0), None),
+            self.spatial_plus_criterion,
+            self.spatial_plus_k,
+        )
+        cached = self._plus_inputs_cache.get(key) or {}
+        out = _sp.search_transform(
+            xy,
+            labels,
+            flat[keep][:, cols],
+            np.asarray(y, dtype=np.float64)[keep],
+            c,
+            kind=self.spatial_plus_criterion,
+            k=self.spatial_plus_k,
+            lam_x=cached.get("lam_x"),
+            lam_y=cached.get("lam_y"),
+        )
+        self._plus_inputs_cache[key] = {
+            "lam_x": out["lam_x"],
+            "lam_y": out["lam_y"],
+            "edf_x": cached.get("edf_x", out["edf_x"]),
+        }
+        Xt = np.full(flat.shape, np.nan)
+        Xt[np.ix_(np.flatnonzero(keep), cols)] = out["X"]
+        yt = np.full(n, np.nan)
+        yt[keep] = out["y"]
+        # ── The record: per channel, then the outcome smoother ─
+        edf_x = self._plus_inputs_cache[key]["edf_x"]
+        channel_of = np.repeat(np.arange(X.shape[1]), int(np.prod(X.shape[2:])))[cols]
+        per_channel = {}
+        for ci, ch in zip(channel_index, index_channels, strict=True):
+            mine = channel_of == ci
+            if not mine.any():
+                continue
+            per_channel[ch] = {
+                "median_edf": (
+                    float(np.nanmedian(edf_x[mine].sum(axis=1)))
+                    if np.isfinite(edf_x[mine]).any()
+                    else None
+                ),
+                "absorbed": float(np.nanmedian(out["absorbed"][mine])),
+            }
+        from . import spatial_scale_selection as _ss
+
+        sm = out["smoother"]
+        k_hat = _ss.effective_bandwidth(
+            xy, sm.labels, _sp.smoother_weights(sm, out["lam_y"]), seed=0
+        )
+        record = {
+            "method": "spatial_plus_inputs",
+            "label": SPATIAL_LABELS["spatial_plus_inputs"],
+            "criterion": self.spatial_plus_criterion,
+            "k": self.spatial_plus_k,
+            "rows": int(keep.sum()),
+            "columns": int(len(cols)),
+            "clusters": int(rule.get("n_groups") or 0),
+            "groups_rule": rule,
+            "channels": per_channel,
+            "absorbed": {ch: v["absorbed"] for ch, v in per_channel.items()},
+            "outcome_lambda": [float(v) for v in out["lam_y"]],
+            "outcome_edf": out["edf_y"],
+            "k_ks": k_hat["k_ks"],
+            "k_rk": k_hat["k_rk"],
+        }
+        return Xt.reshape(X.shape), yt, None, record
+
+    def _search_covariates(self, static: dict):
+        """``(covariates, smooth record or None)`` for the index search.
+
+        Without ``spatial_tune_scale_m``, the fold's covariates. With it, the
+        smooth at that scale, built on the locations of the fold's tensor rows
+        (once per row set), is appended to them, so ``prep``, the synergy
+        terms, the sweep, discovery, gain, posterior and null calibration all
+        work on variation within areas. Too many columns for the rows, or a
+        cluster with nearly as many knots as entities, gets a WARN.
+        """
+        cov = static.get("cov")
+        scale = self.spatial_tune_scale_m
+        if scale is None:
+            return cov, None
+        coords = static.get("coords")
+        if coords is None:
+            raise ValueError(
+                "spatial_tune_scale_m needs the target's locations, which this "
+                "target does not provide."
+            )
+        coords = np.asarray(coords, dtype=np.float64)
+        n = len(coords)
+        key = ("tune", scale, _helpers.spatial_cache_key(coords, np.empty(0), None))
+        entry = self._spatial_basis_cache.get(key)
+        if entry is None:
+            basis = spatial_basis.build_block_basis(
+                coords,
+                eps=self._tune_eps,
+                neighbours=self.spatial_adjust_neighbours,
+                scale_m=scale,
+                min_component=self.spatial_adjust_min_component,
+            )
+            cols = (
+                basis.design(max(1, basis.max_df))
+                if basis.has_spatial
+                else np.empty((n, 0))
+            )
+            entry = {"basis": basis, "columns": cols}
+            self._spatial_basis_cache[key] = entry
+            self._warn_tuning_size(basis, cols.shape[1], cov, n)
+        basis, cols = entry["basis"], entry["columns"]
+        summary = basis.summary
+        record = {
+            "scale_m": scale,
+            "eps_m": self._tune_eps,
+            "clusters": summary.get("n_components"),
+            "merged_components": summary.get("merged_components", 0),
+            "merged_entities": summary.get("merged_entities", 0),
+            "radial_columns": summary.get("radial_columns", 0),
+            "columns": int(cols.shape[1]),
+            "rows": int(n),
+        }
+        if cov is not None and np.size(cov):
+            cov = np.column_stack(
+                [np.asarray(cov, dtype=np.float64).reshape(n, -1), cols]
+            )
+        else:
+            cov = cols
+        return cov, record
+
+    def _warn_tuning_size(self, basis, n_columns, cov, n) -> None:
+        """WARN when the tuning smooth leaves the search too little room."""
+        n_cov = 0 if cov is None else int(np.asarray(cov).reshape(n, -1).shape[1])
+        clusters = basis.summary.get("components") or []
+        largest = max(clusters, key=lambda c: c["n"], default=None)
+        crowded = [c for c in clusters if c["knots"] > c["n"] - 4]
+        where = (
+            f"; largest cluster {largest['n']} entities, {largest['knots']} knots"
+            if largest
+            else ""
+        )
+        scale = f"{self.spatial_tune_scale_m / 1000:g} km"
+        if n_columns + n_cov > 0.25 * n:
+            _log(
+                "WARN",
+                f"Tuning smooth at {scale}: {n_columns} columns and {n_cov} "
+                f"covariates for {n} rows, over a quarter of them, so the search "
+                f"may fit noise{where}. A larger scale keeps the smooth smaller.",
+            )
+        elif crowded:
+            worst = max(crowded, key=lambda c: c["knots"] - c["n"])
+            _log(
+                "WARN",
+                f"Tuning smooth at {scale}: a cluster of {worst['n']} entities has "
+                f"{worst['knots']} knots, nearly one per entity, so the search may "
+                f"fit noise{where}.",
+            )
+
+    def _tuning_record(
+        self, record, X, y, cov, channel_index, index_channels, prep_info
+    ) -> dict:
+        """The tuning record with each channel's absorbed variance share.
+
+        The share is ``1 − (SD within areas / SD after the covariates)²`` of
+        each measured cell, averaged over the channel's cells, on the rows the
+        search kept.
+        """
+        base = bayesian_index.prep(
+            X, y, cov, channel_index=channel_index, return_info=True
+        )[2]["column_sd"]
+        within = prep_info["column_sd"]
+        absorbed = {}
+        for ch, ci in zip(index_channels, channel_index, strict=True):
+            b, w = base[ci].reshape(-1), within[ci].reshape(-1)
+            ok = np.isfinite(b) & np.isfinite(w) & (b > 0)
+            absorbed[ch] = (
+                round(float(np.mean(1.0 - (w[ok] / b[ok]) ** 2)), 4)
+                if ok.any()
+                else None
+            )
+        shares = ", ".join(
+            f"{ch} " + ("n/a" if v is None else f"{v:.0%}")
+            for ch, v in absorbed.items()
+        )
+        _log(
+            "INFO",
+            f"Tuning within areas of {record['scale_m'] / 1000:g} km: "
+            f"{record['clusters']} clusters, {record['columns']} smooth columns; "
+            f"variance absorbed: {shares}.",
+        )
+        return {
+            **record,
+            "kept_rows": int(prep_info["kept"].sum()),
+            "absorbed": absorbed,
+        }
+
     def plasmode_recovery(self, *, out_dir: str | None = None, **kwargs) -> dict:
         """Plasmode recovery on this study's own exposure tensor and covariates.
 
@@ -3831,6 +4520,62 @@ class MetricFusionEngine:
 
         return objective
 
+    @staticmethod
+    def _radius_mask(n_channels: int, radii, radius_idx) -> np.ndarray:
+        """Which rungs each index channel's kernel may use."""
+        mask = np.zeros((n_channels, len(radii)), dtype=bool)
+        for ci, allowed in enumerate(radius_idx):
+            mask[ci, list(allowed)] = True
+        return mask
+
+    def _posterior_start(
+        self, form, *, warm_start, synergy_warm_start, prefit, n_terms
+    ):
+        """``(warm start or None, its source, its reference fit or None)``.
+
+        The latest fit of this channel and form when ``warm_start`` is on,
+        keeping its mass matrix and adapting only the step size; otherwise, for
+        a synergy posterior with ``synergy_warm_start``, a linear pre-fit
+        (``prefit()``) mapped onto the synergy model, whose mass matrix
+        re-adapts.
+        """
+        stored = self._posterior_warm.get((self._active_greenery_channel, form))
+        if warm_start and stored is not None:
+            return (
+                {**stored["warm"], "adapt_mass_matrix": False},
+                stored["label"],
+                stored,
+            )
+        if synergy_warm_start and form == "synergy":
+            try:
+                lin = prefit()
+                return (
+                    bayesian_index.synergy_warm_start(lin, n_terms),
+                    "linear pre-fit",
+                    None,
+                )
+            except Exception as exc:
+                _log("WARN", f"Linear pre-fit for the synergy posterior failed: {exc}")
+        return None, None, None
+
+    @staticmethod
+    def _warm_fit_fallback(post, start, reference, n_draws) -> str | None:
+        """Why a warm-started posterior must be refitted cold, or ``None``."""
+        if start is None:
+            return None
+        rhat = float(post.rhat_max)
+        if not np.isfinite(rhat) or rhat > WARM_RHAT_MAX:
+            return f"R-hat {rhat:.3f} above {WARM_RHAT_MAX}"
+        ref = None if reference is None else reference.get("ess_per_draw")
+        if ref and np.isfinite(post.ess_min):
+            per_draw = float(post.ess_min) / max(n_draws, 1)
+            if per_draw < WARM_ESS_SHARE * ref:
+                return (
+                    f"effective sample size {per_draw:.3f} per draw, below "
+                    f"{WARM_ESS_SHARE:.0%} of its source's {ref:.3f}"
+                )
+        return None
+
     def _params_from_sweep(self, res, post, index_channels, term_sd=None) -> dict:
         """Posterior -> the params dict the composite/apply path consumes.
 
@@ -3850,7 +4595,7 @@ class MetricFusionEngine:
         params: dict[str, Any] = {}
 
         stat_of = {"mean": ("mean", 50)}
-        for (radius, column), ch in zip(post.picked, index_channels):
+        for (radius, column), ch in zip(post.picked, index_channels, strict=True):
             stat, pct = stat_of.get(column, ("percentile", 0))
             if column != "mean":
                 pct = int(column[1:])
@@ -3944,7 +4689,7 @@ class MetricFusionEngine:
                         else ("percentile", int(column[1:]))
                     )
                     vals, on_uniq = self._channel_values_for_static(
-                        static, ch, radius, stat, pct, subset
+                        static, ch, radius, stat, pct
                     )
                     if vals is None:
                         continue
@@ -3965,12 +4710,14 @@ class MetricFusionEngine:
         return X, np.asarray(radii, dtype=float), list(stats), list(channels), static
 
     def _synergy_design(
-        self, static, kept, channel_index, index_channels, radii, stats
+        self, static, kept, channel_index, index_channels, radii, stats, cov=None
     ):
         """The synergy form's raw values per CGI cell, over the kept tensor rows.
 
         Holds each distinct cell of the train+val fold once, for the index
         channels only, with the exposure rows that average it into an entity.
+        ``cov`` replaces the fold's covariates as the basis the interaction
+        terms are residualised on (the search's, smooth included).
         """
         gvi_radii, ndvi_radii = self._search_radii()
         inverse = static.get("uniq_inverse")
@@ -4003,7 +4750,7 @@ class MetricFusionEngine:
                         else ("percentile", int(column[1:]))
                     )
                     vals, on_uniq = self._channel_values_for_static(
-                        static, ch, radius, stat, pct, "train_val"
+                        static, ch, radius, stat, pct
                     )
                     if vals is None:
                         continue
@@ -4013,7 +4760,8 @@ class MetricFusionEngine:
         codes = static["codes"] if static["has_pid"] else np.arange(n_rows)
         rows = np.flatnonzero(np.asarray(kept)[codes])
         weight = static.get("weight")
-        cov = static.get("cov")
+        if cov is None:
+            cov = static.get("cov")
         return bayesian_index.SynergyDesign.build(
             cells,
             None if cov is None else np.asarray(cov)[kept],
@@ -4025,7 +4773,7 @@ class MetricFusionEngine:
             channels=channel_index,
         )
 
-    def _channel_values_for_static(self, static, channel, radius, stat, pct, subset):
+    def _channel_values_for_static(self, static, channel, radius, stat, pct):
         """One (channel, radius, stat) column for a prepared fold, cache first.
 
         ``gvi`` has no source layer of its own — it is a stored cache channel —
@@ -4057,8 +4805,6 @@ class MetricFusionEngine:
             stat,
             pct if pct is not None else 50,
             channel=channel,
-            fold_idx=None,
-            subset=subset,
         )
 
     def _cache_channels(self) -> tuple[str, ...]:
@@ -4263,8 +5009,7 @@ class MetricFusionEngine:
         extra = [
             *(self.covariate_columns or []),
             *self._longitudinal_extra_cols(),
-            *self.negative_control_columns,
-            *self.comparator_columns,
+            *self._carried_columns,
         ]
         for col in dict.fromkeys(extra):
             if col in ent.columns:
@@ -4348,7 +5093,7 @@ class MetricFusionEngine:
         return result
 
     # ────────────────────────────────────────────────────────────
-    # Per-pixel CGI → per-entity collapse (shared by every scoring path)
+    # Per-pixel CGI → per-entity collapse (every scoring path)
     # ────────────────────────────────────────────────────────────
     @staticmethod
     def _collapse_to_entities(
@@ -4436,8 +5181,8 @@ class MetricFusionEngine:
         entity's first-occurrence row (target / covariates / coords /
         longitudinal keys are per-entity constants broadcast to pixels, so a
         "first" collapse is a plain row-take), and the points slice the
-        aggregation path consumes. Cached on ``_fold_static_cache`` and
-        cleared with the ring caches — both key off the live fold row sets.
+        aggregation path consumes. Cached on ``_fold_static_cache``, which
+        keys off the live fold row sets.
         """
         key = (self._split_generation, fold_idx, subset, len(data))
         st = self._fold_static_cache.get(key)
@@ -4478,6 +5223,9 @@ class MetricFusionEngine:
                 for c in self.negative_control_columns
                 if c in data.columns
             }
+            column = _search_weight_column(self)
+            if column in data.columns:
+                st["sample_weight"] = data[column].to_numpy(dtype=np.float64)[first_idx]
             st["coords"] = (
                 np.column_stack(
                     [
@@ -4503,6 +5251,9 @@ class MetricFusionEngine:
                 for c in self.negative_control_columns
                 if c in data.columns
             }
+            column = _search_weight_column(self)
+            if column in data.columns:
+                st["sample_weight"] = data[column].to_numpy(dtype=np.float64)
             st["coords"] = (
                 data[["_cx", "_cy"]].to_numpy(np.float64) if have_coords else None
             )
@@ -4803,54 +5554,333 @@ class MetricFusionEngine:
 
         Builds the per-cluster candidate basis once per split fingerprint (the
         coordinates and outcome are stable across trials) and memoizes it on
-        ``_spatial_basis_cache``. For ``ks_aic`` the df is selected once on the
-        outcome (cached); for ``spatial_plus`` the df is selected per call on the
-        exposure ``cgi``. ``None`` means no spatial adjustment is applied (off,
-        no coordinates, degenerate geometry, or AIC preferred no smooth).
+        ``_spatial_basis_cache``. When the outcome model picks the df it is
+        selected once on the outcome (cached); when the exposure model does, per
+        call on the exposure ``cgi``. ``None`` means no spatial adjustment is
+        applied (off, no coordinates, degenerate geometry, or AIC preferred no
+        smooth).
         """
-        if self.spatial_adjust_method == "none" or coords_xy is None:
+        return self._spatial_smooth(coords_xy, target, cov, cgi)[0]
+
+    def _spatial_smooth(
+        self,
+        coords_xy: np.ndarray | None,
+        target: np.ndarray,
+        cov: np.ndarray | None,
+        cgi: np.ndarray,
+    ) -> tuple[np.ndarray | None, int | None]:
+        """:meth:`_spatial_basis_columns` with the selected df: ``(columns, df)``.
+
+        ``(None, None)`` when no smooth is applied.
+        """
+        chosen = self._spatial_selection(coords_xy, target, cov, cgi)
+        if chosen is None:
+            return None, None
+        return chosen["columns"], chosen["df"]
+
+    def _spatial_candidates(self, basis: "spatial_basis.SpatialBasis") -> list[int]:
+        """The df levels compared on ``basis`` (the job's list, capped)."""
+        return spatial_basis.candidate_dfs(basis, self.spatial_adjust_df)
+
+    def _spatial_selection(
+        self,
+        coords_xy: np.ndarray | None,
+        target: np.ndarray,
+        cov: np.ndarray | None,
+        cgi: np.ndarray,
+        *,
+        on: str | None = None,
+    ) -> dict | None:
+        """One df selection on a scored split, or ``None`` without a smooth.
+
+        ``{"columns", "df", "ic", "at_cap"}``: the selected design (``None``
+        when the criterion kept none), its df, the criterion of every design
+        compared (``{"none": …, "<df>": …}``) and whether the largest
+        candidate won. The df is selected on the outcome given the covariates
+        (``df_outcome_ic``, or ``on="outcome"``) or on the exposure ``cgi``
+        (``df_exposure_ic``). The first selection that lands on the largest
+        candidate logs a WARN.
+        """
+        if self._basis == "none" or coords_xy is None:
+            return None
+        if self.spatial_adjust_select == "scale_ic" and self._spatial_scale is None:
             return None
         coords_xy = np.asarray(coords_xy, dtype=np.float64)
+        if self._spatial_scale is not None:
+            return self._scale_selection(coords_xy)
         cache_key = _helpers.spatial_cache_key(coords_xy, target, cov)
         entry = self._spatial_basis_cache.get(cache_key)
         if entry is None:
             basis = spatial_basis.build_block_basis(
-                np.asarray(coords_xy, dtype=np.float64),
+                coords_xy,
                 max_df=self.spatial_adjust_max_df,
                 eps=self.spatial_adjust_eps_m,
+                neighbours=self.spatial_adjust_neighbours,
+                knots_min=self.spatial_adjust_knots_min,
+                knots_max=self.spatial_adjust_knots_max,
+                min_component=self.spatial_adjust_min_component,
             )
-            ks_df, ks_cols = (None, None)
+            entry = {"basis": basis, "ks": None}
+            if self._spatial_adjust_summary is None and basis.summary.get("chained"):
+                _log(
+                    "WARN",
+                    f"Spatial smooth: {basis.summary['chained']}, so one df "
+                    "removes patterns of very different sizes across clusters. "
+                    "spatial_adjust_eps_m splits clusters at a gap distance, "
+                    "and spatial_adjust_scale_m defines the smooth by a "
+                    "distance everywhere.",
+                )
             if basis.has_spatial:
-                ks_df, ks_cols = spatial_basis.select_df_aic(
+                ks_df, ks_cols, ks_ic = spatial_basis.select_df_aic(
                     np.asarray(target, dtype=np.float64),
                     basis,
                     None if cov is None else np.asarray(cov, dtype=np.float64),
+                    criterion=self.spatial_adjust_criterion,
+                    candidates=self.spatial_adjust_df,
+                    return_profile=True,
                 )
-            entry = {"basis": basis, "ks_cols": ks_cols, "ks_df": ks_df}
+                entry["ks"] = self._selection_record(basis, ks_df, ks_cols, ks_ic)
             self._spatial_basis_cache[cache_key] = entry
             if self._spatial_adjust_summary is None and basis.has_spatial:
-                self._spatial_adjust_summary = {
-                    "method": self.spatial_adjust_method,
-                    "ks_df": ks_df,
-                    **basis.summary,
-                }
+                self._note_basis_summary(
+                    {
+                        **self._method_record(),
+                        "ks_df": entry["ks"]["df"],
+                        "candidates": list(self.spatial_adjust_df),
+                        "criterion": self.spatial_adjust_criterion,
+                        "eps_m": self.spatial_adjust_eps_m,
+                        **basis.summary,
+                        "ks_ic": entry["ks"]["ic"],
+                        "ks_at_cap": entry["ks"]["at_cap"],
+                    }
+                )
         basis = entry["basis"]
         if not basis.has_spatial:
             return None
-        if self.spatial_adjust_method == "ks_aic":
-            return entry["ks_cols"]
-        # spatial_plus: the exposure is residualized on the smooth, so df is
-        # selected on the exposure (df-Spatial+); the candidate basis is reused
+        if self._basis == "outcome" or on == "outcome":
+            return self._count_selection(entry["ks"])
+        # The exposure model picks the df (df-Spatial+); the candidate basis
+        # is reused
         # and the per-call df search runs off the memoized nested-QR precompute
-        # (one matvec instead of max_df+1 least-squares fits).
+        # (one matvec instead of one least-squares fit per candidate).
         pre = entry.get("plus_pre")
         if pre is None and "plus_pre" not in entry:
             pre = spatial_basis.precompute_df_selection(basis)
             entry["plus_pre"] = pre
-        _df, sp_cols = spatial_basis.select_df_aic_fast(
-            np.asarray(cgi, dtype=np.float64), basis, pre
+        sp_df, sp_cols, sp_ic = spatial_basis.select_df_aic_fast(
+            np.asarray(cgi, dtype=np.float64),
+            basis,
+            pre,
+            criterion=self.spatial_adjust_criterion,
+            candidates=self.spatial_adjust_df,
+            return_profile=True,
         )
-        return sp_cols
+        return self._count_selection(
+            self._selection_record(basis, sp_df, sp_cols, sp_ic)
+        )
+
+    @property
+    def _scale_eps(self) -> float:
+        """The cluster gap of scale mode: the job's, else twice the primary
+        scale, shared by every listed scale."""
+        if self.spatial_adjust_eps_m is not None:
+            return self.spatial_adjust_eps_m
+        if self.spatial_adjust_select == "scale_ic":
+            return self._selection_eps()
+        return 2.0 * self.spatial_adjust_scales[0]
+
+    def _scale_selection(self, coords_xy: np.ndarray) -> dict | None:
+        """The fixed smooth of :attr:`_spatial_scale` on these locations.
+
+        The basis depends on the locations only, so it is built once per row
+        set and scale and every exposure and outcome shares it: ``columns``
+        are all of it, ``df`` its column count and ``scale_m`` the scale.
+        ``None`` when the locations support no spatial column.
+        """
+        scale = float(self._spatial_scale)
+        key = (scale, _helpers.spatial_cache_key(coords_xy, np.empty(0), None))
+        entry = self._spatial_basis_cache.get(key)
+        if entry is None:
+            basis = spatial_basis.build_block_basis(
+                coords_xy,
+                eps=self._scale_eps,
+                neighbours=self.spatial_adjust_neighbours,
+                scale_m=scale,
+                min_component=self.spatial_adjust_min_component,
+            )
+            cols = basis.design(max(1, basis.max_df)) if basis.has_spatial else None
+            entry = {
+                "basis": basis,
+                "chosen": (
+                    None
+                    if cols is None or not cols.shape[1]
+                    else {
+                        "columns": cols,
+                        "df": int(cols.shape[1]),
+                        "ic": {},
+                        "at_cap": False,
+                        "scale_m": scale,
+                    }
+                ),
+            }
+            self._spatial_basis_cache[key] = entry
+            if scale not in self._spatial_scale_summaries:
+                self._spatial_scale_summaries[scale] = dict(basis.summary)
+                if basis.summary.get("size_warning"):
+                    _log("WARN", f"Spatial smooth: {basis.summary['size_warning']}.")
+            if self._spatial_adjust_summary is None and basis.has_spatial:
+                self._note_basis_summary(
+                    {
+                        **self._method_record(),
+                        "selection": "fixed scale",
+                        "eps_m": self._scale_eps,
+                        **basis.summary,
+                    }
+                )
+        return entry["chosen"]
+
+    def _note_basis_summary(self, summary: dict) -> None:
+        """Record the split's first basis, and the run's when it is the first."""
+        self._spatial_adjust_summary = summary
+        if self._spatial_run_summary is None:
+            self._spatial_run_summary = summary
+
+    @contextlib.contextmanager
+    def spatial_scale(self, scale: float | None, *, ladder: bool = True):
+        """Inside the block, smooths are built at pattern scale ``scale``;
+        ``None`` reports without a spatial smooth. Scale mode only: the
+        clusters stay those of the primary scale. ``ladder=False`` marks a
+        selected scale (a control's own) rather than a rung of the ladder."""
+        if not self.spatial_adjust_scales:
+            raise ValueError("spatial_scale needs spatial_adjust_scale_m.")
+        saved = self._spatial_scale, self._basis, self._in_ladder
+        if scale is None:
+            self._basis = "none"
+        else:
+            self._spatial_scale = float(scale)
+        self._in_ladder = bool(ladder)
+        try:
+            yield
+        finally:
+            self._spatial_scale, self._basis, self._in_ladder = saved
+
+    def _selected_tag(self) -> dict:
+        """``{scale_m, selected}`` for a record of the selected scale (outside
+        a ladder rung), else nothing."""
+        if self.spatial_adjust_select != "scale_ic" or self._in_ladder:
+            return {}
+        return {
+            "scale_m": None if self._basis == "none" else self._spatial_scale,
+            "selected": self.spatial_select_criterion,
+        }
+
+    def _method_record(self) -> dict:
+        """The adjustment as a record names it: ``method`` and, for a basis,
+        ``select`` (how its size is set)."""
+        if self.spatial_adjust_method == "basis":
+            return {"method": "basis", "select": self.spatial_adjust_select}
+        return {"method": self.spatial_adjust_method}
+
+    @property
+    def _scoring_spatial_method(self) -> str:
+        """``spatial_method`` of the scorers: ``basis`` while a basis is in
+        use (inside :meth:`spatial_scale` too), else ``none``."""
+        return "none" if self._basis == "none" else "basis"
+
+    def _selection_record(self, basis, df, columns, ic) -> dict:
+        """A df selection as :meth:`_spatial_selection` returns it."""
+        candidates = self._spatial_candidates(basis)
+        at_cap = df is not None and bool(candidates) and int(df) == max(candidates)
+        return {
+            "columns": columns,
+            "df": None if df is None else int(df),
+            "ic": {k: float(v) for k, v in ic.items()},
+            "at_cap": bool(at_cap),
+        }
+
+    def _count_selection(self, chosen: dict) -> dict:
+        """Count a selection and warn once when the largest candidate wins."""
+        self._spatial_selections["n"] += 1
+        if chosen["at_cap"]:
+            self._spatial_selections["at_cap"] += 1
+            if self._spatial_selections["at_cap"] == 1:
+                _log(
+                    "WARN",
+                    f"Spatial smooth: the {self.spatial_adjust_criterion.upper()} "
+                    f"picked df {chosen['df']}, the largest candidate "
+                    f"({list(self.spatial_adjust_df)}); a larger df may fit "
+                    "better. Add larger values to spatial_adjust_df (and "
+                    "spatial_adjust_knots_max) to let the criterion decide.",
+                )
+        return chosen
+
+    @property
+    def _residualize_options(self) -> dict:
+        """The covariate-basis keywords of :func:`objective_scoring.score`."""
+        return {
+            "residualize_method": self.residualize_method,
+            "spline_df": self.residualize_spline_df,
+            "spline_min_unique": self.residualize_spline_min_unique,
+        }
+
+    def spatial_selection_report(self) -> dict | None:
+        """The run's smooth settings and selection counts, ``None`` unadjusted.
+
+        Joins the run's first basis (the first split's: clusters, knots, the
+        outcome's IC profile) with every setting of the smooth and how many
+        selections the largest candidate won (``at_cap``). Re-splitting, as the
+        repeated held-out splits do, leaves it unchanged.
+        """
+        if self._basis == "none":
+            return None
+        first = self._spatial_run_summary or self._spatial_adjust_summary
+        if self.spatial_adjust_scales:
+            return {
+                **(first or self._method_record()),
+                "selection": "fixed scale",
+                "scales_m": list(self.spatial_adjust_scales),
+                "primary_scale_m": self.spatial_adjust_scales[0],
+                **(
+                    {
+                        "selection": "scale_ic",
+                        "criterion": self.spatial_select_criterion,
+                        "controls": self.spatial_select_controls,
+                        "primary_scale_m": "selected",
+                    }
+                    if self.spatial_adjust_select == "scale_ic"
+                    else {}
+                ),
+                "eps_m": self._scale_eps,
+                "min_component": self.spatial_adjust_min_component,
+                "neighbours": self.spatial_adjust_neighbours,
+                "clusters": (first or {}).get("n_components"),
+                "paired_rule": "shared",
+                "per_scale": {
+                    str(int(k) if float(k).is_integer() else k): v
+                    for k, v in self._spatial_scale_summaries.items()
+                },
+            }
+        return {
+            **(first or self._method_record()),
+            "candidates": list(self.spatial_adjust_df),
+            "criterion": self.spatial_adjust_criterion,
+            "neighbours": self.spatial_adjust_neighbours,
+            "knots_min": self.spatial_adjust_knots_min,
+            "knots_max": self.spatial_adjust_knots_max,
+            "eps_m": self.spatial_adjust_eps_m,
+            **(
+                {"min_component": self.spatial_adjust_min_component}
+                if self.spatial_adjust_min_component
+                else {}
+            ),
+            "clusters": (first or {}).get("n_components"),
+            "paired_rule": (
+                self.spatial_paired_smooth if self._basis == "exposure" else "outcome"
+            ),
+            "selections": int(self._spatial_selections["n"]),
+            "selections_at_cap": int(self._spatial_selections["at_cap"]),
+            "at_cap": bool(self._spatial_selections["at_cap"]),
+        }
 
     def _finalize_composite(self, composite: np.ndarray) -> np.ndarray:
         """Apply the ``whole_grid_scaling`` toggle to the written composite map.
@@ -5240,6 +6270,7 @@ class MetricFusionEngine:
                 zip(
                     fusion_df["polygon_id"].to_numpy(),
                     fusion_df[group_col].to_numpy(),
+                    strict=True,
                 )
             )
             keys = np.array(
@@ -5272,7 +6303,9 @@ class MetricFusionEngine:
             )
         except Exception:
             return None
-        block_by_group = dict(zip(agg.index.to_numpy(), block_ids.tolist()))
+        block_by_group = dict(
+            zip(agg.index.to_numpy(), block_ids.tolist(), strict=True)
+        )
         return block_by_group, info
 
     def split_data(
@@ -5284,6 +6317,7 @@ class MetricFusionEngine:
         spatial_split: bool = False,
         spatial_block_size_m: float | None = None,
         n_spatial_blocks: int | None = None,
+        spatial_split_mode: str = "stripe",
     ) -> None:
         """Carve a held-out test set and the train+val pool the bootstrap
         the sweep splits.
@@ -5304,7 +6338,17 @@ class MetricFusionEngine:
                 tiles the full extent and no group straddles train and test.
             spatial_block_size_m: Block edge length (metres) when blocking.
             n_spatial_blocks: Target block count when blocking.
+            spatial_split_mode: How test blocks are chosen
+                (:data:`SPATIAL_SPLIT_MODES`): ``stripe`` spaces them evenly
+                along the block order, so a seed can only shift the stripe;
+                ``random`` draws them at random, so each seed gives another
+                test set.
         """
+        if spatial_split_mode not in SPATIAL_SPLIT_MODES:
+            raise ValueError(
+                f"spatial_split_mode must be one of {SPATIAL_SPLIT_MODES}; "
+                f"got {spatial_split_mode!r}."
+            )
         # A fresh split invalidates the reporting-phase caches (they key off the
         # train+val / test frames this method rebuilds).
         self._full_data_cache = None
@@ -5436,28 +6480,39 @@ class MetricFusionEngine:
 
             if spatial_ok:
                 # Spatial single-split: assign whole blocks to the held-out
-                # test by even striping across the space-filling block order,
-                # so the test tiles the full extent and no group straddles
-                # train and test.
+                # test, striped evenly across the space-filling block order or
+                # drawn at random, so no group straddles train and test.
                 rng_sp = np.random.default_rng(random_state)
                 ordered_blocks = np.sort(poly_df["_block"].unique())
-                test_blocks = _helpers.stripe_to_test_blocks(
-                    ordered_blocks, test_size, rng_sp
-                )
+                if spatial_split_mode == "random":
+                    sizes = poly_df["_block"].value_counts()
+                    test_blocks = _helpers.random_test_blocks(
+                        ordered_blocks,
+                        sizes.reindex(ordered_blocks).to_numpy(),
+                        test_size,
+                        rng_sp,
+                    )
+                else:
+                    test_blocks = _helpers.stripe_to_test_blocks(
+                        ordered_blocks, test_size, rng_sp
+                    )
                 test_mask = poly_df["_block"].isin(test_blocks)
                 test_poly = poly_df[test_mask].copy()
                 train_val_poly = poly_df[~test_mask].copy()
+                share = len(test_poly) / max(n_polys, 1)
                 _log(
                     "INFO",
-                    f"Spatial block test split: {len(test_blocks)} of "
+                    f"Spatial block test split ({spatial_split_mode}, seed "
+                    f"{random_state}): {len(test_blocks)} of "
                     f"{len(ordered_blocks)} blocks held out — "
                     f"train+val={len(train_val_poly)} {group_label}s, "
-                    f"test={len(test_poly)} {group_label}s.",
+                    f"test={len(test_poly)} {group_label}s ({share:.1%}).",
                 )
-                share = len(test_poly) / max(n_polys, 1)
                 self._spatial_split_report = {
                     "block_size_m": float(binfo.get("block_size_m", 0.0)),
                     "rule": binfo.get("rule"),
+                    "mode": spatial_split_mode,
+                    "seed": int(random_state),
                     "occupied_blocks": int(len(ordered_blocks)),
                     "test_blocks": int(len(test_blocks)),
                     "test_share": float(share),
@@ -5545,6 +6600,7 @@ class MetricFusionEngine:
             self.cv_folds = []
             self._spatial_basis_cache = {}
             self._spatial_adjust_summary = None
+            self._select_scales()
             return
 
         # ── Row-level (point / raster) split ────────────────
@@ -5576,6 +6632,146 @@ class MetricFusionEngine:
         self.cv_folds = []
         self._spatial_basis_cache = {}
         self._spatial_adjust_summary = None
+        self._select_scales()
+
+    # ── Scale selection (Keller & Szpiro 2020) ──────────────────
+
+    def _selection_eps(self) -> float:
+        """The one cluster gap every candidate scale is built on."""
+        from . import spatial_scale_selection as _ss
+
+        if self.spatial_adjust_eps_m is not None:
+            return self.spatial_adjust_eps_m
+        return _ss.DEFAULT_EPS_M
+
+    def _selection_scales(self) -> tuple[float, ...]:
+        from . import spatial_scale_selection as _ss
+
+        return self.spatial_select_scales_m or tuple(
+            float(v) for v in _ss.DEFAULT_SCALES_M
+        )
+
+    def _entity_rows(self, data: "pd.DataFrame | None") -> "dict | None":
+        """One row per entity of ``data``: locations, target, controls and
+        covariates, ``None`` without locations."""
+        if data is None or len(data) == 0:
+            return None
+        if "_cx" not in data.columns or "_cy" not in data.columns:
+            return None
+        cov_cols = [c for c in (self.covariate_columns or []) if c in data.columns]
+        controls = [c for c in self.negative_control_columns if c in data.columns]
+        cols = ["_cx", "_cy", "target", *controls, *cov_cols]
+        frame = (
+            data.groupby("polygon_id", sort=False)[cols].first()
+            if "polygon_id" in data.columns
+            else data[cols]
+        )
+        return {
+            "xy": frame[["_cx", "_cy"]].to_numpy(dtype=np.float64),
+            "target": pd.to_numeric(frame["target"], errors="coerce").to_numpy(
+                dtype=np.float64
+            ),
+            "controls": {
+                c: pd.to_numeric(frame[c], errors="coerce").to_numpy(dtype=np.float64)
+                for c in controls
+            },
+            "cov": (frame[cov_cols].to_numpy(dtype=np.float64) if cov_cols else None),
+        }
+
+    def _select_scales(self) -> None:
+        """The AIC-NE / BIC-NE profile of the split's train+val rows.
+
+        Every basis run profiles the outcome model without the exposure
+        (covariates, then each candidate scale's basis on one set of clusters)
+        for the target and each negative control. Under
+        ``spatial_adjust_select = "scale_ic"`` the target's choice by
+        ``spatial_select_criterion`` becomes the reported scale (``None`` = no
+        smooth) and, with ``spatial_select_controls = "own"``, every control
+        its own; under ``spatial_tune_select = "scale_ic"`` the same choice is
+        the tuning scale. The test rows never enter.
+        """
+        from . import spatial_scale_selection as _ss
+
+        self._scale_profile = None
+        self._control_scales = {}
+        if self.spatial_adjust_method != "basis" or self.is_panel:
+            return
+        rows = self._entity_rows(self.train_val_data)
+        if rows is None:
+            return
+        profile = _ss.profile(
+            rows["xy"],
+            {"target": rows["target"], **rows["controls"]},
+            rows["cov"],
+            self._selection_scales(),
+            eps_m=self._selection_eps(),
+            neighbours=self.spatial_adjust_neighbours,
+            min_component=self.spatial_adjust_min_component
+            or spatial_basis.DEFAULT_MIN_COMPONENT,
+        )
+        stages = ["reporting"]
+        if self.spatial_tune_select == "scale_ic":
+            stages.append("tuning")
+        self._scale_profile = [
+            {"stage": stage, **r} for stage in stages for r in profile
+        ]
+        crit = self.spatial_select_criterion
+
+        def pick(outcome):
+            scale = _ss.chosen(profile, outcome, crit)
+            return None if scale == "missing" else scale
+
+        if self.spatial_adjust_select == "scale_ic":
+            self._spatial_scale = pick("target")
+            if self.spatial_select_controls == "own":
+                self._control_scales = {c: pick(c) for c in rows["controls"]}
+        if self.spatial_tune_select == "scale_ic":
+            self.spatial_tune_scale_m = pick("target")
+
+    def effective_bandwidths(self, *, seed: int = 0) -> list[dict]:
+        """``k̂`` of every candidate scale's basis on the held-out rows (and on
+        the train+val rows when the tuning scale is selected), by the Keller &
+        Szpiro and the Rainey & Keller rules
+        (:func:`spatial_scale_selection.effective_bandwidth`)."""
+        from . import spatial_scale_selection as _ss
+
+        if self.spatial_adjust_method != "basis" or self.is_panel:
+            return []
+        sets = [("test", self.test_data)]
+        if self.spatial_tune_select == "scale_ic":
+            sets.append(("train_val", self.train_val_data))
+        out = []
+        for row_set, data in sets:
+            rows = self._entity_rows(data)
+            if rows is None:
+                continue
+            xy = rows["xy"][np.isfinite(rows["xy"]).all(axis=1)]
+            bases = _ss.candidate_bases(
+                xy,
+                self._selection_scales(),
+                eps_m=self._selection_eps(),
+                neighbours=self.spatial_adjust_neighbours,
+                min_component=self.spatial_adjust_min_component
+                or spatial_basis.DEFAULT_MIN_COMPONENT,
+            )
+            for scale, basis in bases.items():
+                cols = _ss._columns(basis)
+                k = _ss.effective_bandwidth(
+                    xy,
+                    _ss.basis_labels(basis, len(xy)),
+                    _ss.projection_weights(cols),
+                    seed=seed,
+                )
+                out.append(
+                    {
+                        "row_set": row_set,
+                        "smooth": f"{scale:g}",
+                        "scale_m": scale,
+                        "columns": int(cols.shape[1]),
+                        **k,
+                    }
+                )
+        return out
 
     def _effective_time_fixed(self, spec) -> bool:
         """The spec's time fixed effect, minus the case where wave indicators
@@ -5599,64 +6795,6 @@ class MetricFusionEngine:
             return True
         return self.is_longitudinal and metric in mixed_effects_scoring.HAS_PVALUE
 
-    def _fold_fast_components(self, static: dict):
-        """Per-fold ``(D, σ²)`` for the fast search scorer, cached on the static.
-
-        Returns ``None`` (caller uses the exact per-trial fit) when the engine
-        is not longitudinal, a spatial smooth is active, the fold lacks entity /
-        time keys, or estimation fails. Computed once per fold subset and reused
-        by every trial of that fold — the whole point of the fast path.
-        """
-        if "fast_components" in static:
-            return static["fast_components"]
-        comp = None
-        spec = self.longitudinal_spec
-        if (
-            self.is_longitudinal
-            and spec is not None
-            and self.search_scoring_method
-            in mixed_effects_scoring.FAST_COMPONENT_METHODS
-            and self.spatial_adjust_method == "none"
-            and static.get("entity_id") is not None
-            and static.get("ysb") is not None
-        ):
-            comp = mixed_effects_scoring.estimate_fold_components(
-                static["target"],
-                static.get("cov"),
-                static["ysb"],
-                static["entity_id"],
-                method=self.search_scoring_method,
-                include_time_fixed=self._effective_time_fixed(spec),
-                random_slope=spec.random_slope_time,
-                target=spec.association_target,
-            )
-        static["fast_components"] = comp
-        return comp
-
-    def _fold_gee_baseline(self, static: dict):
-        """Per-fold covariates-only GEE fit for the fast binary panel scorer.
-
-        The binary analogue of :meth:`_fold_fast_components`: the null model's
-        fitted probabilities, working weights and exchangeable correlation are
-        properties of the outcome and covariates, so they are estimated once per
-        fold and every trial takes one Newton step from them. ``None`` sends the
-        caller to the exact per-trial GEE fit.
-        """
-        if "gee_baseline" in static:
-            return static["gee_baseline"]
-        baseline = None
-        if (
-            self.is_longitudinal
-            and self.search_scoring_method != "exact"
-            and self.spatial_adjust_method == "none"
-            and static.get("entity_id") is not None
-        ):
-            baseline = binary_longitudinal.estimate_fold_baseline(
-                static["target"], static["entity_id"], static.get("cov")
-            )
-        static["gee_baseline"] = baseline
-        return baseline
-
     def _score_greenery(
         self,
         metric: str,
@@ -5670,7 +6808,6 @@ class MetricFusionEngine:
         return_pvalue: bool = False,
         return_all: bool = False,
         nan_on_fail: bool = False,
-        fast_components: "tuple[np.ndarray, float] | object | None" = None,
     ):
         """Single scoring seam: MixedLM (longitudinal) or OLS (cross-sectional).
 
@@ -5696,20 +6833,7 @@ class MetricFusionEngine:
         """
         if self.is_longitudinal and metric in longitudinal.GEE_LOGIT_METRICS:
             # Binary outcome on a panel: GEE with an exchangeable working
-            # correlation clustered on the entity. ``fast_components`` carries a
-            # GEEFoldBaseline here (the search path); its absence, or an exact
-            # reporting call, takes the full refit.
-            if (
-                isinstance(fast_components, binary_longitudinal.GEEFoldBaseline)
-                and not return_all
-            ):
-                return binary_longitudinal.score_gee_logit_fast(
-                    metric,
-                    composite,
-                    fast_components,
-                    return_all=return_all,
-                    return_pvalue=return_pvalue,
-                )
+            # correlation clustered on the entity.
             return binary_longitudinal.score_gee_logit(
                 metric,
                 target,
@@ -5723,30 +6847,6 @@ class MetricFusionEngine:
         if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
             spec = self.longitudinal_spec
             assert spec is not None  # guaranteed by is_longitudinal
-            # Fast fixed-V GLS path for the trial search: reuse the per-fold
-            # variance components, one GLS per trial instead of a MixedLM fit.
-            # Only for the ranking metrics, with no spatial smooth, and never
-            # for the exact reporting calls (return_all / no components).
-            if (
-                fast_components is not None
-                and not return_all
-                and metric in mixed_effects_scoring.FAST_SEARCH_METRICS
-                and self.spatial_adjust_method == "none"
-            ):
-                return mixed_effects_scoring.score_mixedlm_fast(
-                    metric,
-                    target,
-                    composite,
-                    entity_id=entity_id,
-                    years_since_baseline=years_since_baseline,
-                    covariates=covariates,
-                    components=fast_components,
-                    include_time_fixed=self._effective_time_fixed(spec),
-                    random_slope=spec.random_slope_time,
-                    return_pvalue=return_pvalue,
-                    nan_on_fail=nan_on_fail,
-                    target=spec.association_target,
-                )
             return mixed_effects_scoring.score_mixedlm(
                 metric,
                 target,
@@ -5760,7 +6860,7 @@ class MetricFusionEngine:
                 return_all=return_all,
                 nan_on_fail=nan_on_fail,
                 spatial_basis=spatial_basis,
-                spatial_method=self.spatial_adjust_method,
+                spatial_method=self._scoring_spatial_method,
                 target=spec.association_target,
             )
         return objective_scoring.score(
@@ -5770,8 +6870,8 @@ class MetricFusionEngine:
             covariates=covariates,
             return_pvalue=return_pvalue,
             spatial_basis=spatial_basis,
-            spatial_method=self.spatial_adjust_method,
-            residualize_method=self.residualize_method,
+            spatial_method=self._scoring_spatial_method,
+            **self._residualize_options,
             pdcor_cache=self._pdcor_cache,
             spline_cache=self._spline_basis_cache,
         )
@@ -5845,12 +6945,11 @@ class MetricFusionEngine:
 
         logger.info("Evaluating on held-out test set...")
 
-        # Apply dynamic circular buffer aggregation over this job's own channel
-        # set. Both points and rasters use the same approach (rasters converted
-        # to points).
+        # Read each channel's neighbourhood values over this job's own channel
+        # set from the pre-aggregation cache (rasters are converted to points).
         # .loc with an index array materialises a new frame; read-only below.
         test_points = self.target_gdf.loc[self.test_data.index]
-        test_blocks = self._aggregate_channels(test_points, params, subset="test")
+        test_blocks = self._aggregate_channels(test_points, params)
 
         test_combined = np.column_stack(list(test_blocks.values()))
         test_valid_mask = ~np.isnan(test_combined).any(axis=1)
@@ -5932,9 +7031,9 @@ class MetricFusionEngine:
             test_pval = None
 
         result = {"test_score": test_score, "metric": metric}
-        if self.spatial_adjust_method != "none":
+        if self._basis != "none":
             result["spatial_adjustment"] = self._spatial_adjust_summary or {
-                "method": self.spatial_adjust_method,
+                **self._method_record(),
                 "applied": False,
             }
         if test_pval is not None:
@@ -6017,15 +7116,13 @@ class MetricFusionEngine:
         blocks: dict[str, np.ndarray] = {}
         for ch in channels:
             radius, stat, pct = self._channel_spec(params, ch)
-            blocks[ch] = self._aggregate_with_ring_cache(
+            blocks[ch] = self._cached_channel_values(
                 points,
                 self._channel_source(ch),
                 radius,
                 stat,
                 pct,
                 channel=ch,
-                fold_idx=None,
-                subset=None,
             )
 
         cov_cols = self.covariate_columns
@@ -6129,7 +7226,7 @@ class MetricFusionEngine:
                 include_time_fixed=self._effective_time_fixed(spec),
                 random_slope=spec.random_slope_time,
                 spatial_basis=res.get("spatial_basis"),
-                spatial_method=self.spatial_adjust_method,
+                spatial_method=self._scoring_spatial_method,
                 n_bootstrap=min(int(n_bootstrap), self._MIXEDLM_TEST_CI_BOOTSTRAP_CAP),
                 ci_level=float(ci_level),
                 seed=int(seed),
@@ -6163,7 +7260,7 @@ class MetricFusionEngine:
                     p_arr,
                     covariates=None,
                     return_pvalue=False,
-                    residualize_method=self.residualize_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -6182,8 +7279,8 @@ class MetricFusionEngine:
                     covariates=cov_part,
                     return_pvalue=False,
                     spatial_basis=sb_part,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    spatial_method=self._scoring_spatial_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -6212,9 +7309,44 @@ class MetricFusionEngine:
             ),
             groups=groups,
             cancel_callback=self._cancel_callback,
+            batch_scorer_factory=self._replicate_scorers(metric, n_cov_cols)[0],
         )
         ci["n"] = n
         return ci
+
+    def _block_resampling(self, metric: str) -> bool:
+        """Whether resampled ``metric`` scores take :mod:`geofuse.resampling`.
+
+        The block engine serves the incremental R² (and, through each
+        replicate's residuals, ``distance_corr`` and ``nrmse``) once a spatial
+        smooth joins the controls, where per-replicate ``lstsq`` over the
+        smooth's columns dominates a report. A replicate must be a row
+        selection of fixed columns, which spline-expanded covariates are not
+        (their knots move with the rows), nor rank-transformed ones
+        (``spearman``); without a smooth the direct fits take seconds. Those
+        keep the per-replicate fits.
+        """
+        return (
+            metric in ("r2", *resampling.RESIDUAL_METRICS)
+            and self._basis != "none"
+            and self.residualize_method == "linear"
+        )
+
+    def _replicate_scorers(self, metric: str, n_cov_cols: int) -> tuple:
+        """``(bootstrap, permutation)`` scorer factories of the block engine
+        for ``[covariates | smooth]`` controls, ``(None, None)`` without it."""
+        if not self._block_resampling(metric):
+            return None, None
+        if metric == "r2":
+            return (
+                resampling.r2_bootstrap_scorer(n_cov_cols),
+                resampling.r2_permutation_scorer(n_cov_cols),
+            )
+        method = self._scoring_spatial_method
+        return (
+            resampling.residual_bootstrap_scorer(metric, n_cov_cols, method),
+            resampling.residual_permutation_scorer(metric, n_cov_cols, method),
+        )
 
     def _full_data_frame(self) -> "pd.DataFrame | None":
         """train+val+test union frame, concatenated once and cached.
@@ -6263,10 +7395,10 @@ class MetricFusionEngine:
         # .loc with an index array materialises a new frame; read-only below.
         all_points = self.target_gdf.loc[all_data.index]
 
-        # Apply circular buffer aggregation with optimized parameters, over the
+        # Read the channels at the optimized parameters, over the
         # job's own channel set — the same fork evaluate_on_test uses, so the
         # applied composite and the held-out score agree.
-        all_blocks = self._aggregate_channels(all_points, weights, subset="all")
+        all_blocks = self._aggregate_channels(all_points, weights)
 
         composite = self._composite_from(weights, all_blocks)
 
@@ -6521,7 +7653,7 @@ class MetricFusionEngine:
         is degenerate.
         """
         n_cov_cols = 0 if cov is None else int(np.asarray(cov).shape[1])
-        if self.spatial_adjust_method == "none":
+        if self._basis == "none":
             return cov, n_cov_cols
         sb = self._spatial_basis_columns(
             self._whole_data_coords(df), target, cov, composite
@@ -6578,8 +7710,8 @@ class MetricFusionEngine:
                     c_arr,
                     cov_part,
                     spatial_basis=sb_part,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    spatial_method=self._scoring_spatial_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
@@ -6606,6 +7738,7 @@ class MetricFusionEngine:
             if t_arr is None or c_arr is None or len(t_arr) < 3:
                 return out
             _score_fn = _make_score_fn(n_cov_cols)
+            boot_scorer, perm_scorer = self._replicate_scorers(metric, n_cov_cols)
             try:
                 ci = _stats_mod.bootstrap_score_ci(
                     t_arr,
@@ -6618,6 +7751,7 @@ class MetricFusionEngine:
                     covariates=cov,
                     replicate_scorer_factory=rep_factory,
                     cancel_callback=self._cancel_callback,
+                    batch_scorer_factory=boot_scorer,
                 )
                 out["score"] = ci.get("observed")
                 out["lower"] = ci.get("lower")
@@ -6636,6 +7770,7 @@ class MetricFusionEngine:
                         covariates=cov,
                         surrogate_scorer_factory=sur_factory,
                         cancel_callback=self._cancel_callback,
+                        permutation_scorer_factory=perm_scorer,
                     )
                     out["p_value"] = perm.get("p_value")
                     if out["score"] is None:
@@ -6783,7 +7918,7 @@ class MetricFusionEngine:
                     include_time_fixed=self._effective_time_fixed(spec),
                     random_slope=spec.random_slope_time,
                     spatial_basis=sb,
-                    spatial_method=self.spatial_adjust_method,
+                    spatial_method=self._scoring_spatial_method,
                     n_bootstrap=n_boot,
                     ci_level=ci_level,
                     seed=int(sub_seed),
@@ -7068,22 +8203,28 @@ class MetricFusionEngine:
     ) -> dict | None:
         """Objective difference between CGI and the best standalone.
 
-        The observed difference and both scores use every row; the bootstrap
-        interval and p-value come from the held-out rows
-        (:func:`exposure_response.split_inference`), the only rows that chose
-        neither composite.
+        The headline difference, both scores, the bootstrap interval and the
+        p-value all come from the held-out rows, the only rows that chose
+        neither composite, so the estimate sits inside its own interval. The
+        same quantities on every row are descriptive and carry an ``_all``
+        suffix (``observed_diff_all``, ``cgi_score_all``,
+        ``standalone_score_all``, ``n_all``). When the held-out rows cannot be
+        scored the headline keys are ``None``.
         """
         kw = {"n_bootstrap": n_bootstrap, "ci_level": ci_level, "seed": seed}
         args = (cgi_params, standalone_params, standalone_channel, metric)
         whole = self._paired_difference_on(*args, bootstrap=False, **kw)
         if whole is None:
             return None
-        held = self._paired_difference_on(*args, held_out=True, **kw)
-        out = exposure_response.split_inference(whole, held)
-        # Present even when the held-out half could not be scored, so readers
-        # see "no inference" rather than a missing key.
-        for k in ("lower", "upper", "p_value"):
+        held = self._paired_difference_on(
+            *args, held_out=True, bootstrap=int(n_bootstrap) > 0, **kw
+        )
+        out = dict(held or {})
+        for k in PAIRED_HEADLINE_KEYS:
             out.setdefault(k, None)
+        for k in ("observed_diff", "cgi_score", "standalone_score", "n"):
+            out[f"{k}_all"] = whole.get(k)
+        out["standalone_channel"] = standalone_channel
         out["inference_n"] = None if held is None else held["n"]
         return out
 
@@ -7114,6 +8255,11 @@ class MetricFusionEngine:
         built. ``p_value`` is the one-sided bootstrap tail (share of replicates
         with difference ≤ 0). Without ``bootstrap`` only the observed
         difference is computed.
+
+        With spatial adjustment each composite is scored with the smooth
+        :attr:`spatial_paired_smooth` gives it (:meth:`_paired_smooths`); a
+        resample carries both smooths' columns with its rows, and the result
+        records the rule and each side's df under ``spatial_adjustment``.
         """
         if metric not in objective_scoring.SUPPORTED_METRICS:
             if self.is_longitudinal and metric in mixed_effects_scoring.MIXEDLM_METRICS:
@@ -7176,10 +8322,12 @@ class MetricFusionEngine:
             target = merged["target"].to_numpy(dtype=np.float64)
             cgi_c = merged["composite_cgi"].to_numpy(dtype=np.float64)
             std_c = merged["composite_std"].to_numpy(dtype=np.float64)
-            # Both composites share the same outcome-selected smooth; it rides in
-            # the resampled controls and is split back out per replicate so the
-            # paired difference is adjusted exactly as the objective was.
-            cov, n_cov_cols = self._augment_cov_with_spatial(merged, target, cgi_c, cov)
+            n_cov_cols = 0 if cov is None else int(np.asarray(cov).shape[1])
+            # Each composite's smooth under the paired rule; the smooths ride
+            # in the resampled rows and join each side's controls per replicate.
+            s_cgi, s_std, spatial_record = self._paired_smooths(
+                self._whole_data_coords(merged), target, cov, cgi_c, std_c
+            )
         except Exception as exc:
             logger.warning(f"paired_objective_difference: alignment failed: {exc}")
             return None
@@ -7188,19 +8336,24 @@ class MetricFusionEngine:
         # anyway, and doing it here keeps the shared-distance-matrix replicate
         # path (which cannot mask per composite) available for the whole loop.
         finite = np.isfinite(target) & np.isfinite(cgi_c) & np.isfinite(std_c)
-        if cov is not None:
-            finite &= np.isfinite(cov).all(axis=1)
+        for block in (cov, s_cgi, s_std):
+            if block is not None:
+                finite &= np.isfinite(block).all(axis=1)
         if not finite.all():
             target = target[finite]
             cgi_c = cgi_c[finite]
             std_c = std_c[finite]
-            if cov is not None:
-                cov = cov[finite]
+            cov = None if cov is None else cov[finite]
+            shared = s_std is s_cgi
+            s_cgi = None if s_cgi is None else s_cgi[finite]
+            s_std = s_cgi if shared else (None if s_std is None else s_std[finite])
             if eid is not None:
                 eid = eid[finite]
 
         if len(target) < 3:
             return None
+        ctrl_cgi = self._with_smooth(cov, s_cgi)
+        ctrl_std = ctrl_cgi if s_std is s_cgi else self._with_smooth(cov, s_std)
 
         # A panel's waves are resampled with their entity, as the test-score
         # bootstrap does, so correlated rows are not counted as independent.
@@ -7222,15 +8375,15 @@ class MetricFusionEngine:
                     c_arr,
                     cov_part,
                     spatial_basis=sb_part,
-                    spatial_method=self.spatial_adjust_method,
-                    residualize_method=self.residualize_method,
+                    spatial_method=self._scoring_spatial_method,
+                    **self._residualize_options,
                     pdcor_cache=self._pdcor_cache,
                     spline_cache=self._spline_basis_cache,
                 )
             )
 
-        obs_cgi = _score(target, cgi_c, cov)
-        obs_std = _score(target, std_c, cov)
+        obs_cgi = _score(target, cgi_c, ctrl_cgi)
+        obs_std = _score(target, std_c, ctrl_std)
         obs_diff = sign * (obs_cgi - obs_std)
         result = {
             "observed_diff": float(obs_diff),
@@ -7240,6 +8393,8 @@ class MetricFusionEngine:
             "n": int(len(target)),
             "favors_cgi": bool(obs_diff > 0),
         }
+        if spatial_record is not None:
+            result["spatial_adjustment"] = spatial_record
         if not bootstrap:
             return result
 
@@ -7247,28 +8402,60 @@ class MetricFusionEngine:
         # on the same resample, so the target / conditioning distance matrices
         # are precomputed once and shared. Requires fully finite inputs (the
         # generic path masks NaN rows inside score(), which an index-vector
-        # scorer cannot reproduce per composite).
+        # scorer cannot reproduce per composite) and one control matrix.
         fast_pair = None
-        if metric == "partial_distance_corr" and cov is not None:
-            fast_pair = pdcor.pdcor_paired_replicate_scorers(target, cgi_c, std_c, cov)
+        if (
+            metric == "partial_distance_corr"
+            and ctrl_cgi is not None
+            and ctrl_std is ctrl_cgi
+        ):
+            fast_pair = pdcor.pdcor_paired_replicate_scorers(
+                target, cgi_c, std_c, ctrl_cgi
+            )
+        engine = None
+        if metric == "r2" and self._block_resampling(metric) and s_cgi is not None:
+            engine = self._paired_engine(target, cgi_c, std_c, cov, s_cgi, s_std)
 
         rng = np.random.default_rng(int(seed))
         n = len(target)
         diffs = np.empty(int(n_bootstrap), dtype=np.float64)
-        for i in range(int(n_bootstrap)):
+
+        def draw():
             if blocks is None:
-                idx = rng.integers(0, n, size=n)
-            else:
-                picks = rng.integers(0, len(blocks), size=len(blocks))
-                idx = np.concatenate([blocks[j] for j in picks])
+                return rng.integers(0, n, size=n)
+            picks = rng.integers(0, len(blocks), size=len(blocks))
+            return np.concatenate([blocks[j] for j in picks])
+
+        if engine is not None:
+            for start in range(0, int(n_bootstrap), resampling.CHUNK):
+                if self._cancel_callback is not None and self._cancel_callback():
+                    raise JobCancelled("Paired bootstrap cancelled by user.")
+                stop = min(start + resampling.CHUNK, int(n_bootstrap))
+                W = np.stack(
+                    [np.bincount(draw(), minlength=n) for _ in range(start, stop)]
+                ).astype(np.float64)
+                try:
+                    sc, ss = engine(W)
+                    diffs[start:stop] = sign * (sc - ss)
+                except Exception:
+                    diffs[start:stop] = np.nan
+        for i in range(0 if engine is not None else int(n_bootstrap)):
+            idx = draw()
             try:
                 if fast_pair is not None:
                     sc = fast_pair[0](idx)
                     ss = fast_pair[1](idx)
                 else:
-                    cov_i = None if cov is None else cov[idx]
-                    sc = _score(target[idx], cgi_c[idx], cov_i)
-                    ss = _score(target[idx], std_c[idx], cov_i)
+                    sc = _score(
+                        target[idx],
+                        cgi_c[idx],
+                        None if ctrl_cgi is None else ctrl_cgi[idx],
+                    )
+                    ss = _score(
+                        target[idx],
+                        std_c[idx],
+                        None if ctrl_std is None else ctrl_std[idx],
+                    )
                 diffs[i] = sign * (sc - ss)
             except Exception:
                 diffs[i] = np.nan
@@ -7283,6 +8470,123 @@ class MetricFusionEngine:
             p_value=float((np.sum(valid <= 0.0) + 1) / (len(valid) + 1)),
         )
         return result
+
+    @staticmethod
+    def _paired_engine(target, cgi_c, std_c, cov, s_cgi, s_std):
+        """Both composites' incremental R² per row of a weight matrix.
+
+        One design when the two share a smooth (both responses read off one
+        set of cross-products), one per composite otherwise.
+        """
+        t = target
+        if s_std is s_cgi:
+            design = resampling.BlockDesign(len(t), cov, s_cgi)
+            R = np.column_stack([t, cgi_c, std_c])
+
+            def both(W):
+                M = design.cross(R, W)
+                sst = resampling.weighted_sst(t, W)
+                return tuple(
+                    resampling.incremental_r2(
+                        M[:, [0, j]][:, :, [0, j]],
+                        sst,
+                        resampling.weighted_sst(x, W),
+                    )
+                    for j, x in ((1, cgi_c), (2, std_c))
+                )
+
+            return both
+        designs = [
+            (resampling.BlockDesign(len(t), cov, s), np.column_stack([t, x]), x)
+            for s, x in ((s_cgi, cgi_c), (s_std, std_c))
+        ]
+
+        def each(W):
+            sst = resampling.weighted_sst(t, W)
+            return tuple(
+                resampling.incremental_r2(
+                    d.cross(R, W), sst, resampling.weighted_sst(x, W)
+                )
+                for d, R, x in designs
+            )
+
+        return each
+
+    def _paired_smooths(self, coords, target, cov, cgi_c, other_c):
+        """The two smooths of a paired CGI-vs-exposure test, and their record.
+
+        ``(smooth of the CGI, smooth of the other exposure, record)``; the same
+        array twice when the two share one, ``(None, None, None)`` unadjusted.
+        When the exposure model picks the df, :attr:`spatial_paired_smooth`
+        decides: ``own``
+        selects each smooth on its exposure (as when each is scored alone),
+        ``cgi`` gives both the CGI's, ``outcome`` both one selected on the
+        outcome given the covariates (the outcome-model rule), ``max`` both the
+        larger of the two exposures' dfs. When the outcome model picks the df
+        the smooth is selected on the outcome already, so every rule is
+        ``outcome``. The record is
+        ``{"method", "rule", "df_cgi", "df_exposure"}``.
+        """
+        method = self._basis
+        if method == "none" or coords is None:
+            return None, None, None
+        if self._spatial_scale is not None or self.spatial_adjust_select == "scale_ic":
+            chosen = self._spatial_selection(coords, target, cov, cgi_c)
+            s = None if chosen is None else chosen["columns"]
+            df = None if chosen is None else chosen["df"]
+            return (
+                s,
+                s,
+                {
+                    **self._method_record(),
+                    "rule": "shared",
+                    "df_cgi": df,
+                    "df_exposure": df,
+                    "scale_m": self._spatial_scale,
+                    **self._selected_tag(),
+                },
+            )
+        rule = self.spatial_paired_smooth if method == "exposure" else "outcome"
+
+        def cols(chosen):
+            if chosen is None or chosen["columns"] is None:
+                return None, None
+            return chosen["columns"], chosen["df"]
+
+        if rule == "outcome":
+            s, df = cols(
+                self._spatial_selection(coords, target, cov, cgi_c, on="outcome")
+            )
+            s_cgi = s_std = s
+            df_cgi = df_std = df
+        else:
+            s_cgi, df_cgi = cols(self._spatial_selection(coords, target, cov, cgi_c))
+            s_std, df_std = s_cgi, df_cgi
+            if rule != "cgi":
+                s_std, df_std = cols(
+                    self._spatial_selection(coords, target, cov, other_c)
+                )
+            if rule == "max":
+                dfs = [d for d in (df_cgi, df_std) if d is not None]
+                df_cgi = df_std = max(dfs) if dfs else None
+                s_cgi = s_std = self._smooth_at(coords, target, cov, df_cgi)
+        record = {
+            **self._method_record(),
+            "rule": rule,
+            "df_cgi": df_cgi,
+            "df_exposure": df_std,
+        }
+        return s_cgi, s_std, record
+
+    def _smooth_at(self, coords, target, cov, df):
+        """The split's smooth at a given df (``None`` at ``None``)."""
+        if df is None:
+            return None
+        key = _helpers.spatial_cache_key(
+            np.asarray(coords, dtype=np.float64), target, cov
+        )
+        design = self._spatial_basis_cache[key]["basis"].design(int(df))
+        return design if design.shape[1] else None
 
     def compute_subset_scores(
         self,
@@ -7493,7 +8797,19 @@ class MetricFusionEngine:
         held = self._covariate_impact_on(params, metric, held_out=True)
         out = exposure_response.split_inference(whole, held)
         out["inference_n"] = None if held is None else held.get("n")
+        label = self._smooth_not_applied
+        if label:
+            out["spatial_adjustment"] = label
+            for row in out.get("per_covariate") or []:
+                row["spatial_adjustment"] = label
         return out
+
+    @property
+    def _smooth_not_applied(self) -> str | None:
+        """``"not applied"`` in a spatially adjusted run, for the reports that
+        control for the covariates only (exposure-response, moderation,
+        covariate impact); ``None`` otherwise."""
+        return "not applied" if _spatially_adjusted(self) else None
 
     def _covariate_impact_on(
         self, params: dict, metric: str, *, held_out: bool = False
@@ -7764,7 +9080,7 @@ class MetricFusionEngine:
         standard errors on a panel — so no table counts one entity's waves as
         independent evidence.
         Pass ``iqr`` to pin the scaling constant, e.g.
-        ``exposure_response.CLSA_NDVI_IQR`` when the point is to land on a
+        ``exposure_response.REFERENCE_NDVI_IQR`` when the point is to land on a
         published NDVI number.
 
         Estimates, contrasts and the curve use every row and are descriptive;
@@ -7783,6 +9099,8 @@ class MetricFusionEngine:
         )
         out = exposure_response.split_inference(whole, test)
         out["inference_n"] = None if test is None else test["n"]
+        if self._smooth_not_applied:
+            out["spatial_adjustment"] = self._smooth_not_applied
         return out
 
     def _exposure_response_on(
@@ -7865,7 +9183,7 @@ class MetricFusionEngine:
                     composite, fitter, cov, logistic=binary, cut_points=cut_points
                 ),
                 "nonlinearity": exposure_response.spline_nonlinearity_test(
-                    composite, fitter, cov
+                    composite, fitter, cov, df=self.exposure_response_spline_df
                 ),
             }
         except Exception as exc:
@@ -7903,6 +9221,8 @@ class MetricFusionEngine:
             held = test.get(r["moderator"])
             merged = exposure_response.split_inference(r, held)
             merged["inference_n"] = None if held is None else held["n"]
+            if self._smooth_not_applied:
+                merged["spatial_adjustment"] = self._smooth_not_applied
             out.append(merged)
         return out
 
@@ -7994,9 +9314,11 @@ class MetricFusionEngine:
         Comparator columns ride the same way and are left out of only their own
         statistics.
         """
+        weight = getattr(self, "weight_column", None)
         for role, cols in (
             ("Negative control", self.negative_control_columns),
             ("Comparator", self.comparator_columns),
+            ("Weight", [weight] if weight else []),
         ):
             for col in cols:
                 if col in fusion_df.columns:
@@ -8005,6 +9327,17 @@ class MetricFusionEngine:
                     _log("WARN", f"{role} '{col}' is not a target column; skipped.")
                     continue
                 fusion_df[col] = pd.to_numeric(entity_gdf[col], errors="coerce").values
+        # The null-group and Spatial+ group columns keep their labels (an area
+        # name is text).
+        for role, group in (
+            ("Null group", getattr(self, "null_group_column", None)),
+            ("Spatial+ group", getattr(self, "spatial_plus_groups_column", None)),
+        ):
+            if group and group not in fusion_df.columns:
+                if group in entity_gdf.columns:
+                    fusion_df[group] = entity_gdf[group].to_numpy()
+                else:
+                    _log("WARN", f"{role} '{group}' is not a target column.")
 
     def _test_entity_mask(self, df: "pd.DataFrame") -> np.ndarray:
         """Rows of an ``apply_fusion`` frame that belong to the held-out split."""
@@ -8023,7 +9356,10 @@ class MetricFusionEngine:
         reporting covariates, with its exact interval and ``n`` (rows where both
         are observed; see :func:`negative_controls.partial_slope`). The slope is
         the one the negative-control transfer test reports, so an exposure's
-        effect and its specificity read on one scale.
+        effect and its specificity read on one scale. With spatial adjustment
+        on, both sides are also residualised on the split's spatial smooth
+        (:meth:`_slope_smooths`) and each entry records it under
+        ``spatial_adjustment``.
         """
         from . import negative_controls as _nc
 
@@ -8031,6 +9367,7 @@ class MetricFusionEngine:
         target = np.asarray(df["target"].values, dtype=np.float64)
         composite = np.asarray(df["composite"].values, dtype=np.float64)
         cov = self._reporting_covariate_matrix(df)
+        coords = self._whole_data_coords(df)
         test = self._test_entity_mask(df)
         out: dict[str, dict] = {}
         for split, rows in (
@@ -8038,10 +9375,124 @@ class MetricFusionEngine:
             ("train_val", ~test),
             ("all", np.ones(len(df), dtype=bool)),
         ):
-            out[split] = _nc.partial_slope(
-                composite[rows], target[rows], None if cov is None else cov[rows]
+            (smooth, record), _ = self._slope_smooths(
+                coords, rows, composite, target, {}, cov
             )
+            out[split] = _nc.partial_slope(
+                composite[rows],
+                target[rows],
+                self._with_smooth(None if cov is None else cov[rows], smooth),
+            )
+            if record is not None:
+                out[split]["spatial_adjustment"] = record
         return out
+
+    # ── Spatial smooth of the reported slopes ───────────────────
+
+    def _reporting_smooth(
+        self,
+        coords: "np.ndarray | None",
+        rows: np.ndarray,
+        outcome: np.ndarray,
+        cov: "np.ndarray | None",
+        exposure: np.ndarray,
+    ) -> "tuple[np.ndarray | None, dict]":
+        """One reported slope's spatial smooth on ``rows``, and its record.
+
+        ``coords`` are :meth:`_whole_data_coords` of an ``apply_fusion`` frame
+        and ``rows`` a mask over it. The smooth is built on those rows as the
+        scores build theirs, with its df selected on ``exposure``
+        (``df_exposure_ic``) or on ``outcome`` given the covariates
+        (``df_outcome_ic``). The record is ``{"method", "df", "at_cap", "ic"}`` (the
+        last two once a selection ran: whether the largest candidate won, and
+        the criterion of every design compared); ``df`` is ``None`` when no
+        smooth is used (no coordinates, or the criterion kept none).
+        """
+        chosen = None
+        if coords is not None:
+            chosen = self._spatial_selection(
+                coords[rows],
+                outcome[rows],
+                None if cov is None else cov[rows],
+                exposure[rows],
+            )
+        record = {**self._method_record(), "df": None}
+        if self._spatial_scale is not None:
+            record["scale_m"] = self._spatial_scale
+        record.update(self._selected_tag())
+        if chosen is None:
+            return None, record
+        cols = chosen["columns"]
+        if cols is not None:
+            record["df"] = chosen["df"]
+        record["at_cap"] = chosen["at_cap"]
+        record["ic"] = chosen["ic"]
+        if self._spatial_scale is not None and cols is not None:
+            x = exposure[rows]
+            record["absorbed"] = _absorbed_share(x, cols)
+            record["absorbed_given_cov"] = _absorbed_given_cov(
+                x, None if cov is None else cov[rows], cols
+            )
+            record["chance_share"] = _chance_share(cols)
+        return cols, record
+
+    def _slope_smooths(
+        self,
+        coords: "np.ndarray | None",
+        rows: np.ndarray,
+        exposure: np.ndarray,
+        target: np.ndarray,
+        controls: dict,
+        cov: "np.ndarray | None",
+    ) -> tuple[tuple, dict]:
+        """The smooths of ``exposure``'s slopes on the target and each control.
+
+        ``((columns, record), {control: (columns, record)})`` over ``rows``
+        (:meth:`_reporting_smooth`): when the exposure model picks the df (or
+        a fixed scale sets it) one smooth serves every outcome; when the outcome
+        model does each outcome has its own, selected on it. Without spatial
+        adjustment every pair is ``(None, None)``.
+        """
+        method = self._basis
+        if method == "none":
+            return (None, None), dict.fromkeys(controls, (None, None))
+        on_target = self._reporting_smooth(coords, rows, target, cov, exposure)
+        if method == "exposure":
+            return on_target, dict.fromkeys(controls, on_target)
+        out = {}
+        for c, values in controls.items():
+            if c in self._control_scales and not self._in_ladder:
+                # A control that selected its own scale is reported at it.
+                with self.spatial_scale(self._control_scales[c], ladder=False):
+                    out[c] = self._reporting_smooth(coords, rows, values, cov, exposure)
+            else:
+                out[c] = self._reporting_smooth(coords, rows, values, cov, exposure)
+        return on_target, out
+
+    @staticmethod
+    def _with_smooth(cov: "np.ndarray | None", smooth: "np.ndarray | None"):
+        """``cov`` with the smooth's columns appended (``cov`` itself without)."""
+        if smooth is None:
+            return cov
+        return smooth if cov is None else np.column_stack([cov, smooth])
+
+    def _reporting_clusters(
+        self, df: "pd.DataFrame", cluster_column: str | None
+    ) -> "np.ndarray | None":
+        """Cluster labels aligned to an ``apply_fusion`` frame, or ``None``."""
+        if not cluster_column:
+            return None
+        full = self._full_data_frame()
+        if full is None or cluster_column not in full.columns:
+            return None
+        if "polygon_id" in df.columns:
+            return (
+                full.groupby("polygon_id", sort=False)[cluster_column]
+                .first()
+                .reindex(df["polygon_id"].values)
+                .to_numpy()
+            )
+        return full[cluster_column].reindex(df.index).to_numpy()
 
     def compute_negative_controls(
         self,
@@ -8063,6 +9514,13 @@ class MetricFusionEngine:
         :mod:`geofuse.negative_controls`. With ``metric``, the job's objective
         is also scored on each outcome. ``cluster_column`` resamples whole
         areas instead of entities. ``None`` when no controls are configured.
+
+        With spatial adjustment on, every slope, contrast and objective score
+        also adjusts for the split's spatial smooth: the composite's when the
+        exposure model picks the df, each outcome's own when the outcome model
+        does
+        (:meth:`_slope_smooths`); each outcome's entry records it under
+        ``spatial_adjustment``.
         """
         from . import negative_controls as _nc
 
@@ -8091,28 +9549,23 @@ class MetricFusionEngine:
             controls[name] = values
         if not controls:
             return None
-        clusters = None
-        if cluster_column:
-            full = self._full_data_frame()
-            if full is not None and cluster_column in full.columns:
-                key = "polygon_id" if "polygon_id" in df.columns else None
-                clusters = (
-                    full.groupby(key, sort=False)[cluster_column]
-                    .first()
-                    .reindex(df[key].values)
-                    .to_numpy()
-                    if key
-                    else full[cluster_column].reindex(df.index).to_numpy()
-                )
+        clusters = self._reporting_clusters(df, cluster_column)
+        coords = self._whole_data_coords(df)
+        method = self._basis
 
-        def objective(y, x, c):
+        def objective(y, x, c, smooth):
             if metric is None:
                 return None
             keep = self._finite_rows(y, x, c)
             try:
                 return float(
                     objective_scoring.score(
-                        metric, y[keep], x[keep], None if c is None else c[keep]
+                        metric,
+                        y[keep],
+                        x[keep],
+                        None if c is None else c[keep],
+                        spatial_basis=None if smooth is None else smooth[keep],
+                        spatial_method=self._scoring_spatial_method,
                     )
                 )
             except Exception:
@@ -8130,20 +9583,38 @@ class MetricFusionEngine:
             if int(mask.sum()) < 10:
                 continue
             c_m = None if cov is None else cov[mask]
+            (t_smooth, t_record), c_smooths = self._slope_smooths(
+                coords, mask, composite, target, controls, cov
+            )
+            extra = None
+            if method == "exposure":
+                extra = {"exposure": t_smooth}
+            elif method == "outcome":
+                extra = {
+                    "target": t_smooth,
+                    "controls": {k: s for k, (s, _) in c_smooths.items()},
+                }
             res = _nc.transfer_test(
                 composite[mask],
                 target[mask],
                 {k: v[mask] for k, v in controls.items()},
                 c_m,
+                extra=extra,
                 n_boot=int(n_boot),
                 seed=int(seed),
                 clusters=None if clusters is None else clusters[mask],
             )
-            res["target"]["objective"] = objective(target[mask], composite[mask], c_m)
+            res["target"]["objective"] = objective(
+                target[mask], composite[mask], c_m, t_smooth
+            )
             for k, v in controls.items():
                 res["controls"][k]["objective"] = objective(
-                    v[mask], composite[mask], c_m
+                    v[mask], composite[mask], c_m, c_smooths[k][0]
                 )
+            if t_record is not None:
+                res["target"]["spatial_adjustment"] = t_record
+                for k in controls:
+                    res["controls"][k]["spatial_adjustment"] = c_smooths[k][1]
             out["splits"][split] = res
         flagged = [
             k
@@ -8160,6 +9631,646 @@ class MetricFusionEngine:
                 "target's on the held-out split: part of the tuned "
                 "association is non-specific.",
             )
+        return out
+
+    def _applied_exposures(
+        self, df: pd.DataFrame, exposures: "dict | None", label: str
+    ) -> dict[str, np.ndarray]:
+        """``{name: values}`` of each exposure (``{name: (active channel,
+        params)}``) applied and aligned to the rows of ``df``, an
+        ``apply_fusion`` frame of the CGI. One that fails to apply is logged
+        under ``label`` and left out; the CGI's channel is active afterwards.
+        """
+        keys = df["polygon_id"].to_numpy() if "polygon_id" in df.columns else None
+        out: dict[str, np.ndarray] = {}
+        for name, (channel, params) in (exposures or {}).items():
+            try:
+                self._active_greenery_channel = channel
+                other = self.apply_fusion(weights=dict(params))
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                _log("WARN", f"{label}: '{name}' not applied: {exc}")
+                continue
+            values = other["composite"].to_numpy(dtype=np.float64)
+            if keys is not None and "polygon_id" in other.columns:
+                values = (
+                    pd.Series(values, index=other["polygon_id"].to_numpy())
+                    .reindex(keys)
+                    .to_numpy(dtype=np.float64)
+                )
+            if len(values) == len(df):
+                out[name] = values
+        self._active_greenery_channel = "cgi"
+        return out
+
+    def compute_specificity_contrast(
+        self,
+        cgi_params: dict,
+        exposures: dict[str, tuple[str, dict]],
+        *,
+        n_boot: int = 1000,
+        seed: int = 42,
+        cluster_column: str | None = None,
+    ) -> dict | None:
+        """Whether the CGI is more specific than each other exposure.
+
+        ``exposures`` maps a name to ``(active channel, params)``: a comparator
+        is ``(comparator_mode(column), {"comparator": column})``, a standalone
+        ``(channel, its params)``. Each is applied next to the CGI and, on the
+        held-out rows, compared with it per negative control by
+        :func:`negative_controls.specificity_contrast` (``ΔD = D_cgi − D_e``,
+        ``D = |β_target| − |β_control|``, ``n_boot`` resamples, whole areas
+        with ``cluster_column``; one seed per control, so every exposure is
+        read on the same resamples). ``rows`` holds one entry per exposure x
+        control; ``slopes`` each exposure's own held-out slopes on the target
+        and on every control, on the rows where each pair is observed, as the
+        CGI's are in :meth:`compute_negative_controls`. ``None`` without
+        controls or exposures; ``{"skipped": "longitudinal"}`` for a panel.
+
+        With spatial adjustment on, the held-out spatial smooth joins the
+        covariates (:meth:`_slope_smooths`): under the exposure rule each
+        exposure has its own, selected on it, which the paired resamples carry
+        for that exposure's two slopes; under the outcome rule each outcome has
+        its own. Every slope and row records it under ``spatial_adjustment`` (a row:
+        ``df_cgi`` / ``df_exposure`` or ``df_target`` / ``df_control``).
+        """
+        from . import negative_controls as _nc
+
+        if not self.negative_control_columns or not exposures:
+            return None
+        if self.is_panel:
+            return {
+                "skipped": "longitudinal",
+                "controls": list(self.negative_control_columns),
+            }
+        prev = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            x_cgi = df["composite"].to_numpy(dtype=np.float64)
+            target = df["target"].to_numpy(dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+            clusters = self._reporting_clusters(df, cluster_column)
+            test = self._test_entity_mask(df)
+            controls = {}
+            for name in self.negative_control_columns:
+                values = self._reporting_raw_column(df, name)
+                if values is not None:
+                    controls[name] = values
+            xs = self._applied_exposures(df, exposures, "Specificity contrast")
+        finally:
+            self._active_greenery_channel = prev
+
+        out: dict = {
+            "controls": list(controls),
+            "exposures": list(xs),
+            "split": "test",
+            "n_test": int(test.sum()),
+            "n_boot": int(n_boot),
+            "cluster_column": cluster_column if clusters is not None else None,
+            "rows": [],
+            "slopes": {},
+        }
+        if not controls or int(test.sum()) < 10:
+            return out
+        c_t = None if cov is None else cov[test]
+        cl_t = None if clusters is None else clusters[test]
+        coords = self._whole_data_coords(df)
+        method = self._basis
+        (cgi_smooth, cgi_record), cgi_smooths = self._slope_smooths(
+            coords, test, x_cgi, target, controls, cov
+        )
+        for name, x_e in xs.items():
+            (e_smooth, e_record), e_smooths = self._slope_smooths(
+                coords, test, x_e, target, controls, cov
+            )
+            slopes = {
+                "target": _nc.partial_slope(
+                    x_e[test], target[test], self._with_smooth(c_t, e_smooth)
+                ),
+                "controls": {
+                    c: _nc.partial_slope(
+                        x_e[test], v[test], self._with_smooth(c_t, e_smooths[c][0])
+                    )
+                    for c, v in controls.items()
+                },
+            }
+            if e_record is not None:
+                slopes["target"]["spatial_adjustment"] = e_record
+                for c in controls:
+                    slopes["controls"][c]["spatial_adjustment"] = e_smooths[c][1]
+            out["slopes"][name] = slopes
+            for j, (c, v) in enumerate(controls.items()):
+                # The exposure rule adjusts each exposure for its own smooth,
+                # the outcome rule each outcome; the record names the df of the
+                # two smooths in play.
+                extra, record = None, None
+                if method == "exposure":
+                    extra = {"exposure": cgi_smooth, "other": e_smooth}
+                    record = {
+                        **self._method_record(),
+                        "df_cgi": cgi_record["df"],
+                        "df_exposure": e_record["df"],
+                    }
+                elif method == "outcome":
+                    extra = {"target": cgi_smooth, "control": cgi_smooths[c][0]}
+                    record = {
+                        **self._method_record(),
+                        "df_target": cgi_record["df"],
+                        "df_control": cgi_smooths[c][1]["df"],
+                    }
+                res = _nc.specificity_contrast(
+                    x_cgi[test],
+                    x_e[test],
+                    target[test],
+                    v[test],
+                    c_t,
+                    extra=extra,
+                    n_boot=int(n_boot),
+                    clusters=cl_t,
+                    seed=int(seed) + j,
+                )
+                row = {
+                    "exposure": name,
+                    "control": c,
+                    "beta_target_cgi": res["beta_target"],
+                    "beta_control_cgi": res["beta_control"],
+                    "beta_target_exposure": res["beta_target_other"],
+                    "beta_control_exposure": res["beta_control_other"],
+                    "d_cgi": res["d"],
+                    "d_exposure": res["d_other"],
+                    "delta_d": res["delta"],
+                    "ci_low": res["ci_low"],
+                    "ci_high": res["ci_high"],
+                    "p_value": res["p_value"],
+                    "n": res["n"],
+                }
+                if record is not None:
+                    if self._spatial_scale is not None:
+                        record["scale_m"] = self._spatial_scale
+                    row["spatial_adjustment"] = record
+                out["rows"].append(row)
+        return out
+
+    def compute_raw_effects(
+        self,
+        cgi_params: dict,
+        exposures: "dict[str, tuple[str, dict]] | None" = None,
+        *,
+        fixed_iqr: "dict[str, float] | None" = None,
+    ) -> dict:
+        """Held-out slopes in raw units: per IQR and per 5th–95th percentile.
+
+        For the CGI and every exposure of ``exposures`` (``{name: (active
+        channel, params)}``, as for :meth:`compute_specificity_contrast`):
+        ``distribution``, the exposure's ``median``, ``q25``, ``q75``, ``iqr``,
+        ``p5``, ``p95`` and ``n`` on the train+val rows, which set the scale;
+        and on the held-out rows its covariate-adjusted slope
+        (:func:`negative_controls.raw_slope`) on the target and on every
+        negative control, in the outcome's units per IQR (``per_iqr``; per
+        ``fixed_iqr[name]`` exposure units when given) and per p5–p95 range
+        (``per_p5_p95``). The covariates and spatial smooths are the per-SD
+        slopes' (:meth:`_slope_smooths`), and each slope records its smooth
+        under ``spatial_adjustment``. ``layers`` gives each composite channel's
+        distribution at the cell the CGI reads, so a composite IQR can be read
+        in a layer's units. The smooth selections are not counted again in
+        :meth:`spatial_selection_report`. Controls are left out for a panel.
+
+        A spatially adjusted run also reports ``per_sd0``: the slope per SD0,
+        the exposure's held-out SD after the covariates only, so the unit stays
+        the same at every pattern scale and unadjusted (``sd0``, and
+        ``outcome_sd``, the outcome's residual SD given covariates and smooth);
+        its ``t`` is the per-SD slope's.
+        """
+        import copy
+
+        from . import negative_controls as _nc
+
+        fixed = {str(k): float(v) for k, v in (fixed_iqr or {}).items()}
+        prev = self._active_greenery_channel
+        counters = copy.deepcopy(self._spatial_selections)
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            layer_names = [c for c in self._composite_channels() if c in df.columns]
+            xs: dict[str, tuple[str, np.ndarray]] = {
+                "cgi": ("cgi", df["composite"].to_numpy(dtype=np.float64))
+            }
+            applied = self._applied_exposures(df, exposures, "Raw-unit effects")
+            for name, values in applied.items():
+                xs[name] = (_exposure_kind(exposures[name][1]), values)
+            target = df["target"].to_numpy(dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+            test = self._test_entity_mask(df)
+            coords = self._whole_data_coords(df)
+            controls: dict[str, np.ndarray] = {}
+            if not self.is_panel:
+                for name in self.negative_control_columns:
+                    values = self._reporting_raw_column(df, name)
+                    if values is not None:
+                        controls[name] = values
+            c_t = None if cov is None else cov[test]
+            per_sd0 = _spatially_adjusted(self)
+            out: dict = {
+                "split": "test",
+                "n_test": int(test.sum()),
+                "controls": list(controls),
+                "exposures": {},
+                "layers": {
+                    ch: _distribution(df[ch].to_numpy(dtype=np.float64)[~test])
+                    for ch in layer_names
+                },
+            }
+            for name, (kind, x) in xs.items():
+                dist = _distribution(x[~test])
+                iqr = fixed.get(name, dist["iqr"])
+                span = None
+                if dist["p95"] is not None and dist["p5"] is not None:
+                    span = dist["p95"] - dist["p5"]
+                (smooth, record), smooths = self._slope_smooths(
+                    coords, test, x, target, controls, cov
+                )
+
+                def contrasts(y, extra, rec, x=x, iqr=iqr, span=span):
+                    c = self._with_smooth(c_t, extra)
+                    res = {
+                        "per_iqr": _nc.raw_slope(
+                            x[test], y[test], c, scale=_scale(iqr)
+                        ),
+                        "per_p5_p95": _nc.raw_slope(
+                            x[test], y[test], c, scale=_scale(span)
+                        ),
+                    }
+                    if per_sd0:
+                        res["per_sd0"] = _per_sd0(x[test], y[test], c_t, c)
+                    if rec is not None:
+                        for r in res.values():
+                            r["spatial_adjustment"] = rec
+                    return res
+
+                out["exposures"][name] = {
+                    "kind": kind,
+                    "distribution": dist,
+                    "iqr_source": "fixed" if name in fixed else "train_val",
+                    "target": contrasts(target, smooth, record),
+                    "controls": {
+                        c: contrasts(v, smooths[c][0], smooths[c][1])
+                        for c, v in controls.items()
+                    },
+                }
+        finally:
+            self._active_greenery_channel = prev
+            self._spatial_selections = counters
+        return out
+
+    def compute_spatial_plus(
+        self,
+        cgi_params: dict,
+        exposures: "dict[str, tuple[str, dict]] | None" = None,
+        *,
+        n_boot: int = 1000,
+        seed: int = 42,
+        fixed_iqr: "dict[str, float] | None" = None,
+    ) -> "dict | None":
+        """Spatial+ (Dupont, Wood & Augustin 2022) on the held-out rows.
+
+        For the CGI and every exposure of ``exposures`` (``{name: (active
+        channel, params)}``), on the target and each negative control:
+        :func:`geofuse.spatial_plus.report` over the held-out rows, with one
+        penalized thin-plate smooth per group (gap clusters at
+        ``spatial_adjust_eps_m``, default 10 km, small ones merged; or the
+        values of ``spatial_plus_groups_column``) and the penalties by
+        ``spatial_plus_criterion`` (plus every ``spatial_plus_checks``
+        criterion, its rows marked ``check``). The IQR and p5–p95 scales are
+        the exposures' train+val distributions (``fixed_iqr`` overrides the
+        IQR), as for :meth:`compute_raw_effects`. ``None`` unless the method
+        is ``spatial_plus``; ``{"skipped": reason}`` for a panel or a
+        two-valued outcome (Spatial+ is fitted for Gaussian outcomes).
+        """
+        from . import spatial_plus as _sp
+
+        if self.spatial_adjust_method != "spatial_plus":
+            return None
+        if self.is_panel:
+            return {"skipped": "longitudinal"}
+        if getattr(self, "weight_column", None):
+            _log(
+                "WARN",
+                "Spatial+ estimates are not weighted: the sampling weights do "
+                "not enter them.",
+            )
+        fixed = {str(k): float(v) for k, v in (fixed_iqr or {}).items()}
+        prev = self._active_greenery_channel
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            target = df["target"].to_numpy(dtype=np.float64)
+            finite_target = target[np.isfinite(target)]
+            if len(np.unique(finite_target)) <= 2:
+                _log(
+                    "WARN",
+                    "Spatial+ fits Gaussian outcomes; the target has two values, "
+                    "so it is skipped.",
+                )
+                return {"skipped": "binary outcome"}
+            xs: dict[str, tuple[str, np.ndarray]] = {
+                "cgi": ("cgi", df["composite"].to_numpy(dtype=np.float64))
+            }
+            applied = self._applied_exposures(df, exposures, "Spatial+")
+            for name, values in applied.items():
+                xs[name] = (_exposure_kind(exposures[name][1]), values)
+            cov = self._reporting_covariate_matrix(df)
+            test = self._test_entity_mask(df)
+            coords = self._whole_data_coords(df)
+            if coords is None:
+                _log("WARN", "Spatial+ needs entity coordinates; skipped.")
+                return {"skipped": "no coordinates"}
+            controls: dict[str, np.ndarray] = {}
+            for name in self.negative_control_columns:
+                values = self._reporting_raw_column(df, name)
+                if values is not None:
+                    controls[name] = values
+            keep = test & np.isfinite(coords).all(axis=1) & np.isfinite(target)
+            if cov is not None:
+                keep &= np.isfinite(cov).all(axis=1)
+            for _, x in xs.values():
+                keep &= np.isfinite(x)
+            for v in controls.values():
+                keep &= np.isfinite(v)
+            if int(keep.sum()) < 20:
+                return {"skipped": "too few held-out rows"}
+            values = None
+            if self.spatial_plus_groups_column:
+                labels = self._reporting_clusters(df, self.spatial_plus_groups_column)
+                if labels is None:
+                    _log(
+                        "WARN",
+                        f"Spatial+ group column '{self.spatial_plus_groups_column}' "
+                        "not found; using gap clusters.",
+                    )
+                else:
+                    values = labels[keep]
+            labels, rule = _sp.group_labels(
+                coords[keep],
+                eps_m=self.spatial_adjust_eps_m,
+                min_component=self.spatial_adjust_min_component,
+                values=values,
+            )
+            if values is not None:
+                rule["column"] = self.spatial_plus_groups_column
+            scales = {}
+            for name, (_kind, x) in xs.items():
+                dist = _distribution(x[~test])
+                span = None
+                if dist["p95"] is not None and dist["p5"] is not None:
+                    span = dist["p95"] - dist["p5"]
+                scales[name] = {"iqr": fixed.get(name, dist["iqr"]), "span": span}
+            out = _sp.report(
+                coords[keep],
+                {name: (kind, x[keep]) for name, (kind, x) in xs.items()},
+                target[keep],
+                {name: v[keep] for name, v in controls.items()},
+                None if cov is None else cov[keep],
+                labels,
+                criterion=self.spatial_plus_criterion,
+                checks=self.spatial_plus_checks,
+                k=self.spatial_plus_k,
+                step1_covariates=self.spatial_plus_step1_covariates,
+                scales=scales,
+                n_boot=int(n_boot),
+                seed=int(seed),
+            )
+        finally:
+            self._active_greenery_channel = prev
+        out.update(
+            method="spatial_plus",
+            label=SPATIAL_LABELS["spatial_plus"],
+            split="test",
+            groups_rule=rule,
+            controls=list(controls),
+            exposures={name: kind for name, (kind, _x) in xs.items()},
+            scales=scales,
+        )
+        for message in dict.fromkeys(out["warnings"]):
+            _log("WARN", f"Spatial+: {message}.")
+        return out
+
+    def compute_weighted_report(
+        self,
+        cgi_params: dict,
+        metric: str,
+        exposures: "dict[str, tuple[str, dict]] | None" = None,
+        *,
+        channel: str | None = None,
+        comparators: "list[str] | None" = None,
+        specificity: bool = False,
+        scales: "dict | None" = None,
+        n_boot_score: int = 0,
+        n_boot: int = 0,
+        seed: int = 42,
+    ) -> dict | None:
+        """The held-out reports weighted by :attr:`weight_column`.
+
+        On the held-out rows, with the weights normalised to mean 1 over the
+        rows each estimate uses (:mod:`geofuse.weighting`): the CGI's score
+        (``r2`` objective only; ``n_boot_score`` resamples), its slope on the
+        target and on every negative control and the ``D`` of each control
+        (``n_boot`` resamples); for every exposure of ``exposures`` (``{name:
+        (active channel, params)}``) its slopes and, at ``scales`` (``{name:
+        {"per_iqr": …, "per_p5_p95": …}}``, the unweighted rows' ranges), its
+        raw-unit slopes; the paired R² difference against ``channel`` and each
+        of ``comparators``; and with ``specificity`` the ΔD against every
+        exposure. Covariates and smooths are the unweighted slopes'
+        (:meth:`_slope_smooths`); a paired difference scores each side over
+        its own slope smooth. ``None`` without a weight column;
+        ``{"skipped": "longitudinal"}`` for a panel, ``{"skipped": "no weight
+        column"}`` when the target lacks it.
+        """
+        import copy
+
+        from . import weighting as _w
+
+        if not self.weight_column:
+            return None
+        if self.is_panel:
+            return {"skipped": "longitudinal"}
+        prev = self._active_greenery_channel
+        counters = copy.deepcopy(self._spatial_selections)
+        try:
+            self._active_greenery_channel = "cgi"
+            df = self.apply_fusion(weights=dict(cgi_params))
+            xs: dict[str, np.ndarray] = {
+                "cgi": df["composite"].to_numpy(dtype=np.float64),
+                **self._applied_exposures(df, exposures, "Weighted report"),
+            }
+            kinds = {"cgi": "cgi"}
+            for name in xs:
+                if name != "cgi":
+                    kinds[name] = _exposure_kind(exposures[name][1])
+            target = df["target"].to_numpy(dtype=np.float64)
+            cov = self._reporting_covariate_matrix(df)
+            test = self._test_entity_mask(df)
+            coords = self._whole_data_coords(df)
+            weights = self._reporting_raw_column(df, self.weight_column)
+            controls = {}
+            for name in self.negative_control_columns:
+                values = self._reporting_raw_column(df, name)
+                if values is not None:
+                    controls[name] = values
+            smooths = {
+                name: self._slope_smooths(coords, test, x, target, controls, cov)
+                for name, x in xs.items()
+            }
+        finally:
+            self._active_greenery_channel = prev
+            self._spatial_selections = counters
+        if weights is None:
+            return {"skipped": "no weight column", "weight_column": self.weight_column}
+
+        w = np.asarray(weights, dtype=np.float64)[test]
+        t = target[test]
+        c_t = None if cov is None else cov[test]
+        ok = _w.usable(w)
+        out: dict = {
+            "weight_column": self.weight_column,
+            "n_test": int(test.sum()),
+            "n_eff": _w.kish(_w.normalised(w[ok])) if ok.any() else 0.0,
+            "n_dropped": int((~ok).sum()),
+            "kinds": kinds,
+            "score": None,
+            "slopes": {},
+            "raw": {},
+            "d": {},
+            "paired": {},
+            "delta_d": {},
+        }
+
+        def with_smooth(smooth):
+            return self._with_smooth(c_t, smooth)
+
+        def tag(res, record):
+            if record is not None:
+                res["spatial_adjustment"] = record
+            return res
+
+        for name, x in xs.items():
+            (s_t, rec_t), s_c = smooths[name]
+            xt = x[test]
+            out["slopes"][name] = {
+                "target": tag(_w.slope(xt, t, with_smooth(s_t), w), rec_t),
+                "controls": {
+                    c: tag(_w.slope(xt, v[test], with_smooth(s_c[c][0]), w), s_c[c][1])
+                    for c, v in controls.items()
+                },
+            }
+            scale = (scales or {}).get(name) or {}
+            if scale:
+                out["raw"][name] = {
+                    "target": {
+                        k: tag(
+                            _w.slope(xt, t, with_smooth(s_t), w, scale=scale[k]),
+                            rec_t,
+                        )
+                        for k in ("per_iqr", "per_p5_p95")
+                        if k in scale
+                    },
+                    "controls": {
+                        c: {
+                            k: tag(
+                                _w.slope(
+                                    xt,
+                                    v[test],
+                                    with_smooth(s_c[c][0]),
+                                    w,
+                                    scale=scale[k],
+                                ),
+                                s_c[c][1],
+                            )
+                            for k in ("per_iqr", "per_p5_p95")
+                            if k in scale
+                        }
+                        for c, v in controls.items()
+                    },
+                }
+
+        x_cgi = xs["cgi"][test]
+        (s_cgi, rec_cgi), s_cgi_c = smooths["cgi"]
+
+        if metric == "r2":
+            out["score"] = tag(
+                _w.r2(
+                    t,
+                    x_cgi,
+                    c_t,
+                    s_cgi,
+                    w,
+                    n_boot=int(n_boot_score),
+                    seed=int(seed),
+                ),
+                rec_cgi,
+            )
+            for name in [channel, *(comparators or [])]:
+                if name is None or name not in xs:
+                    continue
+                s_e = smooths[name][0][0]
+                out["paired"][name] = _w.r2_difference(
+                    t,
+                    x_cgi,
+                    xs[name][test],
+                    c_t,
+                    s_cgi,
+                    s_e,
+                    w,
+                    n_boot=int(n_boot),
+                    seed=int(seed) + 1,
+                )
+                out["paired"][name]["kind"] = (
+                    "channel" if name == channel else "comparator"
+                )
+        for j, (c, v) in enumerate(controls.items()):
+            out["d"][c] = tag(
+                _w.d(
+                    x_cgi,
+                    t,
+                    v[test],
+                    c_t,
+                    s_cgi,
+                    s_cgi_c[c][0],
+                    w,
+                    n_boot=int(n_boot),
+                    seed=int(seed) + 2 + j,
+                ),
+                rec_cgi,
+            )
+        if specificity:
+            method = self._basis
+            for name, x in xs.items():
+                if name == "cgi":
+                    continue
+                (s_e, _), _s = smooths[name]
+                out["delta_d"][name] = {}
+                for j, (c, v) in enumerate(controls.items()):
+                    pairs = {}
+                    if method == "exposure":
+                        for role, sm in (("exposure", s_cgi), ("other", s_e)):
+                            for outcome in ("target", "control"):
+                                pairs[(role, outcome)] = sm
+                    elif method == "outcome":
+                        for role in ("exposure", "other"):
+                            pairs[(role, "target")] = s_cgi
+                            pairs[(role, "control")] = s_cgi_c[c][0]
+                    out["delta_d"][name][c] = _w.delta_d(
+                        x_cgi,
+                        x[test],
+                        t,
+                        v[test],
+                        c_t,
+                        pairs,
+                        w,
+                        n_boot=int(n_boot),
+                        seed=int(seed) + 2 + j,
+                    )
         return out
 
     def retune_concordance(
@@ -8444,15 +10555,13 @@ class MetricFusionEngine:
         for n, ch in enumerate(channels):
             logger.info(f"Sampling {ch} at grid points...")
             radius, stat, pct = self._channel_spec(final_params, ch)
-            blocks[ch] = self._aggregate_with_ring_cache(
+            blocks[ch] = self._cached_channel_values(
                 points_gdf,
                 self._channel_source(ch),
                 radius,
                 stat,
                 pct,
                 channel=ch,
-                fold_idx=-1,
-                subset="robust_map",
             )
             if progress_callback:
                 progress_callback(40 + int(45 * (n + 1) / len(channels)), 100)

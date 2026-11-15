@@ -276,7 +276,7 @@ class JobStore:
             rec._dirty = True
 
     # ────────────────────────────────────────────────────────────
-    # Reads (return snapshots; safe to use without holding the lock)
+    # Reads (snapshots, safe to use without holding the lock)
     # ────────────────────────────────────────────────────────────
 
     def get(self, job_id: str) -> JobRecord | None:

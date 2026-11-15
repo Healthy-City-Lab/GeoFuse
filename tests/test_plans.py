@@ -716,6 +716,91 @@ class TabParityTests(_Case):
         )
         self.assert_same(gui, plans.build(spec))
 
+    def test_fusion_tab_specificity_contrast(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_negative_controls": ["grip"],
+            "fusion_specificity_contrast": True,
+            "fusion_comparators": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            negative_controls = ["grip"]
+            comparators = ["age"]
+            specificity_contrast = true
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertIs(gui[2][0]["specificity_contrast"], True)
+        self.assert_same(gui, plans.build(spec))
+
+    def test_fusion_tab_smoothing_settings(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_covariate_columns": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_residualize_method": "spline",
+            "fusion_residualize_spline_df": 5,
+            "fusion_residualize_spline_min_unique": 9,
+            "fusion_exposure_response_spline_df": 6,
+            "fusion_spatial_adjust_method": "basis",
+            "fusion_spatial_adjust_select": "df_exposure_ic",
+            "fusion_spatial_adjust_df": "0, 2, 5, 9",
+            "fusion_spatial_adjust_criterion": "bic",
+            "fusion_spatial_adjust_neighbours": 7,
+            "fusion_spatial_adjust_knots_min": 30,
+            "fusion_spatial_adjust_knots_max": 120,
+            "fusion_spatial_paired_smooth": "max",
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            covariates = ["age"]
+            residualize_method = "spline"
+            residualize_spline_df = 5
+            residualize_spline_min_unique = 9
+            exposure_response_spline_df = 6
+            spatial_adjust_method = "basis"
+            spatial_adjust_select = "df_exposure_ic"
+            spatial_adjust_df = [9, 0, 5, 2]
+            spatial_adjust_criterion = "bic"
+            spatial_adjust_neighbours = 7
+            spatial_adjust_knots_min = 30
+            spatial_adjust_knots_max = 120
+            spatial_paired_smooth = "max"
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        recorded = gui[2][0]
+        self.assertEqual(recorded["spatial_adjust_df"], [0, 2, 5, 9])
+        self.assertEqual(recorded["spatial_paired_smooth"], "max")
+        self.assertEqual(recorded["residualize_spline_df"], 5)
+        self.assert_same(gui, plans.build(spec))
+
     def test_fusion_tab_comparators(self):
         seed = {
             "fusion_target_paths": [self.cohort],
@@ -776,6 +861,83 @@ class TabParityTests(_Case):
             """
         )
         self.assertEqual(gui[2][0]["categorical_missing"], "indicator")
+        self.assert_same(gui, plans.build(spec))
+
+    def test_fusion_tab_spatial_plus(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_covariate_columns": ["age"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_spatial_adjust_method": "spatial_plus",
+            "fusion_spatial_plus_k": 120,
+            "fusion_spatial_plus_criterion": "reml",
+            "fusion_spatial_plus_checks": ["gcv"],
+            "fusion_spatial_plus_step1_covariates": True,
+            "fusion_spatial_adjust_eps_m": 20000,
+            "fusion_spatial_adjust_min_component": 40,
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            covariates = ["age"]
+            spatial_adjust_method = "spatial_plus"
+            spatial_plus_k = 120
+            spatial_plus_criterion = "reml"
+            spatial_plus_checks = ["gcv"]
+            spatial_plus_step1_covariates = true
+            spatial_adjust_eps_m = 20000.0
+            spatial_adjust_min_component = 40
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        recorded = gui[2][0]
+        self.assertEqual(recorded["spatial_adjust_method"], "spatial_plus")
+        self.assertEqual(recorded["spatial_plus_checks"], ["gcv"])
+        # The select always has a value, so the runner never reads the job as
+        # one recorded before the select setting existed.
+        self.assertIsNotNone(recorded["spatial_adjust_select"])
+        self.assert_same(gui, plans.build(spec))
+
+    def test_fusion_tab_spatial_plus_search_inputs(self):
+        seed = {
+            "fusion_target_paths": [self.cohort],
+            "fusion_target_upload_sig": (self.cohort, os.path.getsize(self.cohort)),
+            "fusion_outcome_columns": ["cesd"],
+            "fusion_run_mode": "Cross-sectional",
+            "fusion_index_form": "linear",
+            "fusion_spatial_adjust_method": "spatial_plus",
+            "fusion_spatial_tune_inputs": True,
+            "fusion_ndvi_paths": [os.path.join(self.dir, "ndvi_2015.tif")],
+            "fusion_gvi_paths": [os.path.join(self.dir, "gvi.gpkg")],
+        }
+        gui = self.click(
+            "fusion", seed, f"fusion.render({self.out!r})", "fusion_form_run_submit"
+        )
+        (spec,) = self.expand(
+            f"""
+            output_dir = {self.out!r}
+            [[fusion]]
+            target = "cohort.gpkg"
+            outcomes = ["cesd"]
+            index_form = "linear"
+            spatial_adjust_method = "spatial_plus"
+            spatial_tune_method = "spatial_plus_inputs"
+            ndvi = "ndvi_2015.tif"
+            gvi = "gvi.gpkg"
+            """
+        )
+        self.assertEqual(gui[2][0]["spatial_tune_method"], "spatial_plus_inputs")
         self.assert_same(gui, plans.build(spec))
 
 

@@ -92,7 +92,10 @@ mismatched file is refused, and processed points are skipped.
    comparators** are the pre-specified ones the Holm correction runs over
    (empty = all). In a run file: `comparators = [...]`,
    `comparators_primary = [...]`; on the command line `--comparator` and
-   `--comparator-primary`.
+   `--comparator-primary`. With controls picked, **Specificity contrast**
+   tests whether the composite is more specific than each primary comparator
+   and the comparison channel (`specificity_contrast = true`,
+   `--specificity-contrast`).
 2. **Optimization setup.** Choose cross-sectional or mixed-effects
    (longitudinal). Longitudinal requires a date column. Cross-sectional can
    optionally use one to route each entity to a year-matched greenery file.
@@ -106,10 +109,13 @@ mismatched file is refused, and processed points are skipped.
    Anything unassigned blocks submission.
 4. **Study details.** Covariates, objective metric (Incremental R² by default;
    choose it by the association you expect, see FEATURES), optional
-   spatial-confounding
-   adjustment, test-set size, the discovery block (channel set, index form,
-   sweep splits, radius prior, minimum GVI coverage) with validation settings
-   behind an expander, the CGI grid pixel size (for every target type, rasters
+   spatial-confounding adjustment (a coordinate smooth in the held-out scores,
+   paired tests, slopes, negative controls and specificity contrast; the tuning
+   does not use it; its settings are under **Spatial adjustment — advanced**,
+   see below), test-set size and split seed, the discovery block (channel
+   set, index form, sweep splits, radius prior, minimum GVI coverage) with
+   validation settings behind an expander (including "Held-out splits", which
+   repeats the whole tuning on that many test splits), the CGI grid pixel size (for every target type, rasters
    included), the exposure buffer, composite scaling, and whether to run each
    channel on its own. Choose the range-based radius prior when the distance of
    influence should not depend on the ladder's spacing.
@@ -125,13 +131,308 @@ row** (default, as for a missing numeric covariate) or **Keep as a level of its
 own** (a `<column>=missing` dummy). In a run file it is
 `categorical_missing = "drop"` or `"indicator"`.
 
+### Spatial smooth and spline settings
+
+The spatial smooth compares a list of candidate sizes and keeps the one its
+criterion prefers, or none. A size is the number of radial functions per
+spatial cluster, on top of each cluster's level and linear trend (`0`). When
+the largest candidate wins, the log warns and the results record `at_cap`: a
+larger smooth might fit better, so add larger values (and raise the knots) to
+let the criterion decide. Every selection's criterion values are kept in
+`results_summary.json` (see OUTPUTS). With the default list a spatially
+adjusted run can pick a larger smooth than the runs made before the list
+existed; `spatial_adjust_max_df = 10` repeats those runs exactly.
+
+| Setting (form label) | Default | What it does |
+| --- | --- | --- |
+| `spatial_adjust_method` (**Spatial-confounding adjustment**) | `none` | `basis`: an unpenalized thin-plate basis in the outcome model (Keller & Szpiro 2020); `spatial_plus`: Spatial+ with penalized smooths per site (Dupont et al. 2022), see below. Runs and run files from before the rename say `ks_aic` (read as `basis` + `df_outcome_ic`) |
+| `spatial_adjust_select` (**Basis size**) | `df_outcome_ic` | How a `basis` sets its size: `df_outcome_ic` (df by AIC/BIC of the outcome model without the exposure), `df_exposure_ic` (df by AIC/BIC of the exposure model, "df-Spatial+"; unpenalized, so the same adjustment with another size), `fixed_scale` (the pattern scales below), `scale_ic` (a scale chosen by AIC/BIC, see below) |
+| `spatial_select_scales_m` (**Candidate scales (m)**) | `[50000, 30000, 20000, 15000, 10000, 7000, 5000, 4000, 3000]` | Pattern scales the scale selection compares, besides no smooth |
+| `spatial_select_criterion` (**Scale criterion**) | `bic` | AIC-NE or BIC-NE picks the scale; both are always saved |
+| `spatial_select_controls` (**Controls' scale**) | `target` | Negative controls use the target's selected scale, or (`own`) select their own |
+| `spatial_tune_select` (**Tuning scale**) | `fixed_scale` | `scale_ic` chooses the tuning scale per split by the same rule, on that split's train+val rows |
+| `spatial_tune_method` (**Residualize the search inputs**) | `basis` | `spatial_plus_inputs` (with `spatial_plus`, linear form only): tune on every input's Spatial+ residual, see below |
+| `spatial_plus_groups_column` (**Spatial+ groups column**) | unset | A target column whose values are the Spatial+ groups (a site); unset = clusters split at `spatial_adjust_eps_m` (default 10 km for Spatial+), smaller than `spatial_adjust_min_component` (default 30) merged |
+| `spatial_plus_k` (**Basis size per group**) | 300 | Knots of each group's penalized thin-plate spline, at most its rows − 4 (mgcv's `k`) |
+| `spatial_plus_criterion` (**Penalty criterion**) | `gcv` | Picks every group's smoothing parameter: `gcv` (as published) or `reml` |
+| `spatial_plus_checks` (**Check criteria**) | `[]` | Criteria also run; their rows are marked `check` |
+| `spatial_plus_step1_covariates` (**Exposure step adjusts for the covariates**) | `false` | The published first step removes only the exposure's spatial part; `true` adjusts it for the covariates too |
+| `spatial_adjust_df` (**Spatial df candidates**) | `[0, 1, 2, 3, 4, 6, 8, 11, 15, 20]` | Sizes compared, besides no smooth; a list in a run file, `0, 2, 5` in the form, `--spatial-adjust-df 0 2 5` on the command line |
+| `spatial_adjust_max_df` | unset | Older form of the list: every size from 0 to N. Give one or the other |
+| `spatial_adjust_criterion` (**Spatial df criterion**) | `aic` | `bic` penalises size more, so it picks a smaller or equal smooth |
+| `spatial_adjust_eps_m` (**Cluster gap eps**) | 0 (automatic) | Entities farther apart than this fall into different clusters |
+| `spatial_adjust_neighbours` (**Cluster neighbours**) | 10 | With eps automatic, entities linked through this many nearest neighbours form one cluster |
+| `spatial_adjust_knots_min` / `_max` (**Fewest / Most knots per cluster**) | 35 / 150 | Knots of each cluster's smooth; a cluster holds at most `knots_max` radial functions |
+| `spatial_paired_smooth` (**Paired-test smooth**) | `own` | `df_exposure_ic` only: the smooth each exposure of a paired CGI-vs-exposure test is scored with, see below |
+| `spatial_adjust_scale_m` (**Spatial pattern scales (m)**) | unset | Define the smooth by a distance instead of a size, see below; a list in a run file, `5000, 20000, 10000` in the form, `--spatial-adjust-scale-m 5000 20000` on the command line |
+| `spatial_adjust_min_component` (**Smallest cluster**) | 0 (30 with scales, none without) | A smaller cluster shares its nearest larger cluster's level instead of having its own |
+| `spatial_tune_scale_m` (**Tune within areas of (m)**) | unset (0) | Tune the composite on variation within areas of about this size, see below |
+| `residualize_spline_df` (**Covariate spline df**) | 4 | Spline size of each continuous covariate when **Covariate residualization** is Spline |
+| `residualize_spline_min_unique` (**Distinct values for a spline**) | 7 | A covariate with fewer distinct values (a code, a dummy) enters linearly |
+| `exposure_response_spline_df` (**Exposure-response spline df**) | 4 | Spline size of the exposure-response curve and its linearity test |
+
+`spatial_plus` used to name the basis whose df the exposure model picks. A
+recorded job or run config from before the rename reruns as that basis
+(`geofuse rerun` reproduces it); a new run file that sets `spatial_plus`
+together with `spatial_adjust_df`, `spatial_adjust_max_df`,
+`spatial_adjust_scale_m` or `spatial_paired_smooth` is refused at plan time
+with the spelling to use instead (`basis` with `df_exposure_ic` or
+`fixed_scale`), since those settings do not act on Spatial+.
+
+When the exposure model picks the df (`df_exposure_ic`) the smooth is
+selected on the exposure, so the CGI and the
+exposure it is compared with (a channel or a comparator) can each have their
+own. `spatial_paired_smooth` decides what a paired test uses: `own` (each
+exposure's own smooth, as when it is scored alone, so the paired difference is
+the difference of the two printed held-out scores), `cgi` (the CGI's smooth for
+both, the behaviour before this setting existed), `outcome` (one smooth
+selected on the outcome given the covariates, the `df_outcome_ic` rule) or
+`max` (the larger of the two exposures' sizes for both). When the outcome model
+picks the df the smooth is selected on the outcome already, so every value behaves as `outcome`, and the
+paired rows record it so.
+
+**Scale selection.** `spatial_adjust_select = "scale_ic"` (with `basis`)
+chooses the pattern scale on each held-out split the way Keller & Szpiro
+(2020, §4) choose the amount of adjustment: the outcome model without the
+exposure (covariates, then the basis at each candidate scale) is fitted on the
+split's train+val rows, and the scale with the smallest BIC (BIC-NE, the
+default) or AIC (AIC-NE) wins; no smooth is a candidate too. Every candidate
+is built on one set of clusters (gap `spatial_adjust_eps_m`, default 10 km), so
+only the smooth changes. The test rows never enter the choice; the chosen
+scale's basis is then built on the held-out rows. Negative controls use the
+target's scale unless `spatial_select_controls = "own"`. The slopes are also
+reported at every candidate and unadjusted, so the chosen scale sits on the
+scale curve. Keller & Szpiro found AIC-NE best in most settings and BIC-NE
+better under bias amplification, and more adjustment can amplify bias, so a
+falling estimate alone does not show confounding. With
+`spatial_tune_select = "scale_ic"` the same rule picks the tuning scale per
+split. Every basis run saves the AIC-NE / BIC-NE profile of the target and
+each control on every split, and the effective bandwidth of every candidate
+(see OUTPUTS), whatever its select setting.
+
+**Spatial+.** `spatial_adjust_method = "spatial_plus" reports Spatial+
+(Dupont, Wood & Augustin 2022) beside the unadjusted results, on every
+held-out split. The model is y = β x + covariates + f(t) + ε with f a
+penalized thin-plate spline. Spatial+ first fits the exposure on location,
+r_x = x − f̂_x, then the outcome on that residual, y = β r_x + covariates +
+f⁺(t) + ε, so β̂⁺ = r_xᵀ(I − S)y / r_xᵀ(I − S)r_x with S the outcome model's
+smoother. Unpenalized, both steps give the basis adjustment (Dupont §4); the
+bias Spatial+ removes is the one the smoothing penalty brings. Here each
+group (a site) gets its own intercept, linear trend and penalized smooth with
+its own smoothing parameter, the analogue of mgcv's `y ~ group + s(x, y, by =
+group, bs = "tp", k = K)`, a site-specific extension of the published method.
+The exposure's penalties are chosen on each group alone (no covariates, as in
+the paper); the outcome model's jointly, with the exposure in it, by GCV or
+REML. The penalty is chosen for fit, not for bias (Paciorek 2010;
+Papadogeorgou 2021), so read Spatial+ as a sensitivity analysis. It covers the
+held-out slopes of the CGI, every standalone channel and comparator on the
+target and each negative control (per SD0, IQR and p5–p95 range), D and ΔD per
+control, and the paired ΔR²; the slope's interval uses the Bayesian
+covariance mgcv reports, and the bootstraps refit both steps on every
+replicate with the penalties fixed. A two-valued target is skipped (Gaussian
+outcomes only), and sampling weights do not enter it (the run warns). A group
+whose smooth uses over 90 % of its functions logs a warning: raise
+`spatial_plus_k`.
+
+**Spatial+ on the search inputs.** With `spatial_adjust_method =
+"spatial_plus"`, `spatial_tune_method = "spatial_plus_inputs"` tunes the
+composite on "local" greenery, a geofuse extension of Spatial+ (not the
+published method). On each split's train+val rows every search column
+(channel × radius × statistic) is residualized on its own penalized smooth per
+group, the outcome smoother is fitted on the outcome, the covariates and the
+groups' smooths without any exposure, and the outcome and every residual are
+multiplied by (I − H)^½, H that smoother's hat matrix. A least-squares slope
+of the transformed outcome on any mix of transformed residuals is then
+Spatial+'s second-step slope of that mix with the outcome smoother's
+penalties held at the outcome-only fit, so the sweep, posterior and null
+calibration all work on Spatial+ residuals (choosing the penalties jointly
+for each of the many candidate composites is not feasible). The covariates
+are absorbed by the transform. The penalties are kept per split, so the
+standalone searches and the null outcomes of the repeated-split calibration
+use the real outcome's smoother. Synergy terms need positive inputs, which
+residuals are not, so the linear form only. The tuned composite is reported
+on the raw inputs by Spatial+ itself, and the search's own posterior β is the
+composite of residualized inputs scored by the transform. The run records,
+per channel, the median edf and absorbed share of its columns, the outcome
+smoother's λ and edf, and its effective bandwidth (`spatial_tuning` in the
+results).
+
+**Pattern scales.** A size per cluster removes patterns of different lengths
+in different places: 20 functions in a cluster 800 km across remove regional
+gradients, in a cluster 10 km across neighbourhood ones. `spatial_adjust_scale_m`
+defines the smooth by a distance instead, so it means the same everywhere:
+exposure variation coarser than about that scale is treated as confounded and
+removed. Each cluster gets as many knots as its occupied area needs at that
+scale, every radial function is used and no criterion runs. The scale is an
+assumption about where confounding acts, so choose it from the study's
+hypothesis rather than from a criterion (a criterion on the exposure keeps
+preferring the smallest scale offered), and keep it above the error in the
+entities' locations. With a scale set:
+
+- clusters split where entities are more than `spatial_adjust_eps_m` apart,
+  by default twice the first scale, and a cluster smaller than
+  `spatial_adjust_min_component` (default 30) joins the nearest larger one;
+- the smooth depends on the locations only, so the CGI, every channel,
+  comparator and negative control share it, and paired tests use it on both
+  sides;
+- with several scales, as in `[5000, 20000, 10000, 3000]`, the first is the
+  primary one (scores, paired tests, verdicts) and every slope is also reported
+  at the others and without a smooth, on every held-out split (one split when
+  **Held-out splits** is 1), so one run gives the curve of the slope across
+  scales. The extra scales cost one more set of slopes and bootstraps each;
+- a cluster needing more than 400 radial functions, or a smooth above 2,000 in
+  all, is logged as a warning: a larger scale or a smaller cluster gap keeps it
+  smaller.
+
+Without a scale, the run warns when one cluster is more than five times as
+wide as the typical one, or holds over a quarter of the entities while twice
+as wide: the neighbour rule has then chained distant places into one cluster,
+and a cluster gap or a scale separates them.
+
+**Tuning within areas.** The smooth normally enters the reporting only: the
+composite is tuned on all variation the covariates leave, then scored within
+areas. That answers whether a choice made on the whole map survives within
+areas. `spatial_tune_scale_m` asks the other question, which layer, radius,
+statistic and weights carry the association among entities in the same area:
+the smooth at that scale, built as above on the rows each search uses (every
+held-out split builds its own), joins the covariates of the whole search, so
+the sweep, the posterior, the null calibration, the standalone studies and the
+negative-control re-tune all work on variation within areas. With it:
+
+- the scores and slopes use the same scale unless `spatial_adjust_scale_m` is
+  set; a first scale different from the tuning scale is allowed but logged as
+  a warning, since the primary results then answer a different question than
+  the search did;
+- the composite's weights on the raw scale refer to the spread within areas,
+  and the record gives, per channel, the share of its variance the smooth
+  absorbs: a channel that is mostly regional has little left to tune on;
+- one tuning scale per run: compare scales with one run each;
+- a smooth with more columns than a quarter of the rows, or a cluster with
+  nearly one knot per entity, is logged as a warning, since the search could
+  then fit noise.
+
+### Posterior warm starts
+
+A synergy posterior sums its likelihood over the rows, and most of a cold fit's
+time goes into tuning the sampler during warm-up. Two warm starts shorten that
+without changing what the posterior targets:
+
+| Setting (form label) | Default | What it does |
+| --- | --- | --- |
+| `synergy_warm_start` (**Start synergy from a linear fit**) | on | A short linear fit of the same columns starts the synergy sampler: its step size, its scales for the shared parameters and its mean as the starting point, the interaction weights starting small. The synergy warm-up is then 250 iterations |
+| `outer_warm_start` (**Warm-start later splits**) | on | Each held-out split after the first starts every posterior from the latest fit of the same channel and form: its starting point and its scales for every parameter, with a 150-iteration warm-up that tunes only the step size |
+| `outer_posterior_draws` (**Draws on later splits**) | unset (as the first) | Draws per chain on the later splits only; their warm-up follows unless `outer_posterior_warmup` is set |
+| `outer_posterior_warmup` / `outer_posterior_chains` | unset (as the first) | Warm-up and chains on the later splits only (run file and command line) |
+
+A warm-started fit is checked against the fit it started from: when its
+largest R-hat is above 1.01, or its effective sample size per draw falls below
+80 % of the source's, it is refitted cold with a warning. Every fit records
+where it started, its warm-up and any fallback (see OUTPUTS). Turning a warm
+start off gives the earlier draws exactly.
+
+### Raw-unit effect sizes
+
+Every run reports the held-out change in the outcome, in its own units,
+per interquartile range and per 5th–95th percentile range of the CGI, each
+channel and each comparator (results panel "Raw-unit effect sizes",
+`raw_effects.csv`, and on every held-out split in `outer_splits.csv`). The
+ranges are each exposure's on the split's train+val rows. To report per a
+published increment instead, give it per exposure in a run file or on the
+command line:
+
+```toml
+[defaults.fusion]
+fixed_iqr = { ndvi = 0.1, ndvi_500m = 0.1 }
+```
+
+```bash
+geofuse fusion ... --fixed-iqr "ndvi=0.1, ndvi_500m=0.1"
+```
+
+The names are `cgi`, a channel (`ndvi`, `gvi`, `veg`, `terrain`) or a
+comparator column. The same increment is used for that exposure in
+`exposure_response.csv`; `exposure_iqr` remains the increment for the
+exposures `fixed_iqr` does not name.
+
+### Sampling weights
+
+Name the target column holding each entity's sampling (or analytic) weight:
+
+```toml
+[defaults.fusion]
+weight_column = "weight"
+```
+
+The run then reports, on every held-out split, weighted versions of the
+score, the slopes, the negative controls, the paired differences, the
+specificity contrast and the raw-unit effects next to the unweighted ones
+(`weighted.csv`, weighted rows of `outer_splits.csv`, "(w)" lines in
+`geofuse results`). The search itself stays unweighted, so the weights
+change what is reported about the chosen composite, not how it is chosen.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `weight_column` | unset | Target column of weights; rows with a missing or non-positive weight are left out of the weighted results only |
+| `weight_search` | off | Also weight the search (residualising, sweep, posterior, its null refits): a weighted likelihood. Needs `index_form = "linear"`; the run warns that the posterior and the null calibration refer to the weighted likelihood |
+
+Turn `weight_search` on only when the question is explicitly about the
+population the weights describe, or when selection is believed to change
+which exposure is chosen, and say so in the methods; it then needs its own
+null calibration. The dashboard sets the weight column in the target
+section (**Sampling weight column**); `weight_search` has no dashboard
+field: set it in a run file or with `--weight-search`, and a study re-run
+from the dashboard keeps it.
+
+### Null calibration of the held-out decision
+
+With **Held-out splits** at 2 or more, a repeated study decides on the
+corrected test of each result across its splits. These settings measure how
+often that decision fires on outcomes unrelated to greenery, inside the same
+job; the preparation, the exposure tensor and the caches are the real run's.
+
+| Setting (form label) | Default | What it does |
+| --- | --- | --- |
+| `outer_report` (**Later splits report**) | `full` | `decision` keeps only the estimates the corrected tests read on the later splits (no bootstrap intervals or permutation p-values); the tests themselves are unchanged |
+| `outer_null_runs` (**Null outcomes**) | 0 | Null outcomes, each run through the same search and held-out splits and seeds in the decision report |
+| `outer_null_kind` (**Null outcome kind**) | `spatial` | `spatial`: area means permuted across areas, variogram-matched surrogates within them; `free`: the outcome permuted over entities (within waves); `both`: each, as two rates |
+| `outer_null_group` (**Null areas column**) | unset | Any target column of areas (a site or city; text or a numeric code, a covariate or not) whose area means the spatial null permutes; entities without a value form one area. A run file naming a column the target lacks is refused when planned. Unset = clusters split at gaps of `spatial_adjust_eps_m` (also in a study without spatial adjustment), else twice the first pattern scale, else the 10-nearest-neighbour components; `spatial_adjust_min_component` joins smaller clusters to their nearest |
+| `outer_null_stop_after`, `_low`, `_high` (**Decide after nulls**, **Stop at or below**, **Stop at or above**) | unset | A sequential rule fixed in advance: after that many nulls, stop as not inflated at or below `_low` rejections, as inflated at or above `_high`, else run all |
+| `outer_null_workers` (**Nulls at once**) | automatic | Nulls run in parallel, each worker holding one copy of the study and its own sampler (about 2–3 GB each); automatic uses up to 4 workers, fewer when cores or memory are short |
+
+```toml
+[defaults.fusion]
+outer_splits = 10
+outer_report = "decision"
+outer_null_runs = 100
+outer_null_kind = "spatial"
+outer_null_group = "site"
+outer_null_stop_after = 50
+outer_null_stop_low = 1
+outer_null_stop_high = 7
+```
+
+The results record how the spatial null was grouped, the number of areas,
+the smallest and the largest area's share; fewer than 5 areas, or one
+holding more than a quarter of the entities, logs a warning, because
+permuting the area means then changes little.
+
+Each null costs about one repeated study in the decision report. A cancelled
+or repeated job keeps its finished nulls and continues from the next one. The
+results list, per null kind, the rejections with their exact interval and the
+real outcome's corrected p ranked among the nulls' (see OUTPUTS for
+`null_summary.csv` and the variogram table). Panels are refused: their rows
+are not exchangeable entities.
+
 ### Reading the results panel
 
 - **Headline.** Held-out test score with its 95 % interval, the significance
   test that actually applies (permutation for cross-sectional, Wald for
   mixed-effects), the direction of the relationship, and the verdict against the
-  best standalone channel. Under it, the covariates some rows were missing, with
-  how each was handled and how many rows with an outcome were dropped.
+  channel that scores best on train+val: "CGI vs standalone — objective
+  (held-out)" is the paired held-out test, and "CGI vs standalone — AIC/BIC
+  (in-sample)" beside it is a secondary statistic. Under it, the covariates
+  some rows were missing, with how each was handled and how many rows with an
+  outcome were dropped.
 - **Study detail.** Per study: the discovered radii, aggregators and weights,
   per-subset scores, and the discovery diagnostics, which cover what the sweep
   picked and how contested it was, the posterior weights with credible
@@ -148,6 +449,18 @@ own** (a `<column>=missing` dummy). In a run file it is
 - **CGI vs comparator exposures.** Each comparator's held-out score, interval,
   p-value, n and β next to the composite's, with the paired difference and its
   Holm p-value (descriptive for non-primary comparators).
+- **Specificity contrast** (when on). Per control and exposure: the four
+  slopes, each exposure's |β target| − |β control|, and their difference with
+  its paired interval, p and Holm p; positive means the composite is the more
+  specific.
+- **Across held-out splits** (with several splits). Each result's spread,
+  share of splits holding and corrected p, the specificity contrast per
+  control included; **Posterior across held-out splits** gives the range of
+  β, each term's weight and R50 / R90, the share of splits in which a term
+  has the largest weight, and the forms chosen.
+- In a spatially adjusted run the negative-control, comparator and
+  specificity tables add a **Spatial smooth** column with the df of the smooth
+  each slope adjusts for, and the captions say what was adjusted.
 - **Covariate impact**, **channel collinearity**, **composite maps**,
   **mixed-effects metrics**, and an index of every file written. **Generate
   CGI Map**, under the map viewer, is a placeholder for a planned full-area map
@@ -157,8 +470,24 @@ See [OUTPUTS.md](OUTPUTS.md) for the folder layout.
 
 ### Performance
 
-Every run logs a stage-by-stage wall-clock breakdown, and parallel phases log
-how many workers were actually busy and what limited the pool.
+Every run logs a stage-by-stage wall-clock breakdown with the peak memory the
+job's processes held during each stage (the commit charge on Windows), and
+parallel phases log how many workers were actually busy and what limited the
+pool. The same breakdown is in `results_summary.json` (`stage_timing`,
+`peak_memory_gb`).
+
+A fusion job runs its own numpy / BLAS on 4 threads (`limits.job_threads`,
+`geofuse config set limits.job_threads 8`): the engine gains little beyond
+four, and each thread's buffers count against the machine's memory. Its process
+pools run one thread per worker and cap GDAL's raster cache at 128 MB per worker
+(set `GDAL_CACHEMAX` to change it). The command's own processes (the
+supervisor, `watch`, `status`, the remote agent) compute nothing heavy and run
+on one thread, a few tens of MB each.
+
+How many fusion studies to run at once (`limits.fusion`) depends on memory:
+each holds about 7 GB at its peak while it pre-aggregates the greenery. On a
+32 GB machine three at once is the measured limit; see
+[PERFORMANCE.md](PERFORMANCE.md) for the figures.
 
 Thread pools take about a third of the cores, because each task is already
 multi-threaded inside numpy. Process pools take 80 % by default and are also
@@ -419,12 +748,13 @@ geofuse config show
 geofuse config set limits.gpu 2              # two GVI jobs at once
 geofuse config set limits.earthengine 3
 geofuse config set limits.max_parallel 6     # jobs the supervisor runs at once
+geofuse config set limits.job_threads 8      # BLAS threads of each fusion job
 ```
 
 ### Results
 
 ```bash
-geofuse results JOB                         # held-out score, direction, each channel alone, weights, radii
+geofuse results JOB                         # held-out score, direction, spatial adjustment, each channel alone, specificity, splits, null calibration, weights, radii
 geofuse results output_results/fusion/<run>/    # any run, dashboard runs included
 geofuse export JOB -o cgi.csv               # the per-entity CGI table (.gpkg, .csv or .geojson)
 geofuse cgi-map JOB area.gpkg               # planned full-area CGI map; exits 2, not available yet

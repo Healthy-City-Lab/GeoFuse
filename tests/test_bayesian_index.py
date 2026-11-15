@@ -71,7 +71,7 @@ class TestRecoversAPlantedSignal(unittest.TestCase):
         self.assertAlmostEqual(float(w.sum()), 1.0, places=9)
         self.assertTrue(np.all(w >= 0.0))
         # The noise channel cannot carry the majority of a simplex weight.
-        share = dict(zip(kept, w))
+        share = dict(zip(kept, w, strict=True))
         self.assertGreater(share.get(1, 0.0), share.get(0, 0.0))
 
 
@@ -361,7 +361,7 @@ class TestDirectionIsNotAssumed(unittest.TestCase):
         Z, y = self._one_signal(-1.0)
         kept, w = bi.simplex_fit(Z.T @ Z, Z.T @ y)
         self.assertIn(0, kept)
-        self.assertGreater(float(dict(zip(kept, w)).get(0, 0.0)), 0.9)
+        self.assertGreater(float(dict(zip(kept, w, strict=True)).get(0, 0.0)), 0.9)
 
     def test_flipping_the_outcome_gives_the_same_weights_and_score(self):
         # The exact symmetry: one dataset, the outcome negated. Anything the
@@ -467,7 +467,9 @@ class TestTheGridIsFittedNotPicked(unittest.TestCase):
         self.assertLess(top, len(prof) - 1)
 
     def test_the_aggregator_blend_concentrates_on_the_informative_statistic(self):
-        blend = dict(zip(self.out["stats"], self.out["aggregator_mean"][0]))
+        blend = dict(
+            zip(self.out["stats"], self.out["aggregator_mean"][0], strict=True)
+        )
         self.assertEqual(max(blend, key=blend.get), "p10")
 
     def test_a_channel_with_no_signal_reports_an_unidentified_scale(self):
@@ -583,7 +585,9 @@ class TestSingleChannelStudy(unittest.TestCase):
     def test_the_scale_and_aggregator_are_still_estimated(self):
         self.assertGreater(self.out["peak_radius_mean"][0], 150.0)
         self.assertLess(self.out["peak_radius_mean"][0], 900.0)
-        blend = dict(zip(self.out["stats"], self.out["aggregator_mean"][0]))
+        blend = dict(
+            zip(self.out["stats"], self.out["aggregator_mean"][0], strict=True)
+        )
         self.assertEqual(max(blend, key=blend.get), "p10")
 
 
@@ -850,7 +854,7 @@ class TestRankSafeResidualisation(unittest.TestCase):
         return yr, flat.reshape(X.shape)
 
     def _assert_same(self, a, b):
-        for u, v in zip(a, b):
+        for u, v in zip(a, b, strict=True):
             np.testing.assert_allclose(u, v, atol=1e-10, rtol=0)
 
     def test_an_all_zero_column_changes_nothing(self):
